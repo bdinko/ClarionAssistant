@@ -1,4 +1,4 @@
-# ClarionAssistant Deploy Script
+﻿# ClarionAssistant Deploy Script
 # Builds and deploys the addin for Clarion 10, 11, 11.1, 12, or all.
 # Usage: .\deploy.ps1 [-Version 10|11|11.1|12|all] [-NoBuild] [-Kill]
 
@@ -323,6 +323,11 @@ if (-not $NoBuild) {
     if (Test-Path $McpServerFile) {
         Write-Host ""
         Write-Host "Building standalone MCP server..." -ForegroundColor Cyan
+        # /t:Restore FIRST: this project is not $ProjectFile, so the restore above never covered it.
+        # Without it the PdfPig PackageReference stays unresolved and the shared DocGraphService.cs
+        # fails with CS0103 on UglyToad -- which exit 1's below and aborts the whole deploy.
+        & $MSBuild $McpServerFile /t:Restore /p:Configuration=Debug /p:Platform=x86 /v:minimal
+        if ($LASTEXITCODE -ne 0) { Write-Host "MCP server restore failed." -ForegroundColor Red; exit 1 }
         & $MSBuild $McpServerFile /p:Configuration=Debug /p:Platform=x86 /v:minimal
         if ($LASTEXITCODE -ne 0) { Write-Host "MCP server build failed." -ForegroundColor Red; exit 1 }
         Write-Host "MCP server build succeeded." -ForegroundColor Green
