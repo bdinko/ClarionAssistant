@@ -1,10 +1,17 @@
 ﻿# ClarionAssistant Deploy Script
 # Builds and deploys the addin for Clarion 10, 11, 11.1, 12, or all.
-# Usage: .\deploy.ps1 [-Version 10|11|11.1|12|all] [-NoBuild] [-Kill]
+# Usage: .\deploy.ps1 [-Version 10|11|11.1|12|all] [-Root <paths>] [-NoBuild] [-Kill]
 
 param(
     [ValidateSet("10","11","11.1","12","all")]
     [string]$Version = "all",  # Which Clarion version(s) to build/deploy
+    # Restrict the run to specific install roots. ONE version can resolve to SEVERAL installs
+    # (Resolve-ClarionRoots returns every glob match -- 11.1 alone found four here), so -Version
+    # by itself cannot express "only C:\Clarion11.1-13810". This filters the resolved roots, so
+    # both the build (which binds against roots[0]) and the deploy see only what you asked for.
+    # A -Root entry that matches no resolved install is a hard error, never a silent no-op.
+    #   .\deploy.ps1 -Version all -Root C:\Clarion10,C:\Clarion11.1-13810,C:\Clarion12
+    [string[]]$Root,
     [switch]$NoBuild,          # Skip build, just copy
     [switch]$Kill              # Kill Clarion IDE before deploying
 )
@@ -145,14 +152,42 @@ if ($Version -eq "all") {
 # previously a missing version aborted the whole run because MSBuild's own hardcoded
 # ClarionRoot default in Directory.Build.props errored out mid-build.
 $ResolvedRoots = @{}
+$MatchedRoots  = @()   # resolved roots that a -Root entry actually selected (typo check below)
 foreach ($ver in $TargetVersions) {
     $cfg   = $Versions[$ver]
     $roots = Resolve-ClarionRoots -RegistryKeys $cfg.RegistryKeys -Fallbacks $cfg.Fallbacks -GlobPatterns $cfg.GlobPatterns
     if ($roots -and $roots.Count -gt 0) {
+        if ($Root) {
+            # Normalise the trailing slash so C:\Clarion12 and C:\Clarion12\ are one root.
+            $roots = @($roots | Where-Object {
+                $resolved = $_.TrimEnd('\')
+                @($Root | Where-Object { $_.TrimEnd('\') -ieq $resolved }).Count -gt 0
+            })
+            $MatchedRoots += $roots
+        }
+        if (-not $roots -or $roots.Count -eq 0) {
+            Write-Host "Clarion ${ver}: no install left after -Root filter - will skip" -ForegroundColor DarkGray
+            continue
+        }
         $ResolvedRoots[$ver] = $roots
         Write-Host "Clarion ${ver}: $($roots -join ', ')" -ForegroundColor DarkGray
     } else {
         Write-Host "Clarion ${ver}: no install found (registry / known paths / drive scan) - will skip" -ForegroundColor DarkGray
+    }
+}
+
+# A -Root entry that selected nothing is almost always a typo or a path that is not actually
+# an install. Failing here is deliberate: the alternative is a run that reports success while
+# deploying to fewer installs than asked for -- the exact failure -Root exists to prevent.
+if ($Root) {
+    $selected = @($MatchedRoots | ForEach-Object { $_.TrimEnd('\') })
+    $unmatched = @($Root | Where-Object { $selected -notcontains $_.TrimEnd('\') })
+    if ($unmatched.Count -gt 0) {
+        Write-Host ""
+        Write-Host "-Root matched no resolved install: $($unmatched -join ', ')" -ForegroundColor Red
+        Write-Host "Resolved installs for the requested version(s):" -ForegroundColor Yellow
+        foreach ($k in $ResolvedRoots.Keys) { Write-Host "  ${k}: $($ResolvedRoots[$k] -join ', ')" -ForegroundColor Yellow }
+        exit 1
     }
 }
 
