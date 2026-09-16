@@ -2137,6 +2137,73 @@ namespace ClarionAssistant.Services
         }
 
         /// <summary>
+        /// Counts rows in a table of this instance's database.
+        /// </summary>
+        private long CountRows(string table)
+        {
+            using (var conn = OpenConnection(readOnly: true))
+            using (var cmd = new SQLiteCommand("SELECT COUNT(*) FROM " + table, conn))
+                return Convert.ToInt64(cmd.ExecuteScalar());
+        }
+
+        /// <summary>
+        /// Get statistics for BOTH the bundled and personal DocGraph databases.
+        /// Falls back to single-DB stats when one database is missing.
+        /// </summary>
+        public string GetStatsMulti(string personalDbPath)
+        {
+            bool hasBundled = File.Exists(_dbPath);
+            bool hasPersonal = !string.IsNullOrEmpty(personalDbPath) && File.Exists(personalDbPath);
+
+            if (!hasBundled && !hasPersonal)
+                return "No DocGraph database found. Run ingest_docs first.";
+
+            if (!hasPersonal) return GetStats();
+            if (!hasBundled) return new DocGraphService(personalDbPath).GetStats();
+
+            var personalSvc = new DocGraphService(personalDbPath);
+
+            long bLibs = CountRows("libraries");
+            long bChunks = CountRows("doc_chunks");
+            long pLibs = personalSvc.CountRows("libraries");
+            long pChunks = personalSvc.CountRows("doc_chunks");
+
+            var sb = new StringBuilder();
+            sb.AppendLine("## Combined");
+            sb.AppendLine(string.Format("Libraries: {0} (bundled {1} + personal {2})", bLibs + pLibs, bLibs, pLibs));
+            sb.AppendLine(string.Format("Total chunks: {0} (bundled {1} + personal {2})", bChunks + pChunks, bChunks, pChunks));
+            sb.AppendLine();
+            sb.AppendLine(string.Format("## Personal DocGraph ({0})", personalDbPath));
+            sb.AppendLine(personalSvc.GetStats());
+            sb.AppendLine(string.Format("## Bundled DocGraph ({0})", _dbPath));
+            sb.AppendLine(GetStats());
+            return sb.ToString();
+        }
+
+        /// <summary>
+        /// List libraries from BOTH the bundled and personal DocGraph databases.
+        /// Falls back to a single-DB listing when one database is missing.
+        /// </summary>
+        public string ListLibrariesMulti(string personalDbPath)
+        {
+            bool hasBundled = File.Exists(_dbPath);
+            bool hasPersonal = !string.IsNullOrEmpty(personalDbPath) && File.Exists(personalDbPath);
+
+            if (!hasBundled && !hasPersonal)
+                return "No DocGraph database found. Run ingest_docs first.";
+
+            if (!hasPersonal) return ListLibraries();
+            if (!hasBundled) return new DocGraphService(personalDbPath).ListLibraries();
+
+            var sb = new StringBuilder();
+            sb.AppendLine(string.Format("## Personal DocGraph ({0})", personalDbPath));
+            sb.AppendLine(new DocGraphService(personalDbPath).ListLibraries());
+            sb.AppendLine(string.Format("## Bundled DocGraph ({0})", _dbPath));
+            sb.AppendLine(ListLibraries());
+            return sb.ToString();
+        }
+
+        /// <summary>
         /// Delete a library and all its chunks from the database. Rebuilds FTS index.
         /// </summary>
         public void DeleteLibrary(long libraryId)

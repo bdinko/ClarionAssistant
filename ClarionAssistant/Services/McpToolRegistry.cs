@@ -2919,10 +2919,10 @@ EXAMPLES:
             Register(new McpTool
             {
                 Name = "list_doc_libraries",
-                Description = "List all third-party libraries that have been ingested into the DocGraph documentation database, with chunk counts.",
+                Description = "List all third-party libraries that have been ingested into the DocGraph documentation database, with chunk counts. Covers BOTH the bundled and the personal DocGraph databases.",
                 InputSchema = McpJsonRpc.BuildSchema(new Dictionary<string, string>()),
                 RequiresUiThread = false,
-                Handler = args => _docGraph.ListLibraries()
+                Handler = args => _docGraph.ListLibrariesMulti(DocGraphService.GetPersonalDbPath())
             });
 
             Register(new McpTool
@@ -2960,10 +2960,10 @@ EXAMPLES:
             Register(new McpTool
             {
                 Name = "docgraph_stats",
-                Description = "Get statistics about the DocGraph documentation database — library count, chunk count, breakdown by topic and vendor.",
+                Description = "Get statistics about the DocGraph documentation databases — library count, chunk count, breakdown by topic and vendor. Reports BOTH the bundled and the personal DocGraph databases, with a combined total.",
                 InputSchema = McpJsonRpc.BuildSchema(new Dictionary<string, string>()),
                 RequiresUiThread = false,
-                Handler = args => _docGraph.GetStats()
+                Handler = args => _docGraph.GetStatsMulti(DocGraphService.GetPersonalDbPath())
             });
 
             Register(new McpTool
