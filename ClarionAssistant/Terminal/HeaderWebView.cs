@@ -27,11 +27,43 @@ namespace ClarionAssistant.Terminal
 
         public bool IsReady { get { return _isInitialized; } }
 
+        // Fixed height (82938fc7): there is no splitter and no saved height. Values are CSS px, measured in
+        // header.html with headless Edge at 320, 420 and 800 px wide, dark and light (all identical):
+        // the title row + tab strip end at 72; the Solution pane, the tallest pane, ends the page at 188.
+        // While Schema Sources or Source Control is active the page shrinks to the strip and the host's
+        // SchemaSourcesView fills the pane below it (PanePixelHeight), so the header's total stays fixed.
+        public const int CssStripHeight = 72;
+        public const int CssFullHeight = 188;
+
+        private string _activeTab = "solution";
+
+        /// <summary>The zoom key the header and the SchemaSourcesView under it share.</summary>
+        public const string ZoomKey = "header";
+
+        /// <summary>The header's zoom; the host keeps the SchemaSourcesView at the same value.</summary>
+        public double ZoomFactor
+        {
+            get { return _webView != null ? _webView.ZoomFactor : 1.0; }
+            set { if (_webView != null && Math.Abs(_webView.ZoomFactor - value) > 0.001) _webView.ZoomFactor = value; }
+        }
+
+        /// <summary>True for the tabs the host's SchemaSourcesView renders ("schema", "repo").</summary>
+        public static bool IsPanelTab(string tab) { return tab == "schema" || tab == "repo"; }
+
+        /// <summary>The active header tab: "solution", "schema" or "repo".</summary>
+        public string ActiveTab { get { return _activeTab; } }
+
+        /// <summary>Raised when the header's pixel height changed (a tab switch or a zoom).</summary>
+        public event EventHandler LayoutChanged;
+
+        /// <summary>Pixel height of the pane under the tab strip, at the header's zoom and DPI.</summary>
+        public int PanePixelHeight { get { return ToPixels(CssFullHeight - CssStripHeight); } }
+
         public HeaderWebView()
         {
             SuspendLayout();
             BackColor = Color.FromArgb(30, 30, 46);
-            Height = 110;
+            Height = ToPixels(CssFullHeight);
             Dock = DockStyle.Top;
 
             _webView = new WebView2 { Dock = DockStyle.Fill, Name = "headerWebView" };
@@ -60,7 +92,11 @@ namespace ClarionAssistant.Terminal
 
                 _webView.CoreWebView2.WebMessageReceived += OnWebMessageReceived;
                 _webView.CoreWebView2.NavigationCompleted += OnNavigationCompleted;
-                _webView.ZoomFactorChanged += (s, ev) => WebViewZoomHelper.SetZoom("header", _webView.ZoomFactor);
+                _webView.ZoomFactorChanged += (s, ev) =>
+                {
+                    WebViewZoomHelper.SetZoom(ZoomKey, _webView.ZoomFactor);
+                    ApplyHeight();
+                };
 
                 string htmlPath = GetHtmlPath();
                 if (File.Exists(htmlPath))
@@ -76,8 +112,29 @@ namespace ClarionAssistant.Terminal
         {
             _isInitialized = true;
             _isInitializing = false;
-            _webView.ZoomFactor = WebViewZoomHelper.GetZoom("header");
+            _webView.ZoomFactor = WebViewZoomHelper.GetZoom(ZoomKey);
+            ApplyHeight();
             HeaderReady?.Invoke(this, EventArgs.Empty);
+        }
+
+        private int ToPixels(int cssPixels)
+        {
+            double zoom = _webView != null ? _webView.ZoomFactor : 1.0;
+            return (int)Math.Ceiling(cssPixels * zoom * DeviceDpi / 96.0);
+        }
+
+        // Clarion moved to a monitor with another DPI: the fixed CSS heights map to a new pixel height.
+        protected override void OnDpiChangedAfterParent(EventArgs e)
+        {
+            base.OnDpiChangedAfterParent(e);
+            ApplyHeight();
+        }
+
+        private void ApplyHeight()
+        {
+            if (IsDisposed) return;
+            Height = ToPixels(_activeTab == "solution" ? CssFullHeight : CssStripHeight);
+            LayoutChanged?.Invoke(this, EventArgs.Empty);
         }
 
         private void OnWebMessageReceived(object sender, CoreWebView2WebMessageReceivedEventArgs e)
@@ -88,6 +145,12 @@ namespace ClarionAssistant.Terminal
                 // Simple JSON parse — avoid dependency on JSON library
                 string action = ExtractJsonValue(json, "action");
                 string data = ExtractJsonValue(json, "data");
+                if (action == "headerTab")
+                {
+                    if (data != "solution" && !IsPanelTab(data)) return;
+                    _activeTab = data;
+                    ApplyHeight();
+                }
                 if (!string.IsNullOrEmpty(action))
                     ActionReceived?.Invoke(this, new HeaderActionEventArgs(action, data));
             }
@@ -104,18 +167,13 @@ namespace ClarionAssistant.Terminal
             _webView.CoreWebView2.PostWebMessageAsString(json);
         }
 
-        /// <summary>Set the version dropdown items.</summary>
-        public void SetVersions(string[] labels, string[] values, int selectedIndex)
+        /// <summary>
+        /// Show the Clarion version CA uses (read-only, 286f2e57: the IDE's Build &gt; Set Clarion Version decides;
+        /// CA has no version picker). <paramref name="title"/> is the hover text: which source chose it.
+        /// </summary>
+        public void SetVersion(string label, string title)
         {
-            var items = new System.Text.StringBuilder("[");
-            for (int i = 0; i < labels.Length; i++)
-            {
-                if (i > 0) items.Append(",");
-                items.AppendFormat("{{\"label\":\"{0}\",\"value\":\"{1}\",\"selected\":{2}}}",
-                    EscapeJson(labels[i]), EscapeJson(values[i]), i == selectedIndex ? "true" : "false");
-            }
-            items.Append("]");
-            SendMessage("{\"type\":\"setVersions\",\"items\":" + items + "}");
+            SendMessage("{\"type\":\"setVersion\",\"label\":\"" + EscapeJson(label) + "\",\"title\":\"" + EscapeJson(title) + "\"}");
         }
 
         /// <summary>Set the solution dropdown items.</summary>
@@ -135,37 +193,6 @@ namespace ClarionAssistant.Terminal
             SendMessage("{\"type\":\"setSolutions\",\"items\":" + items + "}");
         }
 
-        /// <summary>Descriptor for a tab in the header tab bar.</summary>
-        public class TabDescriptor
-        {
-            public string Id;
-            public string Name;
-            public bool IsHome;
-            public bool IsActive;
-        }
-
-        /// <summary>Update the tab bar in the header.</summary>
-        public void SetTabs(TabDescriptor[] tabs)
-        {
-            var sb = new System.Text.StringBuilder("[");
-            for (int i = 0; i < tabs.Length; i++)
-            {
-                if (i > 0) sb.Append(",");
-                sb.AppendFormat("{{\"id\":\"{0}\",\"name\":\"{1}\",\"isHome\":{2},\"isActive\":{3}}}",
-                    EscapeJson(tabs[i].Id), EscapeJson(tabs[i].Name),
-                    tabs[i].IsHome ? "true" : "false",
-                    tabs[i].IsActive ? "true" : "false");
-            }
-            sb.Append("]");
-            SendMessage("{\"type\":\"setTabs\",\"tabs\":" + sb + "}");
-        }
-
-        /// <summary>Highlight one tab as active in the header.</summary>
-        public void SetActiveTab(string tabId)
-        {
-            SendMessage("{\"type\":\"setActiveTab\",\"tabId\":\"" + EscapeJson(tabId) + "\"}");
-        }
-
         /// <summary>Update the MCP/status text in the header.</summary>
         public void SetStatus(string text, string cssClass = "")
         {
@@ -178,10 +205,26 @@ namespace ClarionAssistant.Terminal
             SendMessage("{\"type\":\"setIndexStatus\",\"text\":\"" + EscapeJson(text) + "\",\"css\":\"" + EscapeJson(cssClass) + "\"}");
         }
 
-        /// <summary>Update the redirection (.red) file path shown in the header (diagnostic).</summary>
-        public void SetRedFile(string text, string cssClass = "")
+        /// <summary>
+        /// Update the redirection (.red) line. <paramref name="openable"/> makes it a link; a click posts only
+        /// the intent (openRedFile) and the host opens its own resolved path.
+        /// </summary>
+        public void SetRedFile(string text, string cssClass, bool openable)
         {
-            SendMessage("{\"type\":\"setRedFile\",\"text\":\"" + EscapeJson(text) + "\",\"css\":\"" + EscapeJson(cssClass) + "\"}");
+            SendMessage("{\"type\":\"setRedFile\",\"text\":\"" + EscapeJson(text) + "\",\"css\":\"" + EscapeJson(cssClass)
+                + "\",\"openable\":" + (openable ? "true" : "false") + "}");
+        }
+
+        /// <summary>The number of schema sources linked to the solution, for the Schema Sources tab badge.</summary>
+        public void SetSchemaCount(int count)
+        {
+            SendMessage("{\"type\":\"setSchemaCount\",\"count\":" + Math.Max(0, count) + "}");
+        }
+
+        /// <summary>Tell the page whether the host's copy of the solution path worked (it shows ✓ or ✗).</summary>
+        public void SendCopyResult(bool ok)
+        {
+            SendMessage("{\"type\":\"copyResult\",\"ok\":" + (ok ? "true" : "false") + "}");
         }
 
         /// <summary>Fired when a new log line is appended (for live updates).</summary>
@@ -215,7 +258,7 @@ namespace ClarionAssistant.Terminal
         /// <summary>Switch the header between light and dark theme.</summary>
         public void SetTheme(bool isDark)
         {
-            BackColor = isDark ? Color.FromArgb(30, 30, 46) : Color.FromArgb(220, 224, 232);
+            BackColor = isDark ? Color.FromArgb(30, 30, 46) : Color.FromArgb(239, 241, 245);   // = header.html's light #eff1f5
             SendMessage("{\"type\":\"setTheme\",\"theme\":\"" + (isDark ? "dark" : "light") + "\"}");
         }
 

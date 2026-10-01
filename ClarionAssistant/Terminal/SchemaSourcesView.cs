@@ -17,32 +17,70 @@ namespace ClarionAssistant.Terminal
     }
 
     /// <summary>
-    /// Collapsible WebView2 panel showing schema sources for the current solution.
-    /// Follows the same pattern as HomeWebView.
+    /// The CA header's Schema Sources / Source Control panes (82938fc7): ONE WebView2 panel for the whole
+    /// chat pane, docked under the header and shown while one of those header tabs is active. It is sized
+    /// to the header's fixed pane (PaneHeight) and grows to fit the Manage Sources modal while it is open.
+    /// It shares the header's zoom (HeaderWebView.ZoomKey): its height is the header's pane, so content at a
+    /// different zoom would not fit the pane it was sized for. Follows the same pattern as HomeWebView.
     /// </summary>
     public class SchemaSourcesView : UserControl
     {
         private WebView2 _webView;
         private bool _isInitialized;
         private bool _isInitializing;
-        private bool _collapsed;
+        private bool _modalOpen;
+        private int _paneHeight = HeaderWebView.CssFullHeight - HeaderWebView.CssStripHeight;
 
         public event EventHandler<SchemaSourceActionEventArgs> ActionReceived;
         public event EventHandler Ready;
 
         public bool IsReady { get { return _isInitialized; } }
 
-        private const int EXPANDED_HEIGHT = 220;
-        private const int COLLAPSED_HEIGHT = 36;
+        // The Manage Sources modal is a fixed 580 CSS px design (schema-sources.html .modal); the panel grows
+        // to fit it (at the zoom and DPI) while it is open and returns to the pane height when it closes.
         private const int MODAL_HEIGHT = 580;
+
+        /// <summary>Raised when the user zooms this panel (Ctrl+wheel); the host carries it to the header.</summary>
+        public event EventHandler ZoomChanged;
+
+        /// <summary>True while the Manage Sources modal is open.</summary>
+        public bool ModalOpen { get { return _modalOpen; } }
+
+        /// <summary>The panel's zoom; the host keeps it equal to the header's.</summary>
+        public double ZoomFactor
+        {
+            get { return _webView != null ? _webView.ZoomFactor : 1.0; }
+            set { if (_webView != null && Math.Abs(_webView.ZoomFactor - value) > 0.001) _webView.ZoomFactor = value; }
+        }
+
+        private int ModalPixelHeight
+        {
+            get { return (int)Math.Ceiling(MODAL_HEIGHT * ZoomFactor * DeviceDpi / 96.0); }
+        }
+
+        protected override void OnDpiChangedAfterParent(EventArgs e)
+        {
+            base.OnDpiChangedAfterParent(e);
+            if (_modalOpen) Height = ModalPixelHeight;   // the pane height arrives from the header's LayoutChanged
+        }
+
+        /// <summary>The pixel height of the header pane this view fills (set by the host from the header).</summary>
+        public int PaneHeight
+        {
+            get { return _paneHeight; }
+            set
+            {
+                _paneHeight = Math.Max(1, value);
+                if (!_modalOpen) Height = _paneHeight;
+            }
+        }
 
         public SchemaSourcesView()
         {
             SuspendLayout();
             BackColor = Color.FromArgb(30, 30, 46);
             Dock = DockStyle.Top;
-            _collapsed = true;
-            Height = COLLAPSED_HEIGHT;
+            Height = _paneHeight;
 
             _webView = new WebView2 { Dock = DockStyle.Fill, Name = "schemaSourcesWebView" };
             Controls.Add(_webView);
@@ -70,7 +108,11 @@ namespace ClarionAssistant.Terminal
 
                 _webView.CoreWebView2.WebMessageReceived += OnWebMessageReceived;
                 _webView.CoreWebView2.NavigationCompleted += OnNavigationCompleted;
-                _webView.ZoomFactorChanged += (s, ev) => WebViewZoomHelper.SetZoom("schemaSources", _webView.ZoomFactor);
+                _webView.ZoomFactorChanged += (s, ev) =>
+                {
+                    if (_modalOpen) Height = ModalPixelHeight;
+                    ZoomChanged?.Invoke(this, EventArgs.Empty);
+                };
 
                 string htmlPath = GetHtmlPath();
                 if (File.Exists(htmlPath))
@@ -86,7 +128,7 @@ namespace ClarionAssistant.Terminal
         {
             _isInitialized = true;
             _isInitializing = false;
-            _webView.ZoomFactor = WebViewZoomHelper.GetZoom("schemaSources");
+            _webView.ZoomFactor = WebViewZoomHelper.GetZoom(HeaderWebView.ZoomKey);
             Ready?.Invoke(this, EventArgs.Empty);
         }
 
@@ -98,23 +140,17 @@ namespace ClarionAssistant.Terminal
                 string action = ExtractJsonValue(json, "action");
                 string data = ExtractJsonValue(json, "data");
 
-                // Handle collapse toggle internally
-                if (action == "toggleCollapse")
-                {
-                    _collapsed = !_collapsed;
-                    Height = _collapsed ? COLLAPSED_HEIGHT : EXPANDED_HEIGHT;
-                    // falls through to ActionReceived so AssistantChatControl can persist state
-                }
-
                 // Handle modal open/close — expand height to fit form
                 if (action == "modalOpened")
                 {
-                    Height = MODAL_HEIGHT;
+                    _modalOpen = true;
+                    Height = ModalPixelHeight;
                     return;
                 }
                 if (action == "modalClosed")
                 {
-                    Height = _collapsed ? COLLAPSED_HEIGHT : EXPANDED_HEIGHT;
+                    _modalOpen = false;
+                    Height = _paneHeight;
                     return;
                 }
 
@@ -140,10 +176,14 @@ namespace ClarionAssistant.Terminal
             SendMessage("{\"type\":\"setSources\",\"items\":" + jsonArray + "}");
         }
 
-        /// <summary>Send all global sources (for the Manage Sources modal).</summary>
-        public void SetGlobalSources(string jsonArray, string linkedIdsJson)
+        /// <summary>
+        /// Send all global sources (for the Manage Sources modal), stamped with the solution they were drawn
+        /// for and its generation; the page echoes both on Select so the host can refuse a stale write.
+        /// </summary>
+        public void SetGlobalSources(string jsonArray, string linkedIdsJson, string slnPath, long gen)
         {
-            SendMessage("{\"type\":\"setGlobalSources\",\"items\":" + jsonArray + ",\"linkedIds\":" + linkedIdsJson + "}");
+            SendMessage("{\"type\":\"setGlobalSources\",\"sln\":\"" + EscapeJson(slnPath ?? "") + "\",\"gen\":" + gen + ",\"items\":" + jsonArray
+                + ",\"linkedIds\":" + linkedIdsJson + "}");
         }
 
         /// <summary>Update index status for a single source.</summary>
@@ -161,16 +201,15 @@ namespace ClarionAssistant.Terminal
         /// <summary>Switch between light and dark theme.</summary>
         public void SetTheme(bool isDark)
         {
-            BackColor = isDark ? Color.FromArgb(30, 30, 46) : Color.FromArgb(220, 224, 232);
+            BackColor = isDark ? Color.FromArgb(30, 30, 46) : Color.FromArgb(239, 241, 245);   // = the header page's light #eff1f5
             SendMessage("{\"type\":\"setTheme\",\"theme\":\"" + (isDark ? "dark" : "light") + "\"}");
         }
 
-        /// <summary>Collapse the panel programmatically.</summary>
-        public void SetCollapsed(bool collapsed)
+        /// <summary>Show the Schema Sources ("schema") or the Source Control ("repo") pane.</summary>
+        public void SetMode(string mode)
         {
-            _collapsed = collapsed;
-            Height = _collapsed ? COLLAPSED_HEIGHT : EXPANDED_HEIGHT;
-            SendMessage("{\"type\":\"setCollapsed\",\"collapsed\":" + (collapsed ? "true" : "false") + "}");
+            if (!HeaderWebView.IsPanelTab(mode)) return;
+            SendMessage("{\"type\":\"setMode\",\"mode\":\"" + mode + "\"}");
         }
 
         private string GetHtmlPath()

@@ -24,6 +24,10 @@ namespace ClarionAssistant.Services
     ///   3. UNDEFINED ROUTINE — a 'DO &lt;name&gt;' whose &lt;name&gt; is not a ROUTINE declared in this
     ///      procedure (routine set parsed from the assembled buffer via ClarionAppDataReader).
     ///
+    /// Since 1c685f2e item 7 these are two separate requests: <see cref="ComputeAsync"/> is source 1 (the LSP),
+    /// and <see cref="ComputeSlotChecks"/> is sources 2 and 3, answered at once with no LSP. The page paints
+    /// them under separate marker owners.
+    ///
     /// Markers are 1-based {line,column,endLine,endColumn,message,severity} carrying Monaco's
     /// MarkerSeverity (Error=8, Warning=4, Info=2, Hint=1) so the HTML renders them with no translation.
     /// </summary>
@@ -125,6 +129,9 @@ namespace ClarionAssistant.Services
         };
         private static readonly Regex EndRx = new Regex(@"^END\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
         private static readonly Regex IfRx = new Regex(@"^IF\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        // A post-condition LOOP's closing line ('UNTIL expr' / 'WHILE expr'). The lookahead, not \b,
+        // so a prefixed name such as While:Count is never read as the keyword.
+        private static readonly Regex PostCondClose = new Regex(@"^(UNTIL|WHILE)(?![A-Za-z0-9_:])", RegexOptions.IgnoreCase | RegexOptions.Compiled);
         // 'DO RoutineName' — DO must start the statement (line start, whitespace, or after ';').
         private static readonly Regex DoStmt = new Regex(
             @"(?:^|\s|;)DO\s+([A-Za-z_][A-Za-z0-9_:]*)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
@@ -132,39 +139,52 @@ namespace ClarionAssistant.Services
         private static readonly Regex InlineEnd = new Regex(@"\bEND\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
         /// <summary>
-        /// Build the marker list. <paramref name="ranges"/> are 1-based inclusive [start,end] editable
-        /// slot ranges (live — passed from Monaco's tracked decorations so they reflect edits that grew
-        /// a slot). Returns an empty list in mirror mode (no editable slots).
+        /// Pass 1 ONLY: the Clarion LSP's diagnostics, clamped to the editable ranges. <paramref name="ranges"/>
+        /// are 1-based inclusive [start,end] slot ranges (live, from Monaco's tracked decorations, so they
+        /// reflect edits that grew a slot). Returns an empty list in mirror mode (no editable slots).
         ///
-        /// <paramref name="embedSlotChecks"/>: when false (plain-source FILE MODE — ticket 564aa142),
-        /// only Pass 1 (the real Clarion LSP, spanning the whole file) runs. The per-slot structure-balance
-        /// heuristic (Passes 2 &amp; 3) is designed for tiny embed fragments and mis-reads a full class/.inc:
-        /// it matches FILE/GROUP/QUEUE/etc. used as PARAMETER TYPES (e.g. <c>Procedure(*File pTable)</c>)
-        /// or labels as if a structure opened, producing bogus "FILE is not terminated with END" errors.
-        /// The LSP/compiler does real whole-file structure validation, so the heuristic adds only noise.
+        /// 1c685f2e item 7: the slot checks (Passes 2 and 3) are no longer part of this. They are
+        /// <see cref="ComputeSlotChecks"/>, answered by the page's slotDiagnostics request in its own lane,
+        /// so a `DO NoSuchRoutine` squiggle no longer waits for this LSP pass (up to minutes on a 3.2 MB
+        /// generated module). This reply carries LSP markers only.
+        ///
+        /// Returns NULL when the server has not answered for the CURRENT text within the wait (K2): the host
+        /// replies {markers:null, pending:true} and the page keeps its markers and asks again. Never a cached
+        /// answer for an older text.
         /// </summary>
         public static async Task<List<Dictionary<string, object>>> ComputeAsync(
-            string lspFileName, string buffer, List<int[]> ranges, string procedureName,
-            bool embedSlotChecks = true, EmbedLspContext lspContext = null)
+            string lspFileName, string buffer, List<int[]> ranges,
+            EmbedLspContext lspContext = null, Timing timing = null)
         {
             var markers = new List<Dictionary<string, object>>();
-            if (string.IsNullOrEmpty(buffer) || ranges == null || ranges.Count == 0) return markers;
-
-            string[] lines = buffer.Replace("\r\n", "\n").Replace("\r", "\n").Split('\n');
+            // Why the LSP pass did not run, named for the [diag-timing] line (1c685f2e item 8). It used to
+            // log a bare lspRunning=False for all four cases, which read as "the server is down".
+            if (string.IsNullOrEmpty(buffer)) { if (timing != null) timing.Skip = "emptyBuffer"; return markers; }
+            if (ranges == null || ranges.Count == 0) { if (timing != null) timing.Skip = "emptyRanges"; return markers; }
+            var phase = System.Diagnostics.Stopwatch.StartNew();
 
             // ---- Pass 1: LSP structural diagnostics, clamped to editable slots ----
             try
             {
                 // Route through SharedLspBridge: shared ClarionLsp when active, else the bundled LspClient.
-                if (SharedLspBridge.IsRunning && !string.IsNullOrEmpty(lspFileName))
+                if (string.IsNullOrEmpty(lspFileName)) { if (timing != null) timing.Skip = "noFile"; }
+                else if (!SharedLspBridge.IsRunning) { if (timing != null) timing.Skip = "lspDown"; }
+                else
                 {
                     // #56: with a real-module context the LSP sees the MEMBER-wrapped buffer, so its line
-                    // numbers run one AHEAD of Monaco's — subtract the offset before clamping to slots.
-                    int off = (lspContext != null) ? lspContext.LineOffset : 0;
+                    // numbers run AHEAD of Monaco's by what WrapBuffer prepended to THIS buffer (0 when it
+                    // passed it through) — subtract that before clamping to slots.
+                    int off = (lspContext != null) ? lspContext.LineOffsetFor(buffer) : 0;
+                    if (timing != null) timing.LspRan = true;
+                    phase.Restart();
                     SharedLspBridge.EnsureBufferSynced(lspFileName,
                         (lspContext != null) ? lspContext.WrapBuffer(buffer) : buffer);
+                    if (timing != null) timing.SyncMs = phase.ElapsedMilliseconds;
+                    phase.Restart();
                     List<LspClient.DiagnosticEntry> entries =
-                        await WaitForSettledDiagnosticsAsync(lspFileName).ConfigureAwait(false);
+                        await WaitForSettledDiagnosticsAsync(lspFileName, timing).ConfigureAwait(false);
+                    if (timing != null) { timing.WaitMs = phase.ElapsedMilliseconds; timing.LspEntries = entries != null ? entries.Count : -1; }
+                    if (entries == null) return null;   // K2: pending - no answer for the current text yet
 
                     foreach (var d in entries)
                     {
@@ -182,10 +202,28 @@ namespace ClarionAssistant.Services
             {
                 System.Diagnostics.Debug.WriteLine("[ModernEmbeditorDiagnostics] LSP pass: " + ex.Message);
             }
+            return markers;
+        }
 
-            // File mode (whole-source): stop here. The LSP pass above already covers the whole file;
-            // the per-slot heuristics below mis-fire on declaration files (FILE/GROUP/... as param types).
-            if (!embedSlotChecks) return markers;
+        /// <summary>
+        /// Passes 2 and 3, the slot checks: per-slot structure balance (an opener with no END or '.' in the
+        /// same slot, or a stray END) and undefined routines (`DO name` with no `name ROUTINE` in the
+        /// procedure). A pure function of its arguments: it never touches the LSP, SharedLspBridge or any
+        /// database, so it answers while the server is starting, busy or down. (1c685f2e item 7)
+        ///
+        /// Callers run it only where slot checks apply: embed mode, and the CA Editor overlay, which asks
+        /// for them over the whole file. The CA Embeditor's plain-source FILE MODE tab does not (ticket
+        /// 564aa142): the heuristic is designed for small embed fragments and mis-reads a full class or
+        /// .inc, taking FILE/GROUP/QUEUE parameter types (<c>Procedure(*File pTable)</c>) or labels for
+        /// openers and reporting bogus "FILE is not terminated with END" errors.
+        /// </summary>
+        public static List<Dictionary<string, object>> ComputeSlotChecks(
+            string buffer, List<int[]> ranges, string procedureName)
+        {
+            var markers = new List<Dictionary<string, object>>();
+            if (string.IsNullOrEmpty(buffer) || ranges == null || ranges.Count == 0) return markers;
+
+            string[] lines = SplitLines(buffer);
 
             // Routine set for the undefined-routine check (only flag when we actually parsed routines,
             // so a parse failure never produces false positives).
@@ -198,133 +236,250 @@ namespace ClarionAssistant.Services
             }
             catch { routines = new HashSet<string>(StringComparer.OrdinalIgnoreCase); }
 
-            // ---- Passes 2 & 3: per-slot structure balance + undefined routine ----
             foreach (var r in ranges)
             {
                 if (r == null || r.Length < 2) continue;
-                int s = Math.Max(1, r[0]);
-                int e = Math.Min(lines.Length, r[1]);
-                if (e < s) continue;
+                CheckSlot(lines, 1, Math.Max(1, r[0]), Math.Min(lines.Length, r[1]), routines, markers);
+            }
+            return markers;
+        }
 
-                var open = new Stack<int[]>(); // [line1, col1] for each unmatched opener within this slot
-                for (int ln = s; ln <= e; ln++)
+        /// <summary>One embed slot as the page sends it in the R11 slice form: its first Monaco line and its text.</summary>
+        public sealed class SlotText
+        {
+            public int Start;
+            public string Text;
+        }
+
+        /// <summary>
+        /// The slice form of <see cref="ComputeSlotChecks(string,List{int[]},string)"/> (1c685f2e R11): the page sends
+        /// only the slots' text, never the 3.2 MB buffer. The routine set is <paramref name="routines"/> (the
+        /// procedure family's ROUTINE labels from the host's span map) plus any ROUTINE label typed inside a slot.
+        /// Markers come back in Monaco lines (each slot's Start + its line index).
+        /// </summary>
+        public static List<Dictionary<string, object>> ComputeSlotChecks(IList<SlotText> slots, IEnumerable<string> routines)
+        {
+            var markers = new List<Dictionary<string, object>>();
+            if (slots == null || slots.Count == 0) return markers;
+            var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (routines != null) foreach (var r in routines) if (!string.IsNullOrEmpty(r)) set.Add(r);
+            var split = new List<string[]>();
+            foreach (var slot in slots)
+            {
+                string text = (slot != null ? slot.Text : null) ?? "";
+                split.Add(SplitLines(text));
+                try
                 {
-                    string code = Sanitize(lines[ln - 1]); // blanks comments + string interiors, preserves columns
-                    string trimmed = code.Trim();
-                    if (trimmed.Length == 0) continue;
-                    string u = trimmed.ToUpperInvariant();
+                    var parsed = ClarionAppDataReader.ParseRoutines(text, null);
+                    if (parsed != null) foreach (var p in parsed) set.Add(p.Name);
+                }
+                catch { }
+            }
+            for (int i = 0; i < slots.Count; i++)
+            {
+                if (slots[i] == null || slots[i].Start < 1) continue;
+                int first = slots[i].Start;
+                CheckSlot(split[i], first, first, first + split[i].Length - 1, set, markers);
+            }
+            return markers;
+        }
 
-                    // Close: a line beginning with END..., or a lone '.'
-                    if (EndRx.IsMatch(u) || u == ".")
-                    {
-                        if (open.Count > 0) open.Pop();
-                        else
-                            markers.Add(Marker(ln, FirstNonWs(code) + 1, ln, code.Length + 1,
-                                "END has no matching structure in this embed slot.", SevWarning));
-                        continue;
-                    }
+        /// <summary>
+        /// Passes 2 &amp; 3 over ONE slot: Monaco lines <paramref name="s"/>..<paramref name="e"/>, where the text of
+        /// Monaco line <c>ln</c> is <c>lines[ln - first]</c> (first = 1 for a whole buffer, the slot's start for a slice).
+        /// </summary>
+        private static void CheckSlot(string[] lines, int first, int s, int e, HashSet<string> routines,
+            List<Dictionary<string, object>> markers)
+        {
+            if (e < s) return;
+            var open = new Stack<int[]>(); // [line1, col1] for each unmatched opener within this slot
+            for (int ln = s; ln <= e; ln++)
+            {
+                string code = Sanitize(lines[ln - first]); // blanks comments + string interiors, preserves columns
+                string trimmed = code.Trim();
+                if (trimmed.Length == 0) continue;
+                string u = trimmed.ToUpperInvariant();
 
-                    // Block IF only — skip one-liners: 'IF .. THEN stmt' or a trailing '.' terminator.
-                    if (IfRx.IsMatch(u))
-                    {
-                        int thenIdx = u.IndexOf(" THEN", StringComparison.Ordinal);
-                        string afterThen = thenIdx >= 0 ? trimmed.Substring(thenIdx + 5).Trim() : "";
-                        bool oneLiner = afterThen.Length > 0 || TrailingDot.IsMatch(trimmed);
-                        if (!oneLiner) open.Push(new[] { ln, FirstNonWs(code) + 1 });
-                        // fall through so a 'DO' on the same line is still checked
-                    }
+                // Set when THIS line opens a structure (pushed, or self-terminated on the same
+                // line). Consumed by the trailing-'.' close below: such a line spends the first
+                // '.' of its run terminating ITSELF, so only the remaining dots close outer ones.
+                bool lineOpensStructure = false;
+
+                // Close: a line beginning with END..., or a lone '.'
+                if (EndRx.IsMatch(u) || u == ".")
+                {
+                    if (open.Count > 0) open.Pop();
                     else
+                        markers.Add(Marker(ln, FirstNonWs(code) + 1, ln, code.Length + 1,
+                            "END has no matching structure in this embed slot.", SevWarning));
+                    continue;
+                }
+
+                // Close (post-condition LOOP): 'LOOP ... UNTIL expr' / 'LOOP ... WHILE expr' ends the
+                // LOOP with the UNTIL/WHILE line instead of END (GH #222 follow-up — SoftVelocity's own
+                // libsrc\win\abbrowse.clw uses it). It closes ONLY a LOOP that is the innermost open
+                // structure; with an IF/CASE/... on top it is not this LOOP's closer and closes nothing.
+                // The pre-condition form 'LOOP WHILE x' starts with LOOP, so it never reaches here and
+                // is still pushed as an opener that needs END. With no LOOP on top the line falls
+                // through and is treated exactly as before (an ordinary statement) — no new warning
+                // class, so this can only remove false positives (same reasoning as the trailing-'.'
+                // close below).
+                if (PostCondClose.IsMatch(u) && open.Count > 0 &&
+                    StructWord(lines[open.Peek()[0] - first]) == "LOOP")
+                {
+                    open.Pop();
+                    continue;
+                }
+
+                // Block IF only — skip one-liners: 'IF .. THEN stmt' or a trailing '.' terminator.
+                if (IfRx.IsMatch(u))
+                {
+                    lineOpensStructure = true;
+                    int thenIdx = u.IndexOf(" THEN", StringComparison.Ordinal);
+                    string afterThen = thenIdx >= 0 ? trimmed.Substring(thenIdx + 5).Trim() : "";
+                    bool oneLiner = afterThen.Length > 0 || TrailingDot.IsMatch(trimmed);
+                    if (!oneLiner) open.Push(new[] { ln, FirstNonWs(code) + 1 });
+                    // fall through so a 'DO' on the same line is still checked
+                }
+                else
+                {
+                    Match structMatch = StructOpen.Match(u);
+                    Match bandMatch = structMatch.Success ? null : BandOpen.Match(u);
+                    Match openMatch = structMatch.Success ? structMatch : bandMatch;
+                    if (openMatch == null || !openMatch.Success)
                     {
-                        Match structMatch = StructOpen.Match(u);
-                        Match bandMatch = structMatch.Success ? null : BandOpen.Match(u);
-                        Match openMatch = structMatch.Success ? structMatch : bandMatch;
-                        if (openMatch == null || !openMatch.Success)
-                        {
-                            // GROUP was pulled out of StructOpen's alternation (see GroupOpen's
-                            // comment) — this is its own match slot, same shape as ToolbarOpen below.
-                            Match groupMatch = GroupOpen.Match(u);
-                            if (groupMatch.Success) openMatch = groupMatch;
-                        }
-                        if (openMatch == null || !openMatch.Success)
-                        {
-                            // RECORD was pulled out of StructOpen's alternation too (see RecordOpen's
-                            // comment) — same shape as GroupOpen above.
-                            Match recordMatch = RecordOpen.Match(u);
-                            if (recordMatch.Success) openMatch = recordMatch;
-                        }
-                        if (openMatch == null || !openMatch.Success)
-                        {
-                            // TOOLBAR has its own tight pattern (see ToolbarOpen) and never takes a
-                            // label, so the label gate below can't apply to it: ToolbarOpen has no
-                            // capture group, Groups[1] is empty and never in DeclarationStructKeywords.
-                            Match toolbarMatch = ToolbarOpen.Match(u);
-                            if (toolbarMatch.Success) openMatch = toolbarMatch;
-                        }
-                        if (openMatch == null || !openMatch.Success)
-                        {
-                            // Same reasoning as ToolbarOpen, for MENU/MENUBAR/SHEET/TAB/OPTION: matched
-                            // keyword never takes a label, so the label gate below can't apply — its
-                            // Groups[1] value isn't checked against DeclarationStructKeywords here either
-                            // (none of these five are in that set).
-                            Match nestedMatch = NestedBandOpen.Match(u);
-                            if (nestedMatch.Success) openMatch = nestedMatch;
-                        }
-
-                        if (openMatch != null && openMatch.Success)
-                        {
-                            // ✅ FIX: if the matched keyword is a declaration-structure keyword AND it's at
-                            // column 0 of this (already-trimmed) line, the optional label group backtracked
-                            // to empty — meaning this word IS the label itself (e.g. "Report" in
-                            // "Report          &STRING"), not a structure type in second position. A Clarion
-                            // label always starts at column 0 (confirmed directly against the compiler:
-                            // indenting a label desyncs the parser and produces unrelated errors on the
-                            // following tokens), so a match at column 0 can only be the label — a real
-                            // structure type always has a label before it. Skip it so it falls through as a
-                            // plain statement instead of pushing a bogus, never-closed opener that would
-                            // swallow a later real END and make an unrelated, genuinely-terminated structure
-                            // misreport as unterminated.
-                            string keyword = openMatch.Groups[1].Value;
-                            bool keywordIsFirstWord = openMatch.Groups[1].Index == 0;
-                            bool usedAsLabel = keywordIsFirstWord && DeclarationStructKeywords.Contains(keyword);
-
-                            if (!usedAsLabel)
-                            {
-                                // Skip a self-terminated inline structure (trailing '.' or an END later on the
-                                // same line, e.g. "EXECUTE n; a; b END") — only multi-line openers are tracked.
-                                bool selfTerminated = TrailingDot.IsMatch(trimmed) || InlineEnd.IsMatch(u);
-                                if (!selfTerminated) open.Push(new[] { ln, FirstNonWs(code) + 1 });
-                            }
-                        }
+                        // GROUP was pulled out of StructOpen's alternation (see GroupOpen's
+                        // comment) — this is its own match slot, same shape as ToolbarOpen below.
+                        Match groupMatch = GroupOpen.Match(u);
+                        if (groupMatch.Success) openMatch = groupMatch;
+                    }
+                    if (openMatch == null || !openMatch.Success)
+                    {
+                        // RECORD was pulled out of StructOpen's alternation too (see RecordOpen's
+                        // comment) — same shape as GroupOpen above.
+                        Match recordMatch = RecordOpen.Match(u);
+                        if (recordMatch.Success) openMatch = recordMatch;
+                    }
+                    if (openMatch == null || !openMatch.Success)
+                    {
+                        // TOOLBAR has its own tight pattern (see ToolbarOpen) and never takes a
+                        // label, so the label gate below can't apply to it: ToolbarOpen has no
+                        // capture group, Groups[1] is empty and never in DeclarationStructKeywords.
+                        Match toolbarMatch = ToolbarOpen.Match(u);
+                        if (toolbarMatch.Success) openMatch = toolbarMatch;
+                    }
+                    if (openMatch == null || !openMatch.Success)
+                    {
+                        // Same reasoning as ToolbarOpen, for MENU/MENUBAR/SHEET/TAB/OPTION: matched
+                        // keyword never takes a label, so the label gate below can't apply — its
+                        // Groups[1] value isn't checked against DeclarationStructKeywords here either
+                        // (none of these five are in that set).
+                        Match nestedMatch = NestedBandOpen.Match(u);
+                        if (nestedMatch.Success) openMatch = nestedMatch;
                     }
 
-                    // Undefined routine: DO <name>
-                    if (routines.Count > 0)
+                    if (openMatch != null && openMatch.Success)
                     {
-                        var m = DoStmt.Match(code);
-                        if (m.Success)
+                        // ✅ FIX: if the matched keyword is a declaration-structure keyword AND it's at
+                        // column 0 of this (already-trimmed) line, the optional label group backtracked
+                        // to empty — meaning this word IS the label itself (e.g. "Report" in
+                        // "Report          &STRING"), not a structure type in second position. A Clarion
+                        // label always starts at column 0 (confirmed directly against the compiler:
+                        // indenting a label desyncs the parser and produces unrelated errors on the
+                        // following tokens), so a match at column 0 can only be the label — a real
+                        // structure type always has a label before it. Skip it so it falls through as a
+                        // plain statement instead of pushing a bogus, never-closed opener that would
+                        // swallow a later real END and make an unrelated, genuinely-terminated structure
+                        // misreport as unterminated.
+                        string keyword = openMatch.Groups[1].Value;
+                        bool keywordIsFirstWord = openMatch.Groups[1].Index == 0;
+                        bool usedAsLabel = keywordIsFirstWord && DeclarationStructKeywords.Contains(keyword);
+
+                        if (!usedAsLabel)
                         {
-                            string name = m.Groups[1].Value;
-                            if (!routines.Contains(name))
-                            {
-                                int col = m.Groups[1].Index + 1;
-                                markers.Add(Marker(ln, col, ln, col + name.Length,
-                                    "Routine '" + name + "' is not defined in this procedure.", SevWarning));
-                            }
+                            lineOpensStructure = true;
+                            // Skip a self-terminated inline structure (trailing '.' or an END later on the
+                            // same line, e.g. "EXECUTE n; a; b END") — only multi-line openers are tracked.
+                            bool selfTerminated = TrailingDot.IsMatch(trimmed) || InlineEnd.IsMatch(u);
+                            if (!selfTerminated) open.Push(new[] { ln, FirstNonWs(code) + 1 });
                         }
                     }
                 }
 
-                // Unmatched openers left on the stack → unterminated within this slot.
-                while (open.Count > 0)
+                // Close (part 2): a trailing '.' is Clarion's END-EQUIVALENT terminator and is legal at
+                // the END OF AN ORDINARY STATEMENT, not only on a line of its own — "return self.Bind(x).",
+                // "hr = ok." and "return -1." all close the enclosing IF/LOOP/CASE. The branch above only
+                // recognised a line STARTING with END or a line that is EXACTLY ".", so every such
+                // statement-terminator left its opener on the stack; the slot then ran out of closers and
+                // an enclosing, perfectly legal IF was reported as unterminated (this shape is pervasive —
+                // 136 occurrences in a single hand-written library source). A line that OPENED a structure
+                // spends its trailing '.' terminating ITSELF (already handled as the IF one-liner /
+                // selfTerminated cases above), so it closes nothing further here.
+                //
+                // Deliberately closes AT MOST ONE structure per line. Clarion's ".." / "..." close two and
+                // three respectively, but that shape did not occur anywhere in the surveyed corpus, so
+                // honouring it would mean shipping untested counting logic to buy a case that may not
+                // arise; a multi-dot line simply keeps the old under-closing behaviour until a real
+                // occurrence justifies it.
+                //
+                // Guards, matching the discipline of the two existing TrailingDot call sites:
+                //   * Sanitize() has already blanked '!' comments and string-literal interiors, so a
+                //     period inside 'All done.' or a trailing comment can never reach here.
+                //   * A digit before the '.' is NOT a decimal point — Clarion writes "return -1." with the
+                //     '.' as the terminator (verified against real library source).
+                //   * '|' line continuation needs no special handling even though this scanner is purely
+                //     per-line: a continued statement carries its terminating '.' on its LAST physical
+                //     line, which is the line examined here. (A continued line ends with '|', never '.'.)
+                //   * When nothing is open this stays SILENT rather than reporting "END has no matching
+                //     structure" — deliberately no new warning class, so the change can only remove false
+                //     positives, never add one. The pre-existing lone-'.' branch above keeps its warning.
+                if (!lineOpensStructure && TrailingDot.IsMatch(trimmed) && open.Count > 0)
                 {
-                    var o = open.Pop();
-                    string word = StructWord(lines[o[0] - 1]);
-                    markers.Add(Marker(o[0], o[1], o[0], o[1] + Math.Max(1, word.Length),
-                        word + " is not terminated with END or '.' in this embed slot.", SevError));
+                    open.Pop();
+                }
+
+                // Undefined routine: DO <name>
+                if (routines.Count > 0)
+                {
+                    var m = DoStmt.Match(code);
+                    if (m.Success)
+                    {
+                        string name = m.Groups[1].Value;
+                        if (!routines.Contains(name))
+                        {
+                            int col = m.Groups[1].Index + 1;
+                            markers.Add(Marker(ln, col, ln, col + name.Length,
+                                "Routine '" + name + "' is not defined in this procedure.", SevWarning));
+                        }
+                    }
                 }
             }
 
-            return markers;
+            // Unmatched openers left on the stack → unterminated within this slot.
+            while (open.Count > 0)
+            {
+                var o = open.Pop();
+                string word = StructWord(lines[o[0] - first]);
+                markers.Add(Marker(o[0], o[1], o[0], o[1] + Math.Max(1, word.Length),
+                    word + " is not terminated with END or '.' in this embed slot.", SevError));
+            }
+        }
+
+        /// <summary>Per-phase timings of one <see cref="ComputeAsync"/> call, for the hosts' [diag-timing]
+        /// log line (16d140e9: a squiggle took ~5 minutes to appear on a 3.2 MB generated module).
+        /// -1 = the phase did not run.</summary>
+        public sealed class Timing
+        {
+            public bool LspRan;
+            /// <summary>Why the LSP pass did not run: emptyBuffer, emptyRanges, noFile or lspDown; null when
+            /// it ran. Logged as skip= (1c685f2e item 8).</summary>
+            public string Skip;
+            public long SyncMs = -1;       // EnsureBufferSynced (didChange of the whole buffer)
+            public long WaitMs = -1;       // WaitForSettledDiagnosticsAsync, settle window included
+            public string WaitEnd;         // how the wait ended: complete / timeout(pending) + settle outcome
+            public int LspEntries = -1;    // server entries before clamping to slots
+            /// <summary>K2: the LSP had no answer for the CURRENT text within the budget; ComputeAsync returned null.</summary>
+            public bool Pending;
         }
 
         // The Clarion LSP publishes diagnostics progressively for a file that just changed: an early
@@ -353,22 +508,35 @@ namespace ClarionAssistant.Services
         // thread per request for the whole settle window; past the pool's core-count baseline .NET only
         // injects replacements at roughly 1-2/sec, so queuing delay compounds exactly when requests
         // overlap, which is the same slow-machine case this settle window exists to serve.
-        private static async Task<List<LspClient.DiagnosticEntry>> WaitForSettledDiagnosticsAsync(string lspFileName)
+        private static async Task<List<LspClient.DiagnosticEntry>> WaitForSettledDiagnosticsAsync(string lspFileName, Timing timing = null)
         {
             var wait = SharedLspBridge.WaitForDiagnostics(lspFileName, 1500, true);
-            List<LspClient.DiagnosticEntry> last =
-                (wait != null && !wait.Pending && wait.Entries != null)
-                    ? wait.Entries
-                    : (SharedLspBridge.GetCachedDiagnostics(lspFileName) ?? new List<LspClient.DiagnosticEntry>());
+            bool complete = wait != null && !wait.Pending && wait.Entries != null;
+            if (!complete)
+            {
+                // K2 (1c685f2e): pending is pending. The old fallback to the cache served whatever was cached for the
+                // URI, which after an embeditor reopen was the ON-DISK module's publish (other line numbers), so a
+                // squiggle sat on a comment and the real DO lines had none. The caller answers {markers:null,
+                // pending:true}; the page keeps its current LSP markers and asks again.
+                if (timing != null) { timing.WaitEnd = "timeout(1500ms,pending)"; timing.Pending = true; }
+                return null;
+            }
+            List<LspClient.DiagnosticEntry> last = wait.Entries;
+            string end = "complete";
 
+            int polls = 0;
+            bool republished = false;
             for (int i = 0; last.Count == 0 && i < SettleMaxChecks; i++)
             {
                 await Task.Delay(SettleIntervalMs).ConfigureAwait(false);
+                polls++;
                 var next = SharedLspBridge.GetCachedDiagnostics(lspFileName);
                 if (next == null) continue; // no fresher publish yet — keep waiting out the settle window
                 last = next;
-                if (last.Count > 0) break; // a fuller batch landed — done, no need to keep waiting
+                if (last.Count > 0) { republished = true; break; } // a fuller batch landed — done, no need to keep waiting
             }
+            if (timing != null)
+                timing.WaitEnd = end + (polls == 0 ? "" : republished ? "+settle:republish@" + polls : "+settle:quiet@" + polls);
             return last;
         }
 
@@ -405,6 +573,11 @@ namespace ClarionAssistant.Services
         {
             var m = StructWordRx.Match(Sanitize(rawLine ?? "").Trim());
             return m.Success ? m.Value.ToUpperInvariant() : "Structure";
+        }
+
+        private static string[] SplitLines(string text)
+        {
+            return text.Replace("\r\n", "\n").Replace("\r", "\n").Split('\n');
         }
 
         private static int FirstNonWs(string s)

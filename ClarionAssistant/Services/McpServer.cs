@@ -427,6 +427,10 @@ namespace ClarionAssistant.Services
                     toolArgs.Add(System.Diagnostics.Process.GetCurrentProcess().Id.ToString());
                     string liveSln = null;
                     try { liveSln = EditorService.GetOpenSolutionPath(); } catch { liveSln = null; }
+                    // --solution below is fixed at launch; this record is what lets the standalone
+                    // LSP follow a solution opened LATER (77aceec5). Kept current by
+                    // AssistantChatControl.PollForSolutionChange.
+                    IdeSolutionRecord.Publish(liveSln);
                     if (!string.IsNullOrEmpty(liveSln) && File.Exists(liveSln))
                     {
                         toolArgs.Add("--solution");
@@ -951,6 +955,9 @@ namespace ClarionAssistant.Services
                             RaiseToolCall,
                             "clarion-assistant",
                             "1.0.0");
+                        // PR #198: an install can override the UI-thread tool budget (5-600s, never below a tool's declared minimum) (see McpUiTimeoutPolicy).
+                        _dispatcher.UiTimeoutSettingReader = () =>
+                            _settings != null ? _settings.Get(McpUiTimeoutPolicy.SettingKey) : null;
                     }
                     return _dispatcher;
                 }
