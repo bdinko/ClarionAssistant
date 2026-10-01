@@ -20,7 +20,7 @@ namespace ClarionAssistant
     {
         // Live-instance registry so ShutdownService can dispose this control's WebView2s ON THE UI THREAD
         // BEFORE native IDE teardown. Disposing the control chains to _header (HeaderWebView = HUD) and
-        // _homeView (HomeWebView), and _tabManager disposes its tab content (SchemaSourcesView etc.).
+        // _homeView (HomeWebView) and _schemaView (SchemaSourcesView), and _tabManager disposes its tab content.
         // Mirrors the ModernEmbeditorViewContent pattern. (Practically a singleton chat pad.)
         private static readonly List<AssistantChatControl> _instances = new List<AssistantChatControl>();
 
@@ -32,7 +32,8 @@ namespace ClarionAssistant
 
         // Header (WebView2)
         private HeaderWebView _header;
-        private Splitter _splitter;
+        // Schema Sources / Source Control: ONE panel for the pane, under the header (82938fc7).
+        private SchemaSourcesView _schemaView;
         private Form _logForm;
 
         private McpServer _mcpServer;
@@ -117,23 +118,19 @@ namespace ClarionAssistant
             _header = new HeaderWebView();
             _header.ActionReceived += OnHeaderAction;
             _header.HeaderReady += OnHeaderReady;
+            // Fixed height (82938fc7): no splitter, and a saved "Header.Height" from older builds is ignored.
 
-            // Restore saved header height
-            int savedHeight;
-            string heightStr = _settings.Get("Header.Height");
-            if (!string.IsNullOrEmpty(heightStr) && int.TryParse(heightStr, out savedHeight))
-                _header.Height = Math.Max(60, Math.Min(400, savedHeight));
-
-            // === Splitter between header and content ===
-            _splitter = new Splitter
+            // === Schema Sources / Source Control panel (82938fc7): shown under the header by its tabs.
+            // Created lazily by EnsureSchemaView the first time one of those tabs opens (4d63b995): a hidden
+            // WebView2 in every session slowed the IDE's close. ===
+            // One zoom for the header and the panel under it (its height is the header's pane): whichever the
+            // user zooms, the other follows; the header saves it and re-derives both heights.
+            _header.LayoutChanged += (s, e) =>
             {
-                Dock = DockStyle.Top,
-                Height = 4,
-                BackColor = Color.FromArgb(49, 50, 68),
-                MinSize = 60,
-                Cursor = Cursors.SizeNS
+                if (!SchemaViewAlive) return;
+                _schemaView.ZoomFactor = _header.ZoomFactor;
+                _schemaView.PaneHeight = _header.PanePixelHeight;
             };
-            _splitter.SplitterMoved += OnSplitterMoved;
 
             // === Tab strip (custom-painted, hidden when only 1 tab — MultiTerminal pattern) ===
             _tabStrip = new Panel
@@ -156,8 +153,9 @@ namespace ClarionAssistant
             _homeView.ActionReceived += OnHomeAction;
             _homeView.HomeReady += OnHomeReady;
 
-            // === LSP status bar (bottom of terminal content area) ===
-            _lspStatusBar = new Terminal.LspStatusBar();
+            // === LSP status bar: retired from view (82938fc7). It stays in code, always hidden, and its
+            // SetDiagnostics/SetActivity calls stay harmless; follow-up fb98d892 removes it. ===
+            _lspStatusBar = new Terminal.LspStatusBar { Visible = false };
             _lspStatusBar.DiagnosticsClicked += OnDiagnosticsBarClicked;
             _contentArea.Controls.Add(_lspStatusBar);
 
@@ -173,7 +171,6 @@ namespace ClarionAssistant
             // Add in correct order (Fill first, then Top items from bottom to top)
             Controls.Add(_contentArea);
             Controls.Add(_tabStrip);
-            Controls.Add(_splitter);
             Controls.Add(_header);
 
             // Create Home tab — HomeWebView added to _contentArea, visible immediately
@@ -186,13 +183,13 @@ namespace ClarionAssistant
 
         private void OnHeaderReady(object sender, EventArgs e)
         {
+            HookIdeVersionChanges();
             LoadVersions();
             LoadSolutionHistory();
             DetectFromIde();
             StartMcpServer();
             _header.SetTheme(_isDarkTheme);
-            _header.SetRedFile(_redFileDisplay, _redFileCss); // re-push in case LoadRedFile ran before header was ready
-            SyncTabBarToHeader();
+            _header.SetRedFile(_redFileDisplay, _redFileCss, RedFileOpenable); // re-push in case LoadRedFile ran before header was ready
             // Solutions now auto-detected from IDE, no longer shown on home page
         }
 
@@ -225,23 +222,29 @@ namespace ClarionAssistant
             if (!_homeView.IsReady) return;
             try
             {
-                var accounts = Services.SchemaGraphService.GetAllGitHubAccounts();
-                var sb = new System.Text.StringBuilder("[");
-                for (int i = 0; i < accounts.Count; i++)
-                {
-                    if (i > 0) sb.Append(",");
-                    var a = accounts[i];
-                    string prov = a.ContainsKey("provider") ? (string)a["provider"] : "github";
-                    sb.AppendFormat("{{\"id\":\"{0}\",\"displayName\":\"{1}\",\"username\":\"{2}\",\"provider\":\"{3}\"}}",
-                        EscJson((string)a["id"]), EscJson((string)a["displayName"]), EscJson((string)a["username"]), EscJson(prov));
-                }
-                sb.Append("]");
-                _homeView.SetGitHubAccounts(sb.ToString());
+                _homeView.SetGitHubAccounts(BuildGitHubAccountsJson());
             }
             catch (Exception ex)
             {
                 System.Diagnostics.Debug.WriteLine("[AssistantChatControl] SendGitHubAccountsToHome error: " + ex.Message);
             }
+        }
+
+        /// <summary>The source-control accounts as the Home page and the Source Control pane read them (no tokens).</summary>
+        private static string BuildGitHubAccountsJson()
+        {
+            var accounts = Services.SchemaGraphService.GetAllGitHubAccounts();
+            var sb = new System.Text.StringBuilder("[");
+            for (int i = 0; i < accounts.Count; i++)
+            {
+                if (i > 0) sb.Append(",");
+                var a = accounts[i];
+                string prov = a.ContainsKey("provider") ? (string)a["provider"] : "github";
+                sb.AppendFormat("{{\"id\":\"{0}\",\"displayName\":\"{1}\",\"username\":\"{2}\",\"provider\":\"{3}\"}}",
+                    EscJson((string)a["id"]), EscJson((string)a["displayName"]), EscJson((string)a["username"]), EscJson(prov));
+            }
+            sb.Append("]");
+            return sb.ToString();
         }
 
         private void OnHomeAction(object sender, HomeActionEventArgs e)
@@ -281,6 +284,24 @@ namespace ClarionAssistant
                 || action == "openProject";
         }
 
+        /// <summary>
+        /// Header ⧉ beside SOLUTION (82938fc7). The page sends only the intent; the path copied is this
+        /// control's own _currentSlnPath, never one from the page. The host copies because
+        /// navigator.clipboard.writeText fails on file:// under WebView2; WebMessageReceived runs on the UI
+        /// (STA) thread, as Clipboard needs (CaFindPad pattern). The page shows ✓ or ✗ from the reply.
+        /// </summary>
+        private void OnCopySolutionPath()
+        {
+            bool ok = false;
+            string path = _currentSlnPath;
+            if (!string.IsNullOrEmpty(path))
+            {
+                try { Clipboard.SetText(path); ok = true; }
+                catch (Exception ex) { Debug.WriteLine("[AssistantChatControl] copy solution path: " + ex.Message); }
+            }
+            _header.SendCopyResult(ok);
+        }
+
         private void OnOpenGitHub()
         {
             try
@@ -300,14 +321,8 @@ namespace ClarionAssistant
 
         private void OnActiveTabChanged(object sender, TerminalTab tab)
         {
-            SyncTabBarToHeader();
             if (tab != null && !tab.IsHome && tab.Renderer != null)
                 tab.Renderer.Focus();
-        }
-
-        private void SyncTabBarToHeader()
-        {
-            // Tab bar is now managed by the WinForms TabControl directly
         }
 
         private void OnHeaderAction(object sender, HeaderActionEventArgs e)
@@ -320,22 +335,17 @@ namespace ClarionAssistant
                 case "createClass": OnCreateClass(); break;
                 case "evaluateCode": OnEvaluateCode(sender, EventArgs.Empty); break;
                 case "refresh":
-                    // Issue #32: refresh button intentionally clears the saved
-                    // version override so the dropdown can be reset to whatever
-                    // the Clarion IDE currently has selected. DetectFromIde() is
-                    // also called from non-user paths (startup, solution change)
-                    // and must NOT clear the override in those cases — that's
-                    // why the clear lives here, not inside DetectFromIde.
-                    _settings.Set("Clarion.Version.Override", "");
-                    DetectFromIde();
+                    // Re-read the IDE's Build > Set Clarion Version now (the change hook and 10 s poll do it too).
+                    DetectFromIde();   // also restarts the LSP if the version moved
                     break;
                 case "browse": OnBrowseSolution(sender, EventArgs.Empty); break;
                 case "fullIndex": RunIndex(false); break;
                 case "updateIndex": RunIndex(true); break;
-                case "versionChanged": OnVersionChanged(e.Data); break;
                 case "solutionChanged": OnSolutionChanged(e.Data); break;
                 case "themeChanged": OnThemeChanged(e.Data); break;
-                case "toggleDiagBar": OnToggleDiagnosticsBar(); break;
+                case "headerTab": OnHeaderTab(e.Data); break;
+                case "copySolutionPath": OnCopySolutionPath(); break;
+                case "openRedFile": OnOpenRedFile(); break;
                 case "cheatSheet": OnCheatSheet(); break;
                 case "docs": OnDocs(); break;
                 case "showLog": ShowIndexLog(); break;
@@ -638,9 +648,6 @@ namespace ClarionAssistant
             renderer.Initialized += (s, ev) => OnTabRendererInitialized(tab);
             System.Diagnostics.Debug.WriteLine("[AssistantChatControl] Events wired for project tab " + tab.Id + ", StartupCommand=" + (tab.StartupCommand ?? "(none)"));
 
-            // Schema sources panel (above terminal)
-            AttachSchemaSourcesView(tab);
-
             _tabManager.ActivateTab(tab.Id);
             System.Diagnostics.Debug.WriteLine("[AssistantChatControl] ActivateTab completed for project tab " + tab.Id);
         }
@@ -655,64 +662,110 @@ namespace ClarionAssistant
 
             if (_versionInfo == null || _versionInfo.Versions.Count == 0)
             {
-                _header.SetVersions(new[] { "(not detected)" }, new[] { "" }, 0);
+                // Remember the IDE choice anyway, or SyncVersionWithIde reloads on every 10 s poll.
+                string live;
+                if (ClarionVersionService.TryGetLiveIdeVersionName(out live))
+                    _lastIdeVersionChoice = ClarionVersionSelector.NormalizeIdeChoice(live);
+                _header.SetVersion("(not detected)", "No Clarion version found in ClarionProperties.xml");
                 return;
             }
 
-            _currentVersionConfig = _versionInfo.GetCurrentConfig();
-
-            // Issue #32: a saved user override wins over IDE-detected, but only
-            // if it still resolves to a real version (the user may have uninstalled
-            // that Clarion edition since the override was saved).
-            string overrideName = _settings.Get("Clarion.Version.Override");
-            ClarionVersionConfig overrideConfig = null;
-            if (!string.IsNullOrEmpty(overrideName))
+            // 16d140e9: ONE resolution for the panel, the indexer, the LSP and the library graph. 286f2e57: it is
+            // the IDE's Build > Set Clarion Version only; CA displays it and has no picker of its own.
+            var selection = EffectiveClarionVersion.Resolve(_versionInfo);
+            string previousDescribe = _versionSelection != null ? _versionSelection.Describe() : null;
+            _currentVersionConfig = selection.Config;
+            _lastIdeVersionChoice = selection.IdeChoice;
+            _versionSelection = selection;
+            string describe = selection.Describe();
+            if (!string.Equals(previousDescribe, describe, StringComparison.Ordinal))
             {
-                overrideConfig = _versionInfo.Versions.Find(v => v.Name == overrideName);
-                if (overrideConfig != null)
-                    _currentVersionConfig = overrideConfig;
+                // Changed version or source: say so, drop the library graph's 20 s memo, and bump the signal the
+                // Data pad's environment watcher keys on (its Explorer header shows VERSION too).
+                LspTrace.Write("[AssistantChatControl] " + describe);
+                System.Diagnostics.Debug.WriteLine("[AssistantChatControl] " + describe);
+                ClarionGraphService.InvalidateVersionCache();
+                EffectiveClarionVersion.NotifyChanged();
             }
 
-            var labels = new System.Collections.Generic.List<string>();
-            var values = new System.Collections.Generic.List<string>();
-            int selectedIdx = 0;
-
-            for (int i = 0; i < _versionInfo.Versions.Count; i++)
-            {
-                var config = _versionInfo.Versions[i];
-                string label = config.Name;
-                if (overrideConfig != null && config.Name == overrideConfig.Name)
-                    label += " (saved)";
-                else if (_currentVersionConfig != null && config.Name == _currentVersionConfig.Name
-                    && _versionInfo.CurrentVersionName != null
-                    && _versionInfo.CurrentVersionName.IndexOf("Current", StringComparison.OrdinalIgnoreCase) >= 0)
-                    label += " (active)";
-
-                labels.Add(label);
-                values.Add(config.Name);
-                if (_currentVersionConfig != null && config.Name == _currentVersionConfig.Name)
-                    selectedIdx = i;
-            }
-
-            _header.SetVersions(labels.ToArray(), values.ToArray(), selectedIdx);
+            // Say which source chose it — never resolve a version silently.
+            string label = _currentVersionConfig == null ? "(not detected)"
+                : _currentVersionConfig.Name + (selection.ShortSource != null ? " (" + selection.ShortSource + ")" : "");
+            _header.SetVersion(label, describe + ". Change it with Build > Set Clarion Version.");
         }
 
-        private void OnVersionChanged(string value)
+        /// <summary>The IDE's Build &gt; Set Clarion Version choice at the last resolution (normalized).</summary>
+        private string _lastIdeVersionChoice;
+
+        /// <summary>The last version selection, with the tier that decided it (for the index log).</summary>
+        private ClarionVersionSelection _versionSelection;
+
+        private bool _ideVersionHooked;
+
+        // Kept so Dispose can unhook it: PropertyService.PropertyChanged is static and would root this pad.
+        private ICSharpCode.Core.PropertyChangedEventHandler _ideVersionHandler;
+
+        private void UnhookIdeVersionChanges()
         {
-            if (_versionInfo != null && !string.IsNullOrEmpty(value))
+            try
             {
-                _currentVersionConfig = _versionInfo.Versions.Find(v => v.Name == value);
-                if (_currentVersionConfig != null)
-                {
-                    // Issue #32: persist the user's choice so it survives IDE
-                    // reload. Without this, LoadVersions() re-queries the Clarion
-                    // IDE's PropertyService on every load and reverts to whatever
-                    // the IDE itself has selected (e.g. "Clarion.NET 4.0.13372").
-                    _settings.Set("Clarion.Version.Override", value);
-                    LoadVersions(); // refresh labels so the "(saved)" tag appears
-                }
-                LoadRedFile();
+                if (_ideVersionHandler != null) ICSharpCode.Core.PropertyService.PropertyChanged -= _ideVersionHandler;
             }
+            catch { }
+            _ideVersionHandler = null;
+            _ideVersionHooked = false;
+        }
+
+        /// <summary>
+        /// Follow the IDE's Build &gt; Set Clarion Version (16d140e9). Clarion's Versions.SetActiveVersion (the
+        /// menu command) and SetActiveVersionFromSolution (solution open) both end in
+        /// PropertyService.Set("Clarion.Version", ...), which raises PropertyService.PropertyChanged — the same
+        /// hook MonacoSettingsBroadcaster uses for the editor options. The 10 s poll re-checks too, so a missed
+        /// event only delays the switch.
+        /// </summary>
+        private void HookIdeVersionChanges()
+        {
+            if (_ideVersionHooked) return;
+            try
+            {
+                _ideVersionHandler = (s, e) =>
+                {
+                    try
+                    {
+                        if (e == null || e.Key != "Clarion.Version" || IsDisposed || !IsHandleCreated) return;
+                        // Posted, even on the UI thread: run after the IDE has finished its own switch.
+                        BeginInvoke((Action)(() => SyncVersionWithIde()));
+                    }
+                    catch { }
+                };
+                ICSharpCode.Core.PropertyService.PropertyChanged += _ideVersionHandler;
+                _ideVersionHooked = true;
+            }
+            catch (Exception ex) { System.Diagnostics.Debug.WriteLine("[AssistantChatControl] Clarion.Version hook: " + ex.Message); }
+        }
+
+        /// <summary>
+        /// Re-resolve when the IDE's Build &gt; Set Clarion Version moved since the last resolution: reload the
+        /// VERSION list and the .red, and restart the language server on the new version's paths. Cheap when
+        /// nothing changed (one PropertyService read). UI thread.
+        /// </summary>
+        private void SyncVersionWithIde()
+        {
+            try
+            {
+                string live;
+                if (!ClarionVersionService.TryGetLiveIdeVersionName(out live)) return;
+                string now = ClarionVersionSelector.NormalizeIdeChoice(live);
+                if (_lastIdeVersionChoice != null && string.Equals(now, _lastIdeVersionChoice, StringComparison.OrdinalIgnoreCase))
+                    return;
+
+                System.Diagnostics.Debug.WriteLine("[AssistantChatControl] IDE Build > Set Clarion Version: "
+                    + (_lastIdeVersionChoice ?? "(unknown)") + " -> " + now);
+                LoadVersions();
+                LoadRedFile();
+                LspService.RestartIfVersionChanged(_currentVersionConfig != null ? _currentVersionConfig.Name : null);
+            }
+            catch (Exception ex) { System.Diagnostics.Debug.WriteLine("[AssistantChatControl] SyncVersionWithIde: " + ex.Message); }
         }
 
         private void LoadRedFile()
@@ -750,8 +803,32 @@ namespace ClarionAssistant
         {
             _redFileDisplay = display;
             _redFileCss = css;
-            try { if (_header != null) _header.SetRedFile(display, css); }
+            try { if (_header != null) _header.SetRedFile(display, css, RedFileOpenable); }
             catch { }
+        }
+
+        /// <summary>RED is a link only while it resolved to a file; never in the warning state.</summary>
+        private bool RedFileOpenable
+        {
+            get
+            {
+                return _redFileCss != "warning" && _redFileService != null
+                    && !string.IsNullOrEmpty(_redFileService.RedFilePath);
+            }
+        }
+
+        /// <summary>
+        /// Header RED link (82938fc7): open the .red in an IDE editor tab. The page sends only the intent; the
+        /// path is this control's own _redFileService.RedFilePath, never one from the page. Deferred out of the
+        /// WebView2 message callback with the IDE main window activated first (IdeUi, shared with the CA
+        /// Explorer): a WebView2 holding focus while the IDE opens a document is the pattern that deadlocks.
+        /// </summary>
+        private void OnOpenRedFile()
+        {
+            if (!RedFileOpenable) return;
+            string path = _redFileService.RedFilePath;
+            if (!File.Exists(path)) return;
+            IdeUi.DeferWithMainFormActivated(this, () => _editorService.OpenFileOnly(path), "AssistantChatControl");
         }
 
         private void LoadSolutionHistory()
@@ -779,6 +856,10 @@ namespace ClarionAssistant
 
             _header.SetSolutions(paths.ToArray(), selectedIdx);
             UpdateIndexStatus();
+            // Schema Sources / Source Control follow the solution (82938fc7). DetectFromIde, OnBrowseSolution and
+            // OpenSolutionInNewTab change _currentSlnPath and then call this, and so does its own restore above.
+            // Its other callers only reload the dropdown; RefreshSolutionSettings skips an unchanged solution.
+            RefreshSolutionSettings();
 
             // NO auto-index here (ticket 7f1c67b2). THIS METHOD HAS SEVEN CALLERS and its job
             // is to reload the solution dropdown — it is not a "solution was opened" signal.
@@ -833,11 +914,23 @@ namespace ClarionAssistant
             try
             {
                 string slnPath = EditorService.GetOpenSolutionPath();
+
+                // Hand the IDE's live solution to the standalone clarion-mcp-server(s) this IDE
+                // launched: their --solution was fixed at tab launch, so a Chat tab opened before
+                // the solution had none (77aceec5). Writes only on change, removes on close.
+                Services.IdeSolutionRecord.Publish(slnPath);
+
                 if (!string.IsNullOrEmpty(slnPath) && File.Exists(slnPath) &&
                     !string.Equals(slnPath, _currentSlnPath, StringComparison.OrdinalIgnoreCase))
                 {
                     System.Diagnostics.Debug.WriteLine("[AssistantChatControl] Solution changed: " + slnPath);
                     DetectFromIde();
+                }
+                else
+                {
+                    // Backstop for the Clarion.Version PropertyChanged hook (16d140e9): follow a
+                    // Build > Set Clarion Version change within one poll even if the event was missed.
+                    SyncVersionWithIde();
                 }
 
                 // Backstop: keep the LSP up whenever a solution is known. Idempotent and
@@ -847,8 +940,8 @@ namespace ClarionAssistant
                 if (!string.IsNullOrEmpty(_currentSlnPath))
                     _toolRegistry?.EnsureLspRunningInBackground();
                 // NOTE: the ClarionGraph build heartbeat is driven from _statusLineTimer (always started),
-                // NOT here — this poll runs off _instanceStateTimer, which only starts when instance
-                // coordination initializes, so it can't be the sole trigger.
+                // NOT here (it was placed there when this poll's timer only started with instance
+                // coordination; that timer now always starts, but the heartbeat stays where it is).
             }
             catch { }
         }
@@ -868,6 +961,8 @@ namespace ClarionAssistant
             LoadVersions();
             LoadRedFile();
             UpdateInstanceState();
+            // A running server keeps the version it started with; restart it if that moved (16d140e9).
+            LspService.RestartIfVersionChanged(_currentVersionConfig != null ? _currentVersionConfig.Name : null);
 
             // Eager-start the LSP (background) when the IDE's open solution is detected,
             // so embeditor completion is fully populated without a manual LSP trigger.
@@ -880,6 +975,8 @@ namespace ClarionAssistant
         {
             if (!string.IsNullOrEmpty(path) && File.Exists(path))
             {
+                // Completion's held-open symbol DB connections belong to the old solution.
+                SymbolIndex.ReleaseAll();
                 _currentSlnPath = path;
                 AddToSolutionHistory(path);
                 UpdateIndexStatus();
@@ -892,16 +989,12 @@ namespace ClarionAssistant
                 // block several seconds, hence off the UI thread.
                 _toolRegistry?.EnsureLspRunningInBackground();
 
-                // Ensure active tab has schema sources panel
                 var activeTab = _tabManager.ActiveTab;
                 if (activeTab != null && !activeTab.IsHome)
-                {
                     activeTab.SolutionPath = path;
-                    if (activeTab.SchemaSourcesView == null)
-                        AttachSchemaSourcesView(activeTab);
-                    else
-                        SendSchemaSourcesForTab(activeTab);
-                }
+
+                // Schema Sources / Source Control are keyed on the solution (82938fc7).
+                RefreshSolutionSettings();
 
                 // Auto-index in the background when a solution is opened (ticket 7f1c67b2).
                 // RunIndexAutomatic, not RunIndex: this run is a consequence of opening a
@@ -1199,36 +1292,6 @@ namespace ClarionAssistant
             return (lsp != null) ? lsp.LastActiveFilePath : null;
         }
 
-        /// <summary>
-        /// Header ◎ button — show/hide the LSP diagnostics status bar.
-        ///
-        /// The bar carries its own X, and dismissing it left NO way back: Visible=true happens only
-        /// inside SetDiagnostics, which PollLspUi calls only when the diagnostics state actually
-        /// changes, so a stable state meant restarting Clarion was the only recovery. This is the
-        /// explicit way back, and a toggle rather than a bare "show" so the X isn't the only way to
-        /// dismiss it either.
-        ///
-        /// Re-arming the change detector on the way UP matters: the poll tick repaints the pill only
-        /// when it sees a change, so without this the bar would come back wearing whatever text it
-        /// carried when it was dismissed — potentially minutes stale — until something moved.
-        /// Clearing _lastDiagFile guarantees the next tick treats it as new and repaints from the
-        /// current cache.
-        ///
-        /// If no LSP is running the next tick will hide it again (SetDiagnostics(hidden: true)),
-        /// which is the honest outcome — there is genuinely nothing to report — not a failed toggle.
-        /// </summary>
-        private void OnToggleDiagnosticsBar()
-        {
-            try
-            {
-                if (_lspStatusBar == null) return;
-                bool show = !_lspStatusBar.Visible;
-                _lspStatusBar.Visible = show;
-                if (show) _lastDiagFile = null;
-            }
-            catch (Exception ex) { Debug.WriteLine("[AssistantChatControl] toggle diagnostics bar failed: " + ex.Message); }
-        }
-
         private void OnDiagnosticsBarClicked(object sender, EventArgs e)
         {
             if (_diagForm == null)
@@ -1394,9 +1457,6 @@ namespace ClarionAssistant
             renderer.Initialized += (s, ev) => OnTabRendererInitialized(tab);
             System.Diagnostics.Debug.WriteLine("[AssistantChatControl] Events wired for tab " + tab.Id + ", calling ActivateTab");
 
-            // Schema sources panel (above terminal)
-            AttachSchemaSourcesView(tab);
-
             _tabManager.ActivateTab(tab.Id);
             System.Diagnostics.Debug.WriteLine("[AssistantChatControl] ActivateTab completed for tab " + tab.Id);
         }
@@ -1427,126 +1487,205 @@ namespace ClarionAssistant
 
         #region Schema Sources
 
-        private void AttachSchemaSourcesView(TerminalTab tab)
+        // Schema Sources and Source Control are SOLUTION settings (82938fc7): one SchemaSourcesView for the
+        // whole pane, keyed on _currentSlnPath, shown under the header while its header tab is active. It
+        // used to be one per chat tab, in a collapsed bar above the terminal that few people ever opened.
+
+        /// <summary>Header tab switch: show the panel for Schema Sources / Source Control, hide it for Solution.</summary>
+        private void OnHeaderTab(string tab)
         {
-            var schemaView = new SchemaSourcesView();
-            schemaView.ActionReceived += (s, ev) => OnSchemaSourceAction(tab, ev);
-            schemaView.Ready += (s, ev) => OnSchemaSourcesReady(tab);
-            tab.SchemaSourcesView = schemaView;
-
-            // TabManager adds renderer directly to _contentArea (no TabPage).
-            // Wrap renderer + SchemaSourcesView in a container Panel so
-            // ActivateTab's Visible toggle controls both together.
-            var renderer = tab.Renderer;
-            if (renderer == null) return;
-            var parent = renderer.Parent;
-            if (parent == null) return;
-
-            bool wasVisible = renderer.Visible;
-
-            var container = new Panel { Dock = DockStyle.Fill };
-            container.SuspendLayout();
-            parent.SuspendLayout();
-
-            parent.Controls.Remove(renderer);
-            renderer.Visible = true;
-            renderer.Dock = DockStyle.Fill;
-
-            // Add Fill control first, then Top — WinForms docks later-added controls first
-            container.Controls.Add(renderer);
-            container.Controls.Add(schemaView);
-
-            container.Visible = wasVisible;
-            parent.Controls.Add(container);
-            tab.ContentControl = container;
-
-            parent.ResumeLayout(true);
-            container.ResumeLayout(true);
+            bool show = HeaderWebView.IsPanelTab(tab);
+            if (show) EnsureSchemaView();
+            if (!SchemaViewAlive) return;
+            if (show) _schemaView.SetMode(tab);
+            _schemaView.Visible = show;
         }
 
-        private void OnSchemaSourcesReady(TerminalTab tab)
+        /// <summary>
+        /// Create the panel the first time its tab opens (4d63b995). It takes the header's current zoom and pane
+        /// height: the header raises LayoutChanged before the headerTab action, so the panel missed that one.
+        /// Its data arrives from OnSchemaSourcesReady once the page loads.
+        /// </summary>
+        private void EnsureSchemaView()
         {
-            if (tab.SchemaSourcesView == null) return;
-            tab.SchemaSourcesView.SetTheme(_isDarkTheme);
-
-            // Check if collapse state was saved
-            string collapsed = _settings.Get("SchemaSourcesCollapsed");
-            if (collapsed == "true")
-                tab.SchemaSourcesView.SetCollapsed(true);
-
-            // Send linked sources for this tab's solution
-            SendSchemaSourcesForTab(tab);
-
-            // Send source control accounts and current repo link
-            SendRepoDataForTab(tab);
+            if (SchemaViewAlive || IsDisposed || Disposing || _header == null) return;
+            _schemaView = new SchemaSourcesView
+            {
+                Visible = false,
+                PaneHeight = _header.PanePixelHeight,
+                ZoomFactor = _header.ZoomFactor
+            };
+            _schemaView.ActionReceived += OnSchemaSourceAction;
+            _schemaView.Ready += OnSchemaSourcesReady;
+            _schemaView.ZoomChanged += (s, e) => { if (SchemaViewAlive) _header.ZoomFactor = _schemaView.ZoomFactor; };
+            _schemaView.SetTheme(_isDarkTheme);
+            // Docking runs from the highest child index down: the panel's index sits just under the header's,
+            // so the order is header, panel, tab strip, content.
+            Controls.Add(_schemaView);
+            Controls.SetChildIndex(_schemaView, Controls.GetChildIndex(_header));
         }
 
-        private void SendSchemaSourcesForTab(TerminalTab tab)
+        /// <summary>The panel's page loaded (NavigationCompleted): the one initial push.</summary>
+        private void OnSchemaSourcesReady(object sender, EventArgs e)
         {
-            if (tab.SchemaSourcesView == null || !tab.SchemaSourcesView.IsReady) return;
-
-            string slnPath = tab.SolutionPath ?? tab.WorkingDirectory ?? "";
-            if (string.IsNullOrEmpty(slnPath)) { tab.SchemaSourcesView.SetSources("[]"); return; }
-
-            try
-            {
-                var sources = Services.SchemaGraphService.GetSourcesForSolution(slnPath);
-                var sb = new System.Text.StringBuilder("[");
-                for (int i = 0; i < sources.Count; i++)
-                {
-                    if (i > 0) sb.Append(",");
-                    var src = sources[i];
-                    string id = (string)src["id"];
-                    string name = (string)src["name"];
-                    string type = (string)src["type"];
-                    string connInfo = (string)src["connectionInfo"];
-
-                    // Get index status
-                    var status = Services.SchemaGraphService.GetSourceStatus(id, type, connInfo);
-                    bool indexed = (bool)status["indexed"];
-                    int tableCount = status.ContainsKey("tableCount") ? (int)status["tableCount"] : 0;
-                    string lastIndexed = status.ContainsKey("lastIndexed") ? (string)status["lastIndexed"] : null;
-
-                    sb.AppendFormat("{{\"id\":\"{0}\",\"name\":\"{1}\",\"type\":\"{2}\",\"indexed\":{3},\"tableCount\":{4},\"lastIndexed\":{5}}}",
-                        EscJson(id), EscJson(name), EscJson(type),
-                        indexed ? "true" : "false", tableCount,
-                        lastIndexed != null ? "\"" + EscJson(lastIndexed) + "\"" : "null");
-                }
-                sb.Append("]");
-                tab.SchemaSourcesView.SetSources(sb.ToString());
-            }
-            catch (Exception ex)
-            {
-                System.Diagnostics.Debug.WriteLine("[AssistantChatControl] SendSchemaSourcesForTab error: " + ex.Message);
-                tab.SchemaSourcesView.SetSources("[]");
-            }
-        }
-
-        private void SendRepoDataForTab(TerminalTab tab)
-        {
-            if (tab.SchemaSourcesView == null || !tab.SchemaSourcesView.IsReady) return;
-
-            // Send accounts list
-            try
-            {
-                var accounts = Services.SchemaGraphService.GetAllGitHubAccounts();
-                var sb = new System.Text.StringBuilder("[");
-                for (int i = 0; i < accounts.Count; i++)
-                {
-                    if (i > 0) sb.Append(",");
-                    var a = accounts[i];
-                    string prov = a.ContainsKey("provider") ? (string)a["provider"] : "github";
-                    sb.AppendFormat("{{\"id\":\"{0}\",\"displayName\":\"{1}\",\"username\":\"{2}\",\"provider\":\"{3}\"}}",
-                        EscJson((string)a["id"]), EscJson((string)a["displayName"]),
-                        EscJson((string)a["username"]), EscJson(prov));
-                }
-                sb.Append("]");
-                tab.SchemaSourcesView.SendMessage("{\"type\":\"setRepoAccounts\",\"accounts\":" + sb + "}");
-            }
+            if (!SchemaViewAlive) return;
+            _schemaView.SetTheme(_isDarkTheme);
+            if (HeaderWebView.IsPanelTab(_header.ActiveTab)) _schemaView.SetMode(_header.ActiveTab);
+            try { _schemaView.SendMessage("{\"type\":\"setRepoAccounts\",\"accounts\":" + BuildGitHubAccountsJson() + "}"); }
             catch { }
+            RefreshSolutionSettings(force: true);
+        }
 
-            // Send current repo link
-            string slnPath = tab.SolutionPath ?? tab.WorkingDirectory ?? "";
+        // The solution the badge and the panel last showed; RefreshSolutionSettings skips a repeat.
+        private string _settingsSlnPath;
+
+        /// <summary>
+        /// Re-send everything keyed on the solution: the linked sources (and the header's badge count) and the
+        /// Source Control repo link. Call it wherever _currentSlnPath changes; it does nothing when the solution
+        /// is the one last shown, unless forced. Safe before the panel is ready: the badge still updates, and
+        /// the panel gets its data from OnSchemaSourcesReady.
+        /// </summary>
+        private void RefreshSolutionSettings(bool force = false)
+        {
+            if (_header == null || !_header.IsReady) return;   // OnHeaderReady reloads the solution, which lands here
+            if (!force && string.Equals(_currentSlnPath, _settingsSlnPath, StringComparison.OrdinalIgnoreCase)) return;
+            _settingsSlnPath = _currentSlnPath;
+            _solutionStamp.Advance();   // an actual change: views drawn before it are stale even if the path comes back (A->B->A)
+            SendSchemaSources();
+            SendRepoData();   // re-stamps the repo fields: an edit in flight for the old solution is discarded
+            // An open Manage Sources modal was drawn for the old solution: redraw its checkboxes for this one
+            // (the add/edit form, which is global, is left as it is).
+            if (SchemaViewReady && _schemaView.ModalOpen) SendGlobalSourcesToModal();
+        }
+
+        // Solution + generation stamped into the modal and the repo fields; advanced on every actual change.
+        private readonly SolutionStamp _solutionStamp = new SolutionStamp();
+
+        /// <summary>
+        /// Solution-keyed writes (82938fc7): the modal and the repo fields echo the solution AND the generation
+        /// they were drawn for (the host stamps both). True when either is no longer current - the IDE or the
+        /// dropdown switched solutions while the modal was open or a field had focus, including a switch away
+        /// and back (A->B->A), which the path alone cannot see - so the caller writes nothing.
+        /// </summary>
+        private bool IsStaleSolutionAction(string action, Dictionary<string, object> payload)
+        {
+            object o;
+            string shownSln = payload.TryGetValue("sln", out o) ? o as string : null;
+            long shownGen = -1;
+            if (payload.TryGetValue("gen", out o) && o != null)
+            {
+                try { shownGen = Convert.ToInt64(o); } catch { shownGen = -1; }
+            }
+            if (_solutionStamp.Matches(shownSln, shownGen, _currentSlnPath)) return false;
+            System.Diagnostics.Debug.WriteLine("[schema] stale action=" + action + " shown=" + (shownSln ?? "(none)")
+                + " gen=" + shownGen + " current=" + (_currentSlnPath ?? "(none)") + " gen=" + _solutionStamp.Gen);
+            return true;
+        }
+
+        /// <summary>Tell the panel a write was refused as stale, after its view was re-sent (it shows a note).</summary>
+        private void SendStaleRefused()
+        {
+            if (SchemaViewReady) _schemaView.SendMessage("{\"type\":\"staleRefused\"}");
+        }
+
+        private static Dictionary<string, object> ParsePayload(string data)
+        {
+            try
+            {
+                return new System.Web.Script.Serialization.JavaScriptSerializer().DeserializeObject(data ?? "")
+                    as Dictionary<string, object>;
+            }
+            catch { return null; }
+        }
+
+
+        private bool SchemaViewAlive
+        {
+            get { return _schemaView != null && !_schemaView.IsDisposed; }
+        }
+
+        private bool SchemaViewReady
+        {
+            get { return SchemaViewAlive && _schemaView.IsReady; }
+        }
+
+        /// <summary>Marshal a panel update from a worker thread; dropped if the pane or the panel is gone.</summary>
+        private void PostToSchemaView(Action<SchemaSourcesView> update)
+        {
+            if (IsDisposed || !IsHandleCreated) return;
+            try
+            {
+                BeginInvoke(new Action(() =>
+                {
+                    var view = _schemaView;
+                    if (view != null && !view.IsDisposed) update(view);
+                }));
+            }
+            catch (ObjectDisposedException) { }
+            catch (InvalidOperationException) { }
+        }
+
+        private void SendSchemaSources()
+        {
+            string slnPath = _currentSlnPath ?? "";
+            string json = "[]";
+            int count = 0;
+            if (!string.IsNullOrEmpty(slnPath))
+            {
+                try
+                {
+                    var sources = Services.SchemaGraphService.GetSourcesForSolution(slnPath);
+                    count = sources.Count;
+                    // Until the panel first loads (the first time its tab opens) the badge needs only the count,
+                    // not each source's status database.
+                    if (SchemaViewReady) json = BuildSourcesJson(sources);
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine("[AssistantChatControl] SendSchemaSources error: " + ex.Message);
+                }
+            }
+
+            // The badge and the list come from the same query, so they cannot disagree.
+            if (_header != null && _header.IsReady) _header.SetSchemaCount(count);
+            if (SchemaViewReady) _schemaView.SetSources(json);
+        }
+
+        private static string BuildSourcesJson(List<Dictionary<string, object>> sources)
+        {
+            var sb = new System.Text.StringBuilder("[");
+            for (int i = 0; i < sources.Count; i++)
+            {
+                if (i > 0) sb.Append(",");
+                var src = sources[i];
+                string id = (string)src["id"];
+                string name = (string)src["name"];
+                string type = (string)src["type"];
+                string connInfo = (string)src["connectionInfo"];
+
+                // Get index status
+                var status = Services.SchemaGraphService.GetSourceStatus(id, type, connInfo);
+                bool indexed = (bool)status["indexed"];
+                int tableCount = status.ContainsKey("tableCount") ? (int)status["tableCount"] : 0;
+                string lastIndexed = status.ContainsKey("lastIndexed") ? (string)status["lastIndexed"] : null;
+
+                sb.AppendFormat("{{\"id\":\"{0}\",\"name\":\"{1}\",\"type\":\"{2}\",\"indexed\":{3},\"tableCount\":{4},\"lastIndexed\":{5}}}",
+                    EscJson(id), EscJson(name), EscJson(type),
+                    indexed ? "true" : "false", tableCount,
+                    lastIndexed != null ? "\"" + EscJson(lastIndexed) + "\"" : "null");
+            }
+            sb.Append("]");
+            return sb.ToString();
+        }
+
+        private void SendRepoData()
+        {
+            if (!SchemaViewReady) return;
+
+            // The account list is not per solution; OnSchemaSourcesReady sends it. Send the solution's repo link,
+            // or clear the fields: a solution with no link must not keep showing the previous solution's.
+            string accountId = "", repoName = "";
+            string slnPath = _currentSlnPath ?? "";
             if (!string.IsNullOrEmpty(slnPath))
             {
                 try
@@ -1554,73 +1693,65 @@ namespace ClarionAssistant
                     var repo = Services.SchemaGraphService.GetSolutionRepo(slnPath);
                     if (repo != null)
                     {
-                        tab.SchemaSourcesView.SendMessage(
-                            "{\"type\":\"setSolutionRepo\",\"accountId\":\"" + EscJson(repo["accountId"]) +
-                            "\",\"repoName\":\"" + EscJson(repo["repoName"]) + "\"}");
+                        accountId = repo["accountId"];
+                        repoName = repo["repoName"];
                     }
                 }
                 catch { }
             }
+            _schemaView.SendMessage(
+                "{\"type\":\"setSolutionRepo\",\"sln\":\"" + EscJson(slnPath) + "\",\"gen\":" + _solutionStamp.Gen + ",\"accountId\":\"" + EscJson(accountId) +
+                "\",\"repoName\":\"" + EscJson(repoName) + "\"}");
         }
 
-        private void OnSchemaSourceAction(TerminalTab tab, SchemaSourceActionEventArgs e)
+        private void OnSchemaSourceAction(object sender, SchemaSourceActionEventArgs e)
         {
             switch (e.Action)
             {
-                case "schemaSourcesReady":
-                    OnSchemaSourcesReady(tab);
-                    break;
-
-                case "toggleCollapse":
-                    // Save collapse state
-                    bool isCollapsed = tab.SchemaSourcesView != null && tab.SchemaSourcesView.Height <= 32;
-                    _settings.Set("SchemaSourcesCollapsed", isCollapsed ? "true" : "false");
-                    break;
-
                 case "getGlobalSources":
-                    SendGlobalSourcesToModal(tab);
+                    SendGlobalSourcesToModal();
                     break;
 
                 case "addSource":
-                    HandleAddSource(tab, e.Data);
+                    HandleAddSource(e.Data);
                     break;
 
                 case "editSource":
-                    HandleEditSource(tab, e.Data);
+                    HandleEditSource(e.Data);
                     break;
 
                 case "deleteSource":
-                    HandleDeleteSource(tab, e.Data);
+                    HandleDeleteSource(e.Data);
                     break;
 
                 case "applySourceSelection":
-                    HandleApplySelection(tab, e.Data);
+                    HandleApplySelection(e.Data);
                     break;
 
                 case "indexSource":
-                    HandleIndexSource(tab, e.Data);
+                    HandleIndexSource(e.Data);
                     break;
 
                 case "testConnection":
-                    HandleTestConnection(tab, e.Data);
+                    HandleTestConnection(e.Data);
                     break;
 
                 case "setSolutionRepo":
-                    HandleSetSolutionRepo(tab, e.Data);
+                    HandleSetSolutionRepo(e.Data);
                     break;
 
                 case "browseFile":
-                    HandleBrowseFile(tab, e.Data);
+                    HandleBrowseFile(e.Data);
                     break;
             }
         }
 
-        private void SendGlobalSourcesToModal(TerminalTab tab)
+        private void SendGlobalSourcesToModal()
         {
-            if (tab.SchemaSourcesView == null) return;
+            if (!SchemaViewReady) return;
             try
             {
-                string slnPath = tab.SolutionPath ?? tab.WorkingDirectory ?? "";
+                string slnPath = _currentSlnPath ?? "";
                 var allSources = Services.SchemaGraphService.GetAllSources();
                 var linkedSources = Services.SchemaGraphService.GetSourcesForSolution(slnPath);
                 var linkedIdSet = new System.Collections.Generic.HashSet<string>();
@@ -1651,7 +1782,7 @@ namespace ClarionAssistant
                 }
                 idSb.Append("]");
 
-                tab.SchemaSourcesView.SetGlobalSources(sb.ToString(), idSb.ToString());
+                _schemaView.SetGlobalSources(sb.ToString(), idSb.ToString(), slnPath, _solutionStamp.Gen);
             }
             catch (Exception ex)
             {
@@ -1659,7 +1790,7 @@ namespace ClarionAssistant
             }
         }
 
-        private void HandleAddSource(TerminalTab tab, string data)
+        private void HandleAddSource(string data)
         {
             try
             {
@@ -1667,7 +1798,7 @@ namespace ClarionAssistant
                 string type = ExtractJsonField(data, "type");
                 string connInfo = ExtractJsonField(data, "connectionInfo");
                 Services.SchemaGraphService.AddSource(name, type, connInfo);
-                SendGlobalSourcesToModal(tab);
+                SendGlobalSourcesToModal();
             }
             catch (Exception ex)
             {
@@ -1675,7 +1806,7 @@ namespace ClarionAssistant
             }
         }
 
-        private void HandleEditSource(TerminalTab tab, string data)
+        private void HandleEditSource(string data)
         {
             try
             {
@@ -1685,7 +1816,7 @@ namespace ClarionAssistant
                 string connInfo = ExtractJsonField(data, "connectionInfo");
                 connInfo = RestorePasswordIfPlaceholder(connInfo, id);
                 Services.SchemaGraphService.UpdateSource(id, name, type, connInfo);
-                SendGlobalSourcesToModal(tab);
+                SendGlobalSourcesToModal();
             }
             catch (Exception ex)
             {
@@ -1693,13 +1824,13 @@ namespace ClarionAssistant
             }
         }
 
-        private void HandleDeleteSource(TerminalTab tab, string data)
+        private void HandleDeleteSource(string data)
         {
             try
             {
                 Services.SchemaGraphService.DeleteSource(data);
-                SendGlobalSourcesToModal(tab);
-                SendSchemaSourcesForTab(tab);
+                SendGlobalSourcesToModal();
+                SendSchemaSources();
             }
             catch (Exception ex)
             {
@@ -1707,21 +1838,28 @@ namespace ClarionAssistant
             }
         }
 
-        private void HandleApplySelection(TerminalTab tab, string selectedIdsJson)
+        private void HandleApplySelection(string data)
         {
             try
             {
-                string slnPath = tab.SolutionPath ?? tab.WorkingDirectory ?? "";
-                if (string.IsNullOrEmpty(slnPath)) return;
-
-                // Parse selected IDs from JSON array
-                var selectedIds = new System.Collections.Generic.List<string>();
-                string inner = selectedIdsJson.Trim().TrimStart('[').TrimEnd(']');
-                if (!string.IsNullOrEmpty(inner))
+                // {sln, gen, ids}: sln and gen are the solution and generation the modal was drawn for.
+                var payload = ParsePayload(data);
+                if (payload == null) return;
+                if (IsStaleSolutionAction("applySourceSelection", payload))
                 {
-                    foreach (string part in inner.Split(','))
+                    SendGlobalSourcesToModal();   // redraw for the current solution; nothing is written
+                    SendStaleRefused();
+                    return;
+                }
+                string slnPath = _currentSlnPath;
+
+                var selectedIds = new System.Collections.Generic.List<string>();
+                object ids;
+                if (payload.TryGetValue("ids", out ids) && ids is object[])
+                {
+                    foreach (object o in (object[])ids)
                     {
-                        string id = part.Trim().Trim('"');
+                        string id = o as string;
                         if (!string.IsNullOrEmpty(id)) selectedIds.Add(id);
                     }
                 }
@@ -1746,7 +1884,7 @@ namespace ClarionAssistant
                         Services.SchemaGraphService.UnlinkSourceFromSolution(slnPath, id);
                 }
 
-                SendSchemaSourcesForTab(tab);
+                SendSchemaSources();
             }
             catch (Exception ex)
             {
@@ -1754,11 +1892,12 @@ namespace ClarionAssistant
             }
         }
 
-        private void HandleIndexSource(TerminalTab tab, string sourceId)
+        private void HandleIndexSource(string sourceId)
         {
             // Run indexing on a background thread to avoid blocking UI
             System.Threading.ThreadPool.QueueUserWorkItem(_ =>
             {
+                string statusJson;
                 try
                 {
                     string result = Services.SchemaGraphService.IndexSource(sourceId);
@@ -1771,7 +1910,6 @@ namespace ClarionAssistant
                     var status = Services.SchemaGraphService.GetSourceStatus(sourceId, type, connInfo);
 
                     // Build status JSON
-                    string statusJson;
                     if (isError)
                     {
                         statusJson = "{\"error\":\"" + EscJson(result) + "\"}";
@@ -1783,54 +1921,35 @@ namespace ClarionAssistant
                         statusJson = string.Format("{{\"tableCount\":{0},\"lastIndexed\":{1}}}",
                             tCount, lastIdx != null ? "\"" + EscJson(lastIdx) + "\"" : "null");
                     }
-
-                    // Send back to UI on UI thread
-                    if (!IsDisposed && tab.SchemaSourcesView != null)
-                    {
-                        string sid = sourceId;
-                        string sj = statusJson;
-                        try
-                        {
-                            BeginInvoke(new Action(() =>
-                            {
-                                if (tab.SchemaSourcesView != null)
-                                    tab.SchemaSourcesView.SetIndexStatus(sid, sj);
-                            }));
-                        }
-                        catch (ObjectDisposedException) { }
-                        catch (InvalidOperationException) { }
-                    }
                 }
                 catch (Exception ex)
                 {
                     System.Diagnostics.Debug.WriteLine("[AssistantChatControl] IndexSource error: " + ex.Message);
-                    if (!IsDisposed && tab.SchemaSourcesView != null)
-                    {
-                        string sid = sourceId;
-                        string msg = ex.Message;
-                        try
-                        {
-                            BeginInvoke(new Action(() =>
-                            {
-                                if (tab.SchemaSourcesView != null)
-                                    tab.SchemaSourcesView.SetIndexStatus(sid, "{\"error\":\"" + EscJson(msg) + "\"}");
-                            }));
-                        }
-                        catch (ObjectDisposedException) { }
-                        catch (InvalidOperationException) { }
-                    }
+                    statusJson = "{\"error\":\"" + EscJson(ex.Message) + "\"}";
                 }
+
+                // Send back to the panel on the UI thread
+                PostToSchemaView(view => view.SetIndexStatus(sourceId, statusJson));
             });
         }
 
-        private void HandleSetSolutionRepo(TerminalTab tab, string data)
+        private void HandleSetSolutionRepo(string data)
         {
             try
             {
-                string slnPath = tab.SolutionPath ?? tab.WorkingDirectory ?? "";
-                if (string.IsNullOrEmpty(slnPath)) return;
-                string accountId = ExtractJsonField(data, "accountId");
-                string repoName = ExtractJsonField(data, "repoName");
+                // {sln, gen, accountId, repoName}
+                var payload = ParsePayload(data);
+                if (payload == null) return;
+                if (IsStaleSolutionAction("setSolutionRepo", payload))
+                {
+                    SendRepoData();   // put back the current solution's link; nothing is written
+                    SendStaleRefused();
+                    return;
+                }
+                string slnPath = _currentSlnPath;
+                object o;
+                string accountId = payload.TryGetValue("accountId", out o) ? o as string : null;
+                string repoName = payload.TryGetValue("repoName", out o) ? o as string : null;
                 Services.SchemaGraphService.SetSolutionRepo(slnPath, accountId, repoName);
             }
             catch (Exception ex)
@@ -1839,7 +1958,7 @@ namespace ClarionAssistant
             }
         }
 
-        private void HandleBrowseFile(TerminalTab tab, string data)
+        private void HandleBrowseFile(string data)
         {
             try
             {
@@ -1852,8 +1971,8 @@ namespace ClarionAssistant
                     {
                         dlg.Filter = "Clarion Dictionary (*.dctx)|*.dctx|All files (*.*)|*.*";
                         dlg.Title = "Select Clarion Dictionary";
-                        if (dlg.ShowDialog() == DialogResult.OK && tab.SchemaSourcesView != null)
-                            tab.SchemaSourcesView.SendBrowseResult(dlg.FileName, editId);
+                        if (dlg.ShowDialog() == DialogResult.OK && SchemaViewReady)
+                            _schemaView.SendBrowseResult(dlg.FileName, editId);
                     }
                 }
                 else if (type == "sqlite")
@@ -1862,8 +1981,8 @@ namespace ClarionAssistant
                     {
                         dlg.Filter = "SQLite Database (*.db;*.sqlite;*.sqlite3)|*.db;*.sqlite;*.sqlite3|All files (*.*)|*.*";
                         dlg.Title = "Select SQLite Database";
-                        if (dlg.ShowDialog() == DialogResult.OK && tab.SchemaSourcesView != null)
-                            tab.SchemaSourcesView.SendBrowseResult(dlg.FileName, editId);
+                        if (dlg.ShowDialog() == DialogResult.OK && SchemaViewReady)
+                            _schemaView.SendBrowseResult(dlg.FileName, editId);
                     }
                 }
             }
@@ -1873,7 +1992,7 @@ namespace ClarionAssistant
             }
         }
 
-        private void HandleTestConnection(TerminalTab tab, string data)
+        private void HandleTestConnection(string data)
         {
             string type = ExtractJsonField(data, "type") ?? "";
             string connInfo = ExtractJsonField(data, "connectionInfo") ?? "{}";
@@ -1897,13 +2016,21 @@ namespace ClarionAssistant
                     else if (type == "postgres")
                     {
                         string connStr = Services.SchemaGraphService.BuildPostgresConnectionString(connInfo);
-                        var asm = System.Reflection.Assembly.Load("Npgsql");
-                        var connType = asm.GetType("Npgsql.NpgsqlConnection");
-                        using (var conn = (System.Data.Common.DbConnection)Activator.CreateInstance(connType, connStr))
+                        string loadError;
+                        var asm = Services.NpgsqlLoader.TryLoad(out loadError);
+                        if (asm == null)
                         {
-                            conn.Open();
-                            message = "Connected to " + conn.Database;
-                            success = true;
+                            message = loadError;
+                        }
+                        else
+                        {
+                            var connType = asm.GetType("Npgsql.NpgsqlConnection");
+                            using (var conn = (System.Data.Common.DbConnection)Activator.CreateInstance(connType, connStr))
+                            {
+                                conn.Open();
+                                message = "Connected to " + conn.Database;
+                                success = true;
+                            }
                         }
                     }
                     else
@@ -1916,23 +2043,9 @@ namespace ClarionAssistant
                     message = ex.Message;
                 }
 
-                if (!IsDisposed && tab.SchemaSourcesView != null)
-                {
-                    bool s = success;
-                    string m = message;
-                    try
-                    {
-                        BeginInvoke(new Action(() =>
-                        {
-                            if (tab.SchemaSourcesView != null)
-                                tab.SchemaSourcesView.SendMessage(
-                                    "{\"type\":\"testConnectionResult\",\"success\":" + (s ? "true" : "false") +
-                                    ",\"message\":\"" + EscJson(m) + "\"}");
-                        }));
-                    }
-                    catch (ObjectDisposedException) { }
-                    catch (InvalidOperationException) { }
-                }
+                string resultJson = "{\"type\":\"testConnectionResult\",\"success\":" + (success ? "true" : "false") +
+                    ",\"message\":\"" + EscJson(message) + "\"}";
+                PostToSchemaView(view => view.SendMessage(resultJson));
             });
         }
 
@@ -2144,6 +2257,10 @@ namespace ClarionAssistant
 
             string slnPath = _currentSlnPath;
 
+            // Index against the IDE's CURRENT Build > Set Clarion Version (16d140e9): re-check it now rather
+            // than trust the .red loaded at the last solution change.
+            SyncVersionWithIde();
+
             // Build library paths from RED file .inc search paths
             List<string> libPaths = BuildIndexLibraryPaths();
             var activeRed = _redFileService;
@@ -2177,6 +2294,8 @@ namespace ClarionAssistant
             // Always-on per-run transcript (ticket 0d788f8b) — survives an IDE crash or a
             // closed window; the progress form's Open Log button points here.
             var runLog = new ClarionAssistant.Services.IndexRunLog(Path.GetFileNameWithoutExtension(slnPath));
+            // Which Clarion version (and which source chose it) this run's .red and libraries come from.
+            if (_versionSelection != null) runLog.WriteLine(_versionSelection.Describe());
 
             // Built for every run, SHOWN only when asked (ticket 7f1c67b2). Constructing it
             // unconditionally is deliberate: it keeps one completion path instead of
@@ -2207,6 +2326,9 @@ namespace ClarionAssistant
             bool partialDbDeleted = false;
             worker.DoWork += (s, e) =>
             {
+                // The editor's completion holds a read-only connection to this db (SymbolIndex, 1c685f2e);
+                // drop it before the write open, so a cancelled full run's delete below is not blocked.
+                SymbolIndex.Release(dbPath);
                 var db = new ClarionCodeGraph.Graph.CodeGraphDatabase();
                 db.Open(dbPath);
                 try
@@ -2246,6 +2368,7 @@ namespace ClarionAssistant
                 // would be the exact silent lie this window exists to remove.
                 if (wasCancelled && !incremental)
                 {
+                    SymbolIndex.Release(dbPath);   // a completion may have reopened it mid-run
                     try { File.Delete(dbPath); } catch { }
                     partialDbDeleted = !File.Exists(dbPath);
                 }
@@ -2536,11 +2659,6 @@ namespace ClarionAssistant
 
         #region Settings
 
-        private void OnSplitterMoved(object sender, SplitterEventArgs e)
-        {
-            _settings.Set("Header.Height", _header.Height.ToString());
-        }
-
         private void OnThemeChanged(string theme)
         {
             _isDarkTheme = theme != "light";
@@ -2548,10 +2666,10 @@ namespace ClarionAssistant
             ApplyThemeColors();
             _header.SetTheme(_isDarkTheme);
             _homeView.SetTheme(_isDarkTheme);
+            if (SchemaViewAlive) _schemaView.SetTheme(_isDarkTheme);
             foreach (var tab in _tabManager.Tabs)
             {
                 if (tab.Renderer != null) tab.Renderer.SetTheme(_isDarkTheme);
-                if (tab.SchemaSourcesView != null) tab.SchemaSourcesView.SetTheme(_isDarkTheme);
                 if (tab.ContentControl is CreateClassWebView ccv) ccv.SetTheme(_isDarkTheme);
             }
             Terminal.DiffViewContent.ApplyThemeToAll(_isDarkTheme);
@@ -2563,7 +2681,6 @@ namespace ClarionAssistant
         private void ApplyThemeColors()
         {
             BackColor = _isDarkTheme ? Color.FromArgb(12, 12, 12) : Color.White;
-            _splitter.BackColor = _isDarkTheme ? Color.FromArgb(49, 50, 68) : Color.FromArgb(204, 208, 218);
             if (_tabStrip != null) _tabManager?.ApplyTheme(_isDarkTheme);
             if (_contentArea != null) _contentArea.BackColor = _isDarkTheme ? Color.FromArgb(12, 12, 12) : Color.White;
 
@@ -2718,7 +2835,6 @@ namespace ClarionAssistant
             renderer.DataReceived += data => OnTabRendererDataReceived(tab, data);
             renderer.TerminalResized += (s, ev) => OnTabRendererResized(tab, ev);
             renderer.Initialized += (s, ev) => OnTabRendererInitialized(tab);
-            AttachSchemaSourcesView(tab);
             _tabManager.ActivateTab(tab.Id);
         }
 
@@ -2870,8 +2986,10 @@ namespace ClarionAssistant
                     "INCLUDE('" + newClassName + ".INC')",
                     "INCLUDE('" + newClassName + ".INC')");
 
-                File.WriteAllText(dstInc, incContent);
-                File.WriteAllText(dstClw, clwContent);
+                // Each new file takes its MODEL's encoding (GH #203). File.WriteAllText wrote UTF-8,
+                // so an accented comment in a cp1252 model came out as a UTF-8 class.
+                Services.ClarionSourceText.WriteFile(dstInc, incContent, Services.ClarionSourceText.ResolveEncoding(srcInc));
+                Services.ClarionSourceText.WriteFile(dstClw, clwContent, Services.ClarionSourceText.ResolveEncoding(srcClw));
 
                 // Save output folder as default for next time
                 _settings.Set("Class.OutputFolder", outputFolder);
@@ -2899,7 +3017,6 @@ namespace ClarionAssistant
                 renderer.DataReceived += data => OnTabRendererDataReceived(termTab, data);
                 renderer.TerminalResized += (s, ev) => OnTabRendererResized(termTab, ev);
                 renderer.Initialized += (s, ev) => OnTabRendererInitialized(termTab);
-                AttachSchemaSourcesView(termTab);
                 _tabManager.ActivateTab(termTab.Id);
             }
             catch (Exception ex)
@@ -3069,13 +3186,17 @@ namespace ClarionAssistant
                 UpdateStatus("MCP failed to start");
             }
 
-            // Periodic UI-thread timer to refresh instance state (app, procedure, peers)
-            if (_instanceCoord != null)
+            // Periodic UI-thread timer: solution-change poll (which also publishes the IDE's open
+            // solution for the standalone server, 77aceec5) ALWAYS; instance state only when
+            // coordination came up. It used to be created only with coordination, so a failed
+            // instances.db also silently stopped the solution poll.
+            _instanceStateTimer = new System.Windows.Forms.Timer { Interval = 10000 };
+            _instanceStateTimer.Tick += (s, ev) =>
             {
-                _instanceStateTimer = new System.Windows.Forms.Timer { Interval = 10000 };
-                _instanceStateTimer.Tick += (s, ev) => { PollForSolutionChange(); UpdateInstanceState(); };
-                _instanceStateTimer.Start();
-            }
+                PollForSolutionChange();
+                if (_instanceCoord != null) UpdateInstanceState();
+            };
+            _instanceStateTimer.Start();
 
             // Poll for Claude Code status line data (model, context, rate limits, git)
             _statusLineTimer = new System.Windows.Forms.Timer { Interval = 3000 };
@@ -3083,8 +3204,7 @@ namespace ClarionAssistant
             {
                 PollStatusLine();
                 // Always-on heartbeat for the version-keyed, solution-INDEPENDENT ClarionGraph build. This
-                // timer starts unconditionally (unlike _instanceStateTimer, which is gated on instance
-                // coordination), so the library DB still builds in embeditor / no-solution / coordination-
+                // timer starts unconditionally (as, since 77aceec5, does _instanceStateTimer), so the library DB still builds in embeditor / no-solution / coordination-
                 // failed sessions. Self-guarded: a cheap no-op once ensured / building / in failure-cooldown.
                 Services.ClarionGraphService.EnsureBuiltInBackground();
             };
@@ -3220,7 +3340,7 @@ namespace ClarionAssistant
             }
             catch (Exception ex)
             {
-                System.Diagnostics.Debug.WriteLine("[LaunchClaude] EXCEPTION: " + ex);
+                FailLaunch(tab, "Claude", ex);
             }
         }
 
@@ -3243,7 +3363,7 @@ namespace ClarionAssistant
             }
             catch (Exception ex)
             {
-                System.Diagnostics.Debug.WriteLine("[LaunchCopilot] EXCEPTION: " + ex);
+                FailLaunch(tab, "Copilot", ex);
             }
         }
 
@@ -3266,7 +3386,7 @@ namespace ClarionAssistant
             }
             catch (Exception ex)
             {
-                System.Diagnostics.Debug.WriteLine("[LaunchCodex] EXCEPTION: " + ex);
+                FailLaunch(tab, "Codex", ex);
             }
         }
 
@@ -3298,6 +3418,25 @@ namespace ClarionAssistant
         /// </summary>
         private LaunchContext PrepareBackendLaunch(TerminalTab tab, string backendName, bool requirePwsh7)
         {
+            // Windows too old to host a terminal at all (GitHub #236). Checked BEFORE ConPTY is
+            // touched, because on such a system the failure is an EntryPointNotFoundException from
+            // kernel32 that used to be swallowed into a blank tab.
+            int build = Services.WindowsVersion.GetBuildNumber();
+            int minBuild = Services.WindowsVersion.MinimumSupportedBuild;
+            if (build > 0 && build < minBuild)
+            {
+                AbortLaunch(tab);
+                ShowLaunchProblem(tab, backendName,
+                    "Windows build " + build + " is too old",
+                    "Clarion Assistant needs Windows 10 version 1809 or Windows Server 2019, or later (build "
+                    + minBuild + "+). This machine is build " + build + ".",
+                    "These tabs run on the Windows terminal API (ConPTY), which first shipped in that release"
+                    + (string.Equals(backendName, "Claude", StringComparison.OrdinalIgnoreCase)
+                        ? ", and Claude Code has the same minimum" : "")
+                    + " - so there is nothing to install that would fix it on this version of Windows.");
+                return null;
+            }
+
             tab.Terminal = new ConPtyTerminal();
             tab.Terminal.DataReceived += data => OnTabTerminalDataReceived(tab, data);
             tab.Terminal.ProcessExited += (s, ev) => OnTabTerminalProcessExited(tab);
@@ -3328,6 +3467,72 @@ namespace ClarionAssistant
                 SafeWorkDir = workDir.Replace("'", "''"),
                 EnvSetup = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; [Console]::InputEncoding = [System.Text.Encoding]::UTF8; ",
             };
+        }
+
+        /// <summary>
+        /// A launch threw. Reset the tab FIRST, then say why: AbortLaunch disposes the terminal,
+        /// and ConPtyTerminal's teardown raises ProcessExited synchronously, whose handler writes
+        /// "... exited" to the status line - so the order is what keeps the real reason on screen
+        /// (Codex adversary, pipeline run 1). Shown, not swallowed (GitHub #236): the old
+        /// Debug-only catch was the whole reason a failed launch looked like an empty tab.
+        /// </summary>
+        private void FailLaunch(TerminalTab tab, string backendName, Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine("[Launch" + backendName + "] EXCEPTION: " + ex);
+            AbortLaunch(tab);
+            ShowLaunchProblem(tab, backendName, ex.GetType().Name, ex.GetType().Name + ": " + ex.Message, null);
+        }
+
+        /// <summary>
+        /// Tell the developer, in the tab itself and on the status line, why the assistant did not
+        /// start. The tab is where they are looking: a launch failure that only reaches
+        /// Debug.WriteLine leaves an empty black tab and no clue (GitHub #236). The renderer queues
+        /// writes made before its WebView2 is ready, so this is safe at any point in the launch.
+        ///
+        /// <paramref name="status"/> is the short form for the one-line status bar; the tab gets
+        /// the full <paramref name="headline"/> and <paramref name="detail"/>. Callers that tear
+        /// the tab down must do it BEFORE calling this (see FailLaunch).
+        /// </summary>
+        private void ShowLaunchProblem(TerminalTab tab, string backendName, string status, string headline, string detail)
+        {
+            System.Diagnostics.Debug.WriteLine("[Launch" + backendName + "] NOT STARTED: " + headline + " " + detail);
+            try
+            {
+                var renderer = tab?.Renderer;
+                if (renderer != null && !renderer.IsDisposed)
+                {
+                    string text = "\r\n\x1b[1;31m" + backendName + " did not start.\x1b[0m\r\n\r\n"
+                        + TerminalSafe(headline) + "\r\n"
+                        + (string.IsNullOrEmpty(detail) ? "" : "\r\n\x1b[90m" + TerminalSafe(detail) + "\x1b[0m\r\n");
+                    renderer.WriteToTerminal(Encoding.UTF8.GetBytes(text));
+                }
+            }
+            catch { }
+            try { UpdateStatus(backendName + " failed to start: " + (status ?? "")); } catch { }
+        }
+
+        /// <summary>
+        /// Text safe to write into the xterm.js tab as PLAIN text: newlines normalised to CRLF, and
+        /// every other control character removed - ESC and BEL (which begin CSI/OSC sequences:
+        /// OSC 52 writes the clipboard, OSC 8 plants links, others retitle the window), all C0/C1
+        /// controls, DEL, and the Unicode bidi controls that can disguise what is shown. Exception
+        /// messages can carry paths and child-process output, so they are untrusted here (Codex
+        /// security, pipeline run 1); CA's own styling is added around this, never through it.
+        /// </summary>
+        internal static string TerminalSafe(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return string.Empty;
+            var sb = new StringBuilder(s.Length + 8);
+            foreach (char c in s.Replace("\r\n", "\n").Replace('\r', '\n'))
+            {
+                if (c == '\n') { sb.Append("\r\n"); continue; }
+                if (c == '\t') { sb.Append(c); continue; }
+                if (char.IsControl(c)) continue;                                   // C0, DEL, C1 (ESC, BEL, 0x9B CSI...)
+                if (c == '‎' || c == '‏' || c == '؜') continue;     // directional marks
+                if ((c >= '‪' && c <= '‮') || (c >= '⁦' && c <= '⁩')) continue; // bidi embeds/isolates
+                sb.Append(c);
+            }
+            return sb.ToString();
         }
 
         /// <summary>Reset tab state and dispose the half-initialized terminal
@@ -3388,7 +3593,9 @@ namespace ClarionAssistant
             }
             System.Diagnostics.Debug.WriteLine("[LaunchClaude] mcpConfigPath=" + _mcpConfigPath + ", mcpArg=" + mcpArg);
 
-            DeployClaudeMd(ctx.WorkDir);
+            // False when CLAUDE.md was not written (user's global .claude, or a user-authored
+            // file) - the prompt then rides on --append-system-prompt-file below instead (GH #227).
+            bool claudeMdDelivered = DeployClaudeMd(ctx.WorkDir);
 
             if (_knowledgeService != null)
             {
@@ -3397,6 +3604,8 @@ namespace ClarionAssistant
             }
 
             string systemPromptExtra = BuildSystemPromptInjection(ctx.WorkDir);
+            systemPromptExtra = Services.ClaudeMdDeployer.ComposeSystemPromptExtra(
+                claudeMdDelivered, claudeMdDelivered ? null : ReadClarionAssistantPrompt(), systemPromptExtra);
             string initialPrompt = BuildInitialPrompt(ctx.WorkDir);
             System.Diagnostics.Debug.WriteLine("[LaunchClaude] prompts built");
 
@@ -4177,9 +4386,6 @@ namespace ClarionAssistant
             renderer.TerminalResized += (s, ev) => OnTabRendererResized(tab, ev);
             renderer.Initialized += (s, ev) => OnTabRendererInitialized(tab);
 
-            // Schema sources panel
-            AttachSchemaSourcesView(tab);
-
             _tabManager.ActivateTab(tab.Id);
         }
 
@@ -4187,27 +4393,48 @@ namespace ClarionAssistant
 
         #region Helpers
 
-        private void DeployClaudeMd(string workDir)
+        /// <summary>
+        /// Writes the IDE briefing to &lt;workDir&gt;\.claude\CLAUDE.md when that is safe, and
+        /// returns whether it did. The rules live in <see cref="Services.ClaudeMdDeployer"/>:
+        /// never the user's global Claude config dir, never a CLAUDE.md the user wrote (GH #227 -
+        /// New Chat's %USERPROFILE% fallback used to overwrite ~\.claude\CLAUDE.md).
+        /// </summary>
+        private bool DeployClaudeMd(string workDir)
         {
             try
             {
                 string assemblyDir = Path.GetDirectoryName(
                     System.Reflection.Assembly.GetExecutingAssembly().Location);
                 string source = Path.Combine(assemblyDir, "Terminal", "clarion-assistant-prompt.md");
-                if (!File.Exists(source)) return;
 
-                string claudeDir = Path.Combine(workDir, ".claude");
-                if (!Directory.Exists(claudeDir))
-                    Directory.CreateDirectory(claudeDir);
+                var outcome = Services.ClaudeMdDeployer.Deploy(
+                    source, workDir,
+                    Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                    Environment.GetEnvironmentVariable("CLAUDE_CONFIG_DIR"));
+                System.Diagnostics.Debug.WriteLine("[DeployClaudeMd] " + outcome + " for " + workDir);
 
-                string dest = Path.Combine(claudeDir, "CLAUDE.md");
-                // Always overwrite — the dynamic context from last session needs to be cleared
-                File.Copy(source, dest, true);
+                // Deploy statusLine config so Claude Code writes status data for this tab. Same
+                // rules as CLAUDE.md: never in the user's config dir (so a New Chat in the profile
+                // folder has no CA status line), and never over a file that isn't CA's own.
+                if (!string.IsNullOrEmpty(workDir))
+                    DeployStatusLineConfig(Path.Combine(workDir, ".claude"), assemblyDir);
 
-                // Deploy statusLine config so Claude Code writes status data for this tab
-                DeployStatusLineConfig(claudeDir, assemblyDir);
+                return Services.ClaudeMdDeployer.Delivered(outcome);
             }
-            catch { }
+            catch { return false; }
+        }
+
+        /// <summary>The shipped IDE briefing, or null if it cannot be read.</summary>
+        private static string ReadClarionAssistantPrompt()
+        {
+            try
+            {
+                string assemblyDir = Path.GetDirectoryName(
+                    System.Reflection.Assembly.GetExecutingAssembly().Location);
+                string source = Path.Combine(assemblyDir, "Terminal", "clarion-assistant-prompt.md");
+                return File.Exists(source) ? File.ReadAllText(source) : null;
+            }
+            catch { return null; }
         }
 
         private void DeployStatusLineConfig(string claudeDir, string assemblyDir)
@@ -4223,7 +4450,6 @@ namespace ClarionAssistant
                 string nodeExe = ResolveNodeExe();
                 if (nodeExe == null) return;
 
-                string settingsPath = Path.Combine(claudeDir, "settings.local.json");
                 string safeScript = scriptPath.Replace("\\", "/");
                 string safeNode = nodeExe.Replace("\\", "/");
                 string json = "{\"statusLine\":{\"type\":\"command\",\"command\":\"\\\"" + safeNode + "\\\" \\\"" + safeScript + "\\\"\"}}";
@@ -4232,8 +4458,13 @@ namespace ClarionAssistant
                 // line 1 column 1" and IGNORES THE WHOLE FILE. Since the file's only content is the
                 // statusLine command, that meant the Clarion Assistant status line silently never
                 // worked for anyone. We could not see it because File.ReadAllText strips BOMs, so
-                // every round-trip on our side looked fine (ticket 9b9dbc7d).
-                File.WriteAllText(settingsPath, json, Services.EncodingHelper.Utf8NoBom);
+                // every round-trip on our side looked fine (ticket 9b9dbc7d). WriteStatusLineSettings
+                // writes with Utf8NoBom, and only where GH #227's rules allow.
+                var outcome = Services.ClaudeMdDeployer.WriteStatusLineSettings(
+                    claudeDir, json,
+                    Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                    Environment.GetEnvironmentVariable("CLAUDE_CONFIG_DIR"));
+                System.Diagnostics.Debug.WriteLine("[DeployStatusLineConfig] " + outcome + " for " + claudeDir);
             }
             catch { }
         }
@@ -4549,6 +4780,7 @@ namespace ClarionAssistant
                 //
                 // Still does NOT cover a kill — deploy, crash, Task Manager — which is the common
                 // way CA terminals die and needs a liveness check on the broker side; see the ticket.
+                Services.ShutdownLog.Close("pad dispose: begin (MT disconnect)");
                 try
                 {
                     if (_tabManager != null)
@@ -4559,16 +4791,28 @@ namespace ClarionAssistant
                 }
                 catch (Exception ex) { Services.ShutdownLog.Log("MT disconnect on pad dispose failed: " + ex.Message); }
 
+                // Close timing (4d63b995): one line before each step, so the gaps show where the time goes.
+                Services.ShutdownLog.Close("pad dispose: tabs");
                 if (_tabManager != null) _tabManager.Dispose();
+                Services.ShutdownLog.Close("pad dispose: mcp server");
                 if (_mcpServer != null) _mcpServer.Dispose();
+                Services.ShutdownLog.Close("pad dispose: knowledge service");
                 if (_knowledgeService != null) _knowledgeService.Dispose();
+                Services.ShutdownLog.Close("pad dispose: timers and diagnostics form");
                 if (_lspUiTimer != null) { _lspUiTimer.Stop(); _lspUiTimer.Dispose(); }
                 if (_diagForm != null) { try { _diagForm.Close(); _diagForm.Dispose(); } catch { } }
                 if (_instanceStateTimer != null) { _instanceStateTimer.Stop(); _instanceStateTimer.Dispose(); }
+                UnhookIdeVersionChanges();
                 if (_statusLineTimer != null) { _statusLineTimer.Stop(); _statusLineTimer.Dispose(); }
+                Services.ShutdownLog.Close("pad dispose: instance coordination");
                 if (_instanceCoord != null) _instanceCoord.Dispose();
+                Services.ShutdownLog.Close("pad dispose: home view");
                 if (_homeView != null) _homeView.Dispose();
+                Services.ShutdownLog.Close("pad dispose: schema view" + (_schemaView != null ? "" : " (never created)"));
+                if (_schemaView != null) { _schemaView.Dispose(); _schemaView = null; }
+                Services.ShutdownLog.Close("pad dispose: header");
                 if (_header != null) _header.Dispose();
+                Services.ShutdownLog.Close("pad dispose: done");
             }
             base.Dispose(disposing);
         }

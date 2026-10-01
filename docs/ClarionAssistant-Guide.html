@@ -427,7 +427,7 @@
 <header class="site-header">
   <h1>Clarion.Assistant</h1>
   <div class="subtitle">AI-Powered Development for the Clarion IDE</div>
-  <div class="version-badge">User Guide &middot; v1.7 &middot; for Clarion.Assistant 5.8</div>
+  <div class="version-badge">User Guide &middot; v1.8 &middot; for Clarion.Assistant 5.9</div>
 </header>
 
 <!-- ════════════════════════════════════════════════════ -->
@@ -439,6 +439,7 @@
   <nav class="sidebar">
     <h3>What's New</h3>
     <a href="#whats-new">Release Notes</a>
+    <a href="#whats-new-59" class="sub">v5.9</a>
     <a href="#whats-new-58" class="sub">v5.8</a>
     <a href="#whats-new-55" class="sub">v5.5</a>
     <a href="#whats-new-54" class="sub">v5.4</a>
@@ -461,7 +462,7 @@
     <a href="#claude-chat">Overview</a>
     <a href="#claude-chat-home" class="sub">Home Tab</a>
     <a href="#claude-chat-tabs" class="sub">Tab System</a>
-    <a href="#claude-chat-solution" class="sub">Solution Bar</a>
+    <a href="#claude-chat-solution" class="sub">Header Tabs</a>
     <a href="#claude-chat-toolbar" class="sub">Terminal Toolbar</a>
     <a href="#claude-chat-capabilities" class="sub">What Claude Can Do</a>
     <a href="#claude-chat-examples" class="sub">Example Conversations</a>
@@ -529,6 +530,59 @@
 <!-- ════════════════════════════════════════════════════ -->
 <section id="whats-new" class="doc-section">
   <h2>What's New</h2>
+
+  <h3 id="whats-new-59">v5.9 &mdash; Instant Completion, Header Tabs, an Embeditor That Behaves Like Clarion</h3>
+
+  <p>
+    In the <a href="#ca-embeditor"><strong>CA Embeditor</strong></a> and CA Editor,
+    <strong>completion, hover and squiggles are now instant</strong>, even on generated modules of
+    tens of thousands of lines. On an 86,000-line module completion used to show
+    &quot;Loading&hellip;&quot; for four seconds and a missing-routine squiggle took minutes; it now
+    takes tens of milliseconds. Clarion Assistant answers first from locals, parameters, class members
+    (including <code>SELF.</code> with inherited members), CodeGraph and the live dictionary, and the
+    language server adds its results when they arrive. Keywords and built-ins now hover with what they
+    do. The bundled language server starts as soon as a solution opens, with no chat tab needed, and
+    works for the first time without Mark Sarson's ClarionLsp addin.
+  </p>
+
+  <p>
+    The pane's <a href="#claude-chat-solution">header</a> has tabs: <strong>Solution</strong>,
+    <strong>Schema Sources</strong> and <strong>Source Control</strong>, which used to hide in a
+    &quot;Solution Settings&quot; bar inside each chat tab. <strong>&#10697;</strong> copies the
+    solution path, <strong>RED</strong> opens the <code>.red</code> file, and the LSP diagnostics bar
+    and its toggle are gone. <strong>VERSION</strong> now simply shows the Clarion version the IDE has
+    selected (<strong>Build &gt; Set Clarion Version</strong>), and every part of Clarion Assistant uses
+    it. Clarion also <strong>closes noticeably faster</strong>.
+  </p>
+
+  <p>
+    The CA Embeditor behaves like Clarion's own: <kbd>Ctrl</kbd>+<kbd>F4</kbd>,
+    <kbd>Ctrl</kbd>+<kbd>O</kbd> and <kbd>Alt</kbd>+letter reach the IDE, closing unsaved work raises
+    Clarion's own &quot;Save Changes in Embed Editor?&quot; prompt, and one procedure is open at a time.
+    <kbd>Ctrl</kbd>+<kbd>W</kbd> marks a word, and <code>LOOP &hellip; UNTIL</code> folds and formats
+    correctly.
+  </p>
+
+  <p>
+    For the assistant: a standalone <strong><code>clarion-mcp-server</code></strong> brings 61 of the
+    tools (documentation, knowledge, LSP, schema, CodeGraph) to any MCP client outside the IDE, and
+    new dictionary tools read the open app's <strong>own dictionary</strong> live instead of guessing
+    one from disk. Clarion Assistant also joins the <strong>Clarion Addin Registry</strong>, so
+    <strong>AddinFinder</strong> can find and update it; that is why this release is 5.9.0 and not
+    5.8.2. Plus many more fixes: source files keep their own encoding, New Chat no longer overwrites
+    your <code>CLAUDE.md</code>, and the installer no longer mangles non-ASCII characters in your
+    Claude Code settings.
+  </p>
+
+  <div class="info-box info-box--warning">
+    <strong>If New Chat overwrote your global <code>CLAUDE.md</code>,</strong> 5.9 stops it happening
+    again but cannot bring the original back. Restore it from File History, OneDrive or another backup.
+  </div>
+
+  <p>
+    Full notes:
+    <a href="https://github.com/ClarionLive/ClarionAssistant/blob/master/docs/releases/v5.9.0.md">v5.9.0 release notes</a>.
+  </p>
 
   <h3 id="whats-new-58">v5.8 &mdash; CodeGraph Speed &amp; Accuracy, Settings-Safe Installer</h3>
 
@@ -1225,11 +1279,15 @@
     Each tab has its own Claude Code process with full IDE integration.
   </div>
 
-  <h3 id="claude-chat-solution">Solution Bar</h3>
+  <h3 id="claude-chat-solution">Header: Solution, Schema Sources, Source Control</h3>
   <p>
-    The Solution Bar runs across the top of the Clarion Assistant panel. It controls which Clarion
-    environment and solution Claude operates against.
+    The header runs across the top of the Clarion Assistant panel, above every tab (Home included).
+    It has three tabs of its own: <strong>Solution</strong>, <strong>Schema Sources</strong> and
+    <strong>Source Control</strong>. The header has a fixed height, so there is nothing to drag.
   </p>
+
+  <h4>Solution</h4>
+  <p>Controls which Clarion environment and solution Claude operates against.</p>
 
   <table class="feature-table">
     <thead>
@@ -1240,57 +1298,68 @@
     </thead>
     <tbody>
       <tr>
-        <td><strong>Version Selector</strong></td>
+        <td><strong>Solution</strong></td>
         <td>
-          Dropdown listing installed Clarion versions (11, 12, etc.). Clarion.Assistant
-          auto-detects which versions are present on your system.
+          A dropdown of recently opened solutions. The solution open in the IDE is detected and
+          selected automatically. <strong>&#10697;</strong> copies the solution's full path to the
+          clipboard; <strong>&hellip;</strong> browses for a <code>.sln</code> file.
         </td>
       </tr>
       <tr>
-        <td><strong>Solution Picker</strong></td>
+        <td><strong>Version</strong></td>
         <td>
-          A dropdown showing up to 10 recently opened solutions, plus a browse button to
-          locate a <code>.sln</code> file manually. The currently open solution in the IDE
-          is auto-detected and pre-selected.
+          The Clarion version in use, shown read-only: it is always the IDE's
+          <strong>Build &gt; Set Clarion Version</strong> for the solution, marked <strong>(IDE)</strong>.
+          With the IDE on <em>(Current Version)</em> it is the running Clarion's own version. To change
+          it, use Build &gt; Set Clarion Version; <strong>&#8635;</strong> re-reads the IDE's choice.
         </td>
       </tr>
       <tr>
-        <td><strong>Refresh</strong></td>
+        <td><strong>RED</strong></td>
         <td>
-          Forces re-detection of the IDE's currently open solution. Use this if you opened
-          or switched solutions and the picker has not updated.
+          The redirection (<code>.red</code>) file in effect. It is an underlined link: click it to open
+          the <code>.red</code> file in an IDE editor tab. When no redirection file could be resolved it
+          shows a warning instead, and is not clickable.
         </td>
       </tr>
       <tr>
-        <td><strong>Full Index</strong></td>
+        <td><strong>CodeGraph</strong></td>
         <td>
-          Triggers a complete CodeGraph indexing pass over the entire solution. This parses
-          every source file and builds a <code>.codegraph.db</code> SQLite database containing
-          all symbols, relationships, and call chains.
-        </td>
-      </tr>
-      <tr>
-        <td><strong>Update</strong></td>
-        <td>
-          Runs an incremental index refresh. Only files changed since the last full index
-          are re-processed. Significantly faster for day-to-day use.
-        </td>
-      </tr>
-      <tr>
-        <td><strong>Index Status</strong></td>
-        <td>
-          Displays the date and time of the last successful index. If the solution has never
-          been indexed, this area prompts you to run a full index.
+          The date and time of the last successful index, or a prompt to index a solution that never
+          has been. <strong>Reindex</strong> rebuilds the <code>.codegraph.db</code> SQLite database from
+          scratch; <strong>Update</strong> re-processes only the files changed since the last index and
+          is much faster for day-to-day use. The log button shows the indexing activity log.
         </td>
       </tr>
     </tbody>
   </table>
 
   <div class="info-box info-box--tip">
-    <strong>Tip:</strong> Run a <strong>Full Index</strong> once when you first open a solution,
+    <strong>Tip:</strong> Run a <strong>Reindex</strong> once when you first open a solution,
     then use <strong>Update</strong> periodically as you make changes. Claude's CodeGraph queries
     are only as current as the last index.
   </div>
+
+  <h4>Schema Sources</h4>
+  <p>
+    The databases that describe your solution's data: Clarion dictionaries (<code>.dctx</code>),
+    Microsoft SQL Server, SQLite and PostgreSQL. The tab shows how many sources are linked. The list
+    shows each source's type, table count and last index date; <strong>Manage Sources</strong> adds,
+    edits and removes them, and <strong>Index All</strong> (or a row's <strong>Index</strong>) refreshes
+    the schema the assistant queries.
+  </p>
+
+  <h4>Source Control</h4>
+  <p>
+    Links the solution to a GitHub or Bitbucket repository: pick the <strong>Account</strong> and enter
+    the <strong>Repo</strong> name.
+  </p>
+
+  <p>
+    Schema Sources and Source Control belong to the <strong>solution</strong>, not to a chat. They follow
+    the solution selected in the header and look the same from every tab. (Before 5.9 they sat in a
+    collapsed &quot;Solution Settings&quot; bar inside each chat tab.)
+  </p>
 
   <h3 id="claude-chat-toolbar">Terminal Toolbar</h3>
 
@@ -1564,25 +1633,15 @@
   <h3 id="ca-embeditor-open">Opening a Procedure</h3>
 
   <p>
-    The fastest way is a right-click in the Clarion application tree:
+    Open a procedure's embeds the way you always have in Clarion: right-click the procedure in the
+    application tree and choose <strong>Embeditor Source</strong>, or use the Views toolbar button. The CA
+    Embeditor lays itself over Clarion's own embeditor automatically, and your edits save straight
+    back with Clarion's Save &amp; Exit.
   </p>
 
-  <ul>
-    <li>
-      <strong>Right-click &rarr; Open in CA Embeditor</strong> &mdash; right-click any procedure in
-      the application tree and choose <strong>Open in CA Embeditor</strong>. The procedure you
-      clicked opens directly in a CA Embeditor tab &mdash; no Tools-menu or picker step in between.
-    </li>
-    <li>
-      <strong>Multiple procedures as tabs</strong> &mdash; open as many procedures as you like; each
-      opens in its own CA Embeditor tab, so you can move between them while you work.
-    </li>
-    <li>
-      <strong>Other ways to open</strong> &mdash; the <strong>CA Embeditor</strong> button on the
-      native embed-editor toolbar opens the currently selected procedure. The right-click is simply
-      the shortcut for the common case.
-    </li>
-  </ul>
+  <p>
+    One procedure is open in the CA Embeditor at a time, as in Clarion's own embeditor.
+  </p>
 
   <h3 id="ca-monaco-editor">Monaco Source Editor</h3>
 
@@ -1593,6 +1652,32 @@
     native Clarion text editor while keeping the same save and navigation behavior.
   </p>
 
+  <h4>Completion, hover and squiggles</h4>
+
+  <p>
+    In the CA Editor and the CA Embeditor, completion, hover and squiggles appear as you type, even in
+    a generated module of tens of thousands of lines. Clarion Assistant answers from what it already
+    knows, without waiting for the language server:
+  </p>
+
+  <ul>
+    <li>the procedure's <strong>locals and parameters</strong>, routines, and group and queue fields;</li>
+    <li><strong>class members</strong>, including <code>SELF.</code> with the members it inherits
+      (for example <code>WindowManager</code>'s, inside a <code>ThisWindow</code> method);</li>
+    <li>solution-wide <strong>procedures and globals</strong> from CodeGraph;</li>
+    <li><code>PRE:</code> <strong>fields from the live dictionary</strong>, with no schema import needed;</li>
+    <li>Clarion <strong>keywords and built-ins</strong>. Hovering one shows what it does and its
+      signature, for example <code>CLIP(STRING string)</code>.</li>
+  </ul>
+
+  <p>
+    Structure errors and a <code>DO</code> of a missing routine are underlined as soon as they are
+    found. The language server's own completions and squiggles are added when they arrive, and
+    squiggles always belong to the text on screen, including after a save and reopen. CodeGraph
+    databases get the indexes this needs automatically the first time they are used, so there is
+    nothing to re-index.
+  </p>
+
   <p>
     You can turn either surface off under <strong>Options &rarr; Clarion Assistant &rarr; Editor
     Surfaces</strong>:
@@ -1600,7 +1685,7 @@
 
   <ul>
     <li><strong>Use the Monaco source editor</strong> &mdash; replaces the native Clarion text editor.</li>
-    <li><strong>Use the Monaco embeditor</strong> &mdash; adds the right-click <em>Open in CA Embeditor</em> item.</li>
+    <li><strong>Use the Monaco embeditor</strong> &mdash; lays the CA Embeditor over Clarion's own embeditor when you open a procedure's embeds.</li>
     <li><strong>Apply to these file types only</strong> &mdash; a semicolon-separated extension filter; blank means all.</li>
   </ul>
 
@@ -1688,8 +1773,8 @@
   <p>
     Open the docked <strong>CA Explorer</strong> from <strong>Tools &rarr; CA Explorer</strong> or
     with <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>D</kbd> (its title bar reads <strong>CA Explorer</strong>
-    when docked). It follows the active CA Embeditor tab, so it always shows the data for the
-    procedure you're currently editing:
+    when docked). It follows the CA Embeditor, so it always shows the data for the procedure
+    you're currently editing:
   </p>
 
   <ul>
@@ -1706,8 +1791,8 @@
       columns, and its relationships to other tables.
     </li>
     <li>
-      <strong>Follows the active tab</strong> &mdash; switch CA Embeditor tabs and the pad updates
-      to match the procedure you switched to.
+      <strong>Follows the open procedure</strong> &mdash; open another procedure's embeds and the
+      pad updates to match.
     </li>
     <li>
       <strong>Drag a field to the editor or designer</strong> &mdash; drag a column or variable row
@@ -2154,7 +2239,10 @@
         The Monaco source editor and CA Embeditor show real-time error and warning squiggles
         (via <code>lsp_diagnostics</code>) and offer code completion &mdash; including
         <code>PROP:</code>/<code>EVENT:</code> equates and member-access
-        (<code>oInstance.Method</code>) suggestions &mdash; as you type.
+        (<code>oInstance.Method</code>) suggestions &mdash; as you type. Clarion Assistant answers
+        completion and hover instantly from the procedure, CodeGraph and the dictionary, and the
+        language server's results are added when they arrive
+        (see <a href="#ca-monaco-editor">Monaco Source Editor</a>).
       </p>
     </div>
   </div>
@@ -2162,7 +2250,8 @@
   <h3>How It Works</h3>
 
   <p>
-    The Language Server starts automatically when you select a solution in the Clarion Assistant panel.
+    The Language Server starts automatically when a solution opens in the IDE &mdash; you don't need
+    to open a chat tab first.
     It runs in the background, analyzing your Clarion source files and maintaining an up-to-date
     model of your codebase. In the Monaco source editor and CA Embeditor you can jump to a
     definition directly with <kbd>F12</kbd> or <kbd>Ctrl</kbd>+click.
@@ -2383,7 +2472,7 @@
   <table class="tools-table">
     <thead><tr><th>Tool</th><th>Description</th></tr></thead>
     <tbody>
-      <tr><td><code>lsp_start</code></td><td>Start the Clarion Language Server. Auto-starts when a solution is selected.</td></tr>
+      <tr><td><code>lsp_start</code></td><td>Start the Clarion Language Server. Auto-starts when a solution opens in the IDE; no chat tab is needed.</td></tr>
       <tr><td><code>lsp_definition</code></td><td>Go to definition: find where a symbol is defined, across files.</td></tr>
       <tr><td><code>lsp_references</code></td><td>Find all references to a symbol across the entire workspace.</td></tr>
       <tr><td><code>lsp_hover</code></td><td>Get type information, signature, and documentation for a symbol.</td></tr>
@@ -2672,7 +2761,7 @@
 <!--  FOOTER                                             -->
 <!-- ════════════════════════════════════════════════════ -->
 <footer class="site-footer">
-  <p>Clarion.Assistant User Guide &middot; v1.7 &middot; &copy; 2025&ndash;2026</p>
+  <p>Clarion.Assistant User Guide &middot; v1.8 &middot; &copy; 2025&ndash;2026</p>
 </footer>
 
 <!-- Smooth scrolling -->

@@ -104,6 +104,13 @@ namespace ClarionAssistant.Terminal
         /// <summary>{action:"documentStructure"} — outline/document-symbol tree for the current buffer;
         /// host replies via PostResponse with {symbols:[{name,kind,detail,line,children}], fileMode}.</summary>
         void OnDocumentStructure(MonacoEditorControl editor, string rawJson);
+        /// <summary>1c685f2e item 4: the instant local layer, answered with no language server. On the
+        /// interface (not OnUnknownAction) so the compiler refuses a host that does not route them - the
+        /// dual-host no-op gotcha. Each implementation is one call to <see cref="MonacoEditorControl.RunLocalAction"/>
+        /// naming its lane and the host's <see cref="Services.LocalLayerOptions"/>.</summary>
+        void OnLocalCompletion(MonacoEditorControl editor, string rawJson);
+        void OnLocalHover(MonacoEditorControl editor, string rawJson);
+        void OnSlotDiagnostics(MonacoEditorControl editor, string rawJson);
 
         /// <summary>{action:"saveSettings"} — persist gear-panel settings + broadcast to all tabs.</summary>
         void OnSaveSettings(MonacoEditorControl editor, string rawJson);
@@ -173,6 +180,25 @@ namespace ClarionAssistant.Terminal
     }
 
     /// <summary>
+    /// OPTIONAL companion to <see cref="IMonacoEditorHost"/>: a host that can answer
+    /// {action:"foldingRanges"} from the language server.
+    ///
+    /// Kept off IMonacoEditorHost on purpose. That interface is implemented by every Monaco surface,
+    /// and only the ones with a real file + a running LSP can answer this — a surface that cannot
+    /// simply doesn't implement it, the request times out on the page (4s), and the editor falls back
+    /// to the line-oriented fold pass in clarion-language.js. Adding it to the main interface would
+    /// force a no-op on every other surface for no gain, and the fallback has to exist regardless
+    /// because the LSP may not be running at all.
+    /// </summary>
+    public interface IMonacoFoldingHost
+    {
+        /// <summary>{action:"foldingRanges", v} — the buffer is resolved through
+        /// MonacoEditorControl.TryResolveRequestBuffer (16d140e9); host replies via PostResponse with
+        /// {ranges:[{start,end,kind}]} (1-based, inclusive) or {ranges:null} when unavailable.</summary>
+        void OnFoldingRanges(MonacoEditorControl editor, string rawJson);
+    }
+
+    /// <summary>
     /// Reusable Monaco-over-WebView2 surface. Owns the <see cref="Panel"/> + <see cref="WebView2"/>,
     /// CoreWebView2 init, a per-instance virtual-host temp folder (large-buffer transfer via
     /// source.txt), navigation to the Monaco HTML (default monaco-embeditor.html) with the ?v=
@@ -216,6 +242,182 @@ namespace ClarionAssistant.Terminal
         /// </summary>
         public bool IsDark { get; private set; }
 
+        // ── Buffer sync (16d140e9) ──────────────────────────────────────────────────────────────
+        // The page posts its buffer in 'bufferSync' (and file mode's 'fileState') only when the content
+        // changed; requests carry `v`. ONE cached copy per surface, replaced on every sync. See
+        // MonacoBufferSync.cs for why (a 3.2 MB buffer per request crashed a 32-bit Clarion.exe).
+        private readonly MonacoBufferCache _bufferCache = new MonacoBufferCache();
+        private readonly LaneSet _lanes = new LaneSet();   // RunLatest lanes, see MonacoBufferSync.cs
+        private readonly Debouncer _fileStateSpanMap = new Debouncer(400);   // F7: one span map per pause in file mode
+
+        /// <summary>The page's buffer as of its last sync (null before the first one).</summary>
+        public string CurrentBuffer { get { return _bufferCache.CurrentBuffer; } }
+
+        /// <summary>The page's sync version `v` for <see cref="CurrentBuffer"/> (-1 before the first sync).</summary>
+        public long CurrentBufferVersion { get { return _bufferCache.CurrentBufferVersion; } }
+
+        /// <summary>The cached buffer if it is version <paramref name="v"/>, else null.</summary>
+        public string ResolveBuffer(long v) { return _bufferCache.Resolve(v); }
+
+        /// <summary>
+        /// THE way a handler gets the buffer a request refers to. An inline "buffer" (older page) is used
+        /// as-is; otherwise "v" is resolved from the cache. When the request names a version this surface
+        /// does not hold (should not happen — the page posts the sync first and WebView2 keeps order), the
+        /// request is answered HERE with a null reply (the page treats it exactly like a timeout) and the
+        /// page is told to resend with its next request; the caller gets false and must return without
+        /// replying. Never throws, never blocks.
+        /// </summary>
+        public bool TryResolveRequestBuffer(IDictionary<string, object> data, out string buffer)
+        {
+            buffer = null;
+            MonacoBufferCache.Lookup how = MonacoBufferCache.Lookup.None;
+            bool ok;
+            // Every caller is a buffer-dependent action: only an inline buffer or a cached `v` is servable.
+            // No buffer AND no usable `v` (Lookup.None) is refused like an unknown `v` (Missing) - pipeline
+            // HIGH on a49f411: a null buffer let diagnostics fall back to load-time text and completion/hover
+            // answer from stale LSP/on-disk state.
+            try { ok = _bufferCache.TryResolveForRequest(data, out buffer, out how); }
+            catch { ok = false; buffer = null; }
+            if (ok) return true;
+
+            long reqId, v;
+            MonacoBufferCache.TryGetLong(data, "reqId", out reqId);
+            bool hasV = MonacoBufferCache.TryGetLong(data, "v", out v);
+            string action = null;
+            try { object a; if (data != null && data.TryGetValue("action", out a)) action = a as string; } catch { }
+            try
+            {
+                MonacoSpikeLog.Write("[buffer-sync] " + (action ?? "?") + " reqId=" + reqId + " lookup=" + how +
+                    " v=" + (hasV ? v.ToString() : "none") + " surface holds v=" + _bufferCache.CurrentBufferVersion +
+                    " - null reply + resync");
+            }
+            catch { }
+            if (reqId > 0) PostResponse((int)reqId, null);
+            PostJson("{\"type\":\"bufferResync\"}");
+            return false;
+        }
+
+        /// <summary>
+        /// File mode's mirror text for a 'fileState' message: the cached copy when the message was stamped
+        /// with `v` (the control cached it on arrival — one copy, not two), else null (older page: the
+        /// caller deserialises the message itself). <paramref name="header"/> holds the small fields
+        /// (dirty, seq, v) when the message is in the page's shape.
+        /// </summary>
+        public string FileStateText(string json, out Dictionary<string, object> header)
+        {
+            header = null;
+            try
+            {
+                int start;
+                header = MonacoBufferCache.ParseHeader(json, "text", out start);
+                long v;
+                if (header == null || !MonacoBufferCache.TryGetLong(header, "v", out v)) return null;
+                return _bufferCache.Resolve(v);
+            }
+            catch { header = null; return null; }
+        }
+
+        /// <summary>
+        /// The diagnostics reply (both hosts). Null markers = K2 pending: the LSP has not answered for the current
+        /// text yet, so the page keeps the LSP markers it shows and asks again, rather than painting a cached
+        /// answer for another text.
+        /// </summary>
+        public static Dictionary<string, object> DiagnosticsReply(List<Dictionary<string, object>> markers)
+        {
+            return markers == null
+                ? new Dictionary<string, object> { { "markers", null }, { "pending", true } }
+                : new Dictionary<string, object> { { "markers", markers } };
+        }
+
+        /// <summary>One [diag-timing] line per diagnostics request (both hosts). Never throws.</summary>
+        public static void LogDiagTiming(RequestTimingLine line, string text, long resolveMs,
+            Services.ModernEmbeditorDiagnostics.Timing t, List<Dictionary<string, object>> markers)
+        {
+            try
+            {
+                line.Add("chars", text != null ? text.Length : 0)
+                    .Add("resolveMs", resolveMs)
+                    // skip= names why the LSP pass did not run (none = it ran). Replaces lspRunning=, which was
+                    // False for an empty buffer/ranges or no file too, not only for a stopped server.
+                    .Add("skip", t == null ? "n/a" : (t.Skip ?? (t.LspRan ? "none" : "?")))
+                    .Add("syncMs", t != null ? t.SyncMs : -1)
+                    .Add("waitMs", t != null ? t.WaitMs : -1)
+                    .Add("waitEnd", t != null ? (t.WaitEnd ?? "n/a") : "n/a")
+                    .Add("lspEntries", t != null ? t.LspEntries : -1)
+                    .Add("markers", markers != null ? markers.Count : 0);
+                MonacoSpikeLog.Write(line.Format());
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// Run <paramref name="work"/> on a background thread, one at a time per <paramref name="lane"/>,
+        /// keeping only the newest waiting request: an older one still waiting when a newer one arrives is
+        /// answered with a null reply (the page's timeout shape) instead of being run. Used for completion
+        /// and hover, which Monaco re-asks on every keystroke / mouse move. (16d140e9)
+        /// </summary>
+        public void RunLatest(string lane, int reqId, Action work, Action onDropped = null)
+        {
+            _lanes.Submit(lane, work, () =>
+            {
+                PostResponse(reqId, null);
+                if (onDropped != null) { try { onDropped(); } catch { } }
+            });
+        }
+
+        /// <summary>
+        /// A local-layer request (localCompletion / localHover / slotDiagnostics), end to end: resolve its
+        /// buffer by `v`, run <see cref="Services.LocalLayerHandlers.Handle"/> in <paramref name="lane"/> (newest
+        /// wins, never behind an LSP lane), and post the reply. Hosts call this with their own options and add
+        /// nothing else. No LSP, no sync, no database: see LocalLayerHandlers. (1c685f2e item 4)
+        /// </summary>
+        public void RunLocalAction(string lane, string action, string json, Services.LocalLayerOptions options)
+        {
+            Dictionary<string, object> data;
+            try { data = new JavaScriptSerializer { MaxJsonLength = int.MaxValue }.DeserializeObject(json) as Dictionary<string, object>; }
+            catch (Exception ex) { MonacoSpikeLog.Write("[local-timing] action=" + action + " unreadable request: " + ex.Message); return; }
+            if (data == null) return;
+            long reqId;
+            MonacoBufferCache.TryGetLong(data, "reqId", out reqId);
+            // 1c685f2e R11: a request carrying its own slice needs no synced buffer (the page no longer syncs
+            // the whole buffer while typing). Without one it refers to the synced buffer by `v`, as before.
+            string buffer = null;
+            if (!Services.LocalLayerHandlers.CarriesSlice(data) && !TryResolveRequestBuffer(data, out buffer)) return;   // answered null + resync
+            RunLatest(lane, (int)reqId, () => PostResponse((int)reqId, Services.LocalLayerHandlers.Handle(action, buffer, data, options)),
+                () => MonacoSpikeLog.Write("[local-timing] action=" + action + " reqId=" + reqId + " dropped=superseded-by-newer-request"));
+        }
+
+        /// <summary>
+        /// 1c685f2e F6: refuse an oversized page message. Logged (rate-limited per action) and, when it names a
+        /// request id, answered at once with the action's empty shape so the page does not wait out its timeout.
+        /// The reqId is read by a bounded scan (the prefix only), never by parsing the message.
+        /// </summary>
+        private void RejectMessage(string action, string json, string reason)
+        {
+            Services.WebMessageGuard.LogReject(MonacoSpikeLog.Write, action, json.Length, reason);
+            int reqId;
+            string head = json.Length > 4096 ? json.Substring(0, 4096) : json;
+            if (int.TryParse(ExtractJsonValue(head, "reqId"), out reqId) && reqId > 0)
+                PostResponse(reqId, Services.LocalLayerHandlers.IsLocalAction(action) ? Services.LocalLayerHandlers.EmptyReply(action) : null);
+        }
+
+        /// <summary>
+        /// 1c685f2e R11: after each full sync, push the page the buffer's span map ({type:'spanMap', v, headerHash,
+        /// procs:[...]}) so it can cut slices for the local layer. Built off the UI thread in the newest-wins
+        /// "span-map" lane; a job whose version was already replaced by a newer sync does nothing.
+        /// </summary>
+        private void PushSpanMap()
+        {
+            long v = _bufferCache.CurrentBufferVersion;
+            _lanes.Submit("span-map", () =>
+            {
+                string text = _bufferCache.Resolve(v);
+                if (text == null) return;   // superseded by a newer sync; that one pushes its own map
+                string msg = Services.LocalLayerHandlers.SpanMapMessage(v, text, MonacoSpikeLog.Write);
+                if (msg != null) PostJson(msg);
+            }, null);
+        }
+
         public MonacoEditorControl(IMonacoEditorHost host, bool isDark = true,
                                    string htmlFileName = "monaco-embeditor.html",
                                    string virtualHost = "clarion-embeditor-data")
@@ -226,7 +428,7 @@ namespace ClarionAssistant.Terminal
 
             Dock = DockStyle.Fill;
             IsDark = isDark;
-            BackColor = isDark ? Color.FromArgb(30, 30, 46) : Color.FromArgb(239, 241, 245);
+            BackColor = PrePaintBackdrop(isDark);
 
             // Plain WebView2 — Monaco's native mouseWheelZoom owns Ctrl+wheel inside the renderer.
             // DefaultBackgroundColor = the themed backdrop so the WebView2 surface shows the editor's colour
@@ -299,10 +501,54 @@ namespace ClarionAssistant.Terminal
         // control routes unconditionally; the host knows its own mode.
         private void OnWebMessageReceived(object sender, CoreWebView2WebMessageReceivedEventArgs e)
         {
+            string json = null, action = null;
             try
             {
-                string json = e.TryGetWebMessageAsString();
-                string action = ExtractJsonValue(json, "action");
+                var readSw = System.Diagnostics.Stopwatch.StartNew();
+                json = e.TryGetWebMessageAsString();
+                long getMs = readSw.ElapsedMilliseconds;
+                if (json == null) return;
+                // 1c685f2e F6: the page is input. Bound the message BEFORE any JSON parsing: nothing over the
+                // largest per-action limit is even scanned for its action, then each action has its own cap.
+                string tooBig = Services.WebMessageGuard.CheckOverall(json.Length);
+                action = tooBig == null ? ExtractJsonValue(json, "action") : null;
+                if (tooBig == null) tooBig = Services.WebMessageGuard.CheckSize(action, json.Length);
+                if (tooBig != null) { RejectMessage(action, json, tooBig); return; }
+
+                // Host-agnostic messages are handled BEFORE the host check (1c685f2e item 8). A bufferSync
+                // dropped by an early return here was silent: every later request for that version showed only
+                // as `lookup=Missing`, followed by a full-buffer resync under the same memory pressure.
+                switch (action)
+                {
+                    case "bufferSync":
+                        // 16d140e9: the page's buffer, sent once per content version. Cached here (one copy per
+                        // surface, replacing the last) so no host has to implement anything to receive it.
+                        // AcceptSync logs `[buffer-sync] recv ...` or `... parse failed ...` (items 0 and 8).
+                        if (_bufferCache.AcceptSync(json, "buffer", getMs, MonacoSpikeLog.Write))
+                        {
+                            _fileStateSpanMap.Cancel();   // this map covers any fileState still waiting
+                            PushSpanMap();
+                        }
+                        return;
+                    case "headerSync":
+                        // 1c685f2e R11: the module header text for a hash the host lacked (it answered a slice
+                        // request {needHeader:true}); the page retries that request once after posting this.
+                        {
+                            Dictionary<string, object> hf; string htext; object hh;
+                            string hash = MonacoBufferCache.TryParseTextMessage(json, "text", out hf, out htext) && hf.TryGetValue("hash", out hh)
+                                ? Convert.ToString(hh, System.Globalization.CultureInfo.InvariantCulture) : null;
+                            Services.LocalLayerHandlers.AcceptHeader(hash, htext, MonacoSpikeLog.Write);
+                        }
+                        return;
+                    case "log":
+                        // 1c685f2e item 0: a line the page wrote ([local-rt] ...), cleaned + capped, else verbatim.
+                        {
+                            string pageLine = PageLogLine.FromMessage(json);
+                            if (!string.IsNullOrEmpty(pageLine)) MonacoSpikeLog.Write(pageLine);
+                        }
+                        return;
+                }
+
                 var h = _host;
                 if (h == null) return;
 
@@ -354,7 +600,12 @@ namespace ClarionAssistant.Terminal
                         }
                         catch (Exception lex) { System.Diagnostics.Debug.WriteLine("[MonacoEditorControl] openLocation error: " + lex.Message); }
                         break;
-                    case "ready":             h.OnReady(this); break;
+                    case "ready":
+                        // A (re)loaded page restarts its sync versions at 1: drop the previous load's copy so a
+                        // stale v can never match it. The page always syncs before its first request anyway.
+                        _bufferCache.Clear();
+                        h.OnReady(this);
+                        break;
                     case "save":              h.OnSave(this, json); break;
                     case "cancel":            h.OnCancel(this); break;
                     case "confirmSaveExit":   h.OnConfirmSaveExit(this); break;
@@ -376,6 +627,17 @@ namespace ClarionAssistant.Terminal
                     case "signatureHelp":     h.OnSignatureHelp(this, json); break;
                     case "implementation":    h.OnImplementation(this, json); break;
                     case "documentStructure": h.OnDocumentStructure(this, json); break;
+                    case "localCompletion":   h.OnLocalCompletion(this, json); break;
+                    case "localHover":        h.OnLocalHover(this, json); break;
+                    case "slotDiagnostics":   h.OnSlotDiagnostics(this, json); break;
+                    case "foldingRanges":
+                        // Optional capability (IMonacoFoldingHost) — a surface that can't answer leaves
+                        // the page's request to time out, and it falls back to the local fold pass.
+                        {
+                            var foldHost = h as IMonacoFoldingHost;
+                            if (foldHost != null) foldHost.OnFoldingRanges(this, json);
+                        }
+                        break;
                     case "saveSettings":      h.OnSaveSettings(this, json); break;
                     case "readVsCodeSettings": h.OnReadVsCodeSettings(this, json); break;
                     case "saveHistory":       h.OnSaveHistory(this, json); break;
@@ -386,7 +648,14 @@ namespace ClarionAssistant.Terminal
                     case "selectionChanged":  h.OnSelectionChanged(this, json); break;
                     case "focusEditor":       h.OnFocusEditor(this); break;
                     case "reload":            h.OnReload(this); break;
-                    case "fileState":         h.OnFileState(this, json); break;
+                    case "fileState":
+                        // File mode's synchronous close-safety mirror. Stamped with `v`, it is ALSO the buffer
+                        // sync for that version (16d140e9): cache its text first, so the host's OnFileState
+                        // (via FileStateText) and every LSP request for this version share this one copy.
+                        // F7: fileState arrives on EVERY file-mode edit; build the span map once the edits pause.
+                        if (_bufferCache.AcceptSync(json, "text", getMs, MonacoSpikeLog.Write)) _fileStateSpanMap.Trigger(PushSpanMap);
+                        h.OnFileState(this, json);
+                        break;
                     case "openDesigner":      h.OnOpenDesigner(this, json); break;
                     case "openDesignerCreate":h.OnOpenDesignerCreate(this, json); break;
                     case "activateDesigner":  h.OnActivateDesigner(this); break;
@@ -399,7 +668,14 @@ namespace ClarionAssistant.Terminal
             }
             catch (Exception ex)
             {
-                System.Diagnostics.Debug.WriteLine("[MonacoEditorControl] Message error: " + ex.Message);
+                // To the log, not Debug.WriteLine (1c685f2e item 8): on a 3.2 MB buffer this is where a managed
+                // OOM from TryGetWebMessageAsString lands, and it used to vanish.
+                try
+                {
+                    MonacoSpikeLog.Write("[MonacoEditorControl] message error action=" + (action ?? "?") +
+                        " msgChars=" + (json != null ? json.Length : -1) + " " + ex.GetType().Name + ": " + ex.Message);
+                }
+                catch { }
             }
         }
 
@@ -899,12 +1175,31 @@ namespace ClarionAssistant.Terminal
         public void ApplyTheme(bool isDark)
         {
             IsDark = isDark;
-            BackColor = isDark ? Color.FromArgb(30, 30, 46) : Color.FromArgb(239, 241, 245);
+            BackColor = PrePaintBackdrop(isDark);
             if (_isInitialized)
                 PostJson("{\"type\":\"applyTheme\",\"isDark\":" + (isDark ? "true" : "false") + "}");
         }
 
         // ── Helpers ─────────────────────────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// The colour every surface painted BEFORE the Monaco page — the control backdrop, the WebView2
+        /// DefaultBackgroundColor, the covers over the native editor — should show, so the swap to Monaco
+        /// doesn't flash. The page's own backdrop colours (#1e1e2e dark / #eff1f5 light), except under
+        /// Windows High Contrast (GH #195): the page then paints the contrast theme's window colour
+        /// (forced-colors Canvas) and Monaco auto-switches to its hc theme, so a light pref backdrop was a
+        /// white flash for a dark contrast theme. Returned as a plain ARGB colour (not a KnownColor) so it
+        /// is safe to hand to WebView2.
+        /// </summary>
+        internal static Color PrePaintBackdrop(bool isDark)
+        {
+            try
+            {
+                if (SystemInformation.HighContrast) return Color.FromArgb(SystemColors.Window.ToArgb());
+            }
+            catch { }
+            return isDark ? Color.FromArgb(30, 30, 46) : Color.FromArgb(239, 241, 245);
+        }
 
         private string GetHtmlPath()
         {
@@ -984,6 +1279,8 @@ namespace ClarionAssistant.Terminal
             if (disposing && !_disposedControl)
             {
                 _disposedControl = true;
+                try { _fileStateSpanMap.Dispose(); } catch { }
+                try { _bufferCache.Clear(); } catch { }
                 try
                 {
                     HandleCreated -= OnHandleCreated;

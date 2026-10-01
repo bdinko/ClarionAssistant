@@ -46,6 +46,23 @@ namespace ClarionAssistant
 
         public void Run()
         {
+            // 1c685f2e item 8: a node crash or a dead reader loop gets a line in monaco-spike.log, beside
+            // the [lsp-timing] / [diag-timing] lines it explains (the addin installs no LspTrace sink).
+            LspClient.LifecycleLog = MonacoSpikeLog.Write;
+            SymbolIndex.LogSink = MonacoSpikeLog.Write;   // noIndex / busy lines from the local layer's DB lookups
+            // The local layer's databases (both Monaco surfaces): the solution's CodeGraph and the ClarionGraph library.
+            LocalLayerHandlers.ProjectDbPath = () => { var p = SharedLspBridge.CodeGraphDbPathProvider; return p != null ? p() : null; };
+            LocalLayerHandlers.LibraryDbPath = ClarionGraphService.ResolveDbPath;
+
+            // 1c685f2e L2 (pre-existing on master 2fcb940): the LSP never started unless a CA chat tab had opened.
+            // Every start funnels through LspService.EnsureRunning, which takes the solution from
+            // LspService.SolutionPathProvider, and that hook was set only by AssistantChatControl. With no chat,
+            // every SolutionLoaded, immediate and 5 s fallback start returned NoSolution, silently. The IDE's open
+            // solution is the same answer the chat control gives; set it here, at addin start, unless a host already did.
+            if (LspService.SolutionPathProvider == null)
+                LspService.SolutionPathProvider = () => EditorService.GetOpenSolutionPath();
+            LspService.StartLog = MonacoSpikeLog.Write;   // [lsp-autostart] start|skip reason=
+
             try
             {
                 // (a) Wire the open-path / completion-time self-heal hook pane-independently.
@@ -146,19 +163,27 @@ namespace ClarionAssistant
         // ProjectService.SolutionClosed is a plain EventHandler(object, EventArgs). Stop the bundled
         // server (only if it's ours and running) so it re-roots on the next solution. Never touch the
         // shared ClarionLsp addin — it owns its own lifecycle.
+        // The stop runs on the pool (4d63b995): SolutionClosed fires on the UI thread, also while the IDE
+        // closes, and Stop() sleeps ~400 ms. ShutdownService's KillForShutdown still reaps the process at exit.
         private static void OnSolutionClosed(object sender, EventArgs e)
         {
+            ShutdownLog.Close("OnSolutionClosed begin");
+            // Completion's held-open symbol DB connections belong to the closed solution (1c685f2e).
+            try { SymbolIndex.ReleaseAll(); } catch { }
             try
             {
-                if (SharedLspBridge.IsSharedActive) return;
-                var c = LspClient.Active;
-                if (c != null && c.IsRunning)
+                if (!SharedLspBridge.IsSharedActive)
                 {
-                    Debug.WriteLine("[LspAutostart] Solution closed — stopping the bundled LSP so the next solution re-roots it.");
-                    c.Stop();
+                    var c = LspClient.Active;
+                    if (c != null && c.IsRunning)
+                    {
+                        Debug.WriteLine("[LspAutostart] Solution closed — stopping the bundled LSP so the next solution re-roots it.");
+                        c.StopInBackground(m => ShutdownLog.Close(m));
+                    }
                 }
             }
             catch (Exception ex) { Debug.WriteLine("[LspAutostart] OnSolutionClosed failed: " + ex.Message); }
+            ShutdownLog.Close("OnSolutionClosed end");
         }
 
         /// <summary>
