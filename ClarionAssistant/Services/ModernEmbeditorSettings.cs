@@ -42,6 +42,10 @@ namespace ClarionAssistant.Services
         public string HorizontalScrollbar = "auto";
         // Split-editor pane orientation: "v" (side by side) | "h" (top / bottom). Default v.
         public string SplitOrientation = "v";
+        // Document-structure fly-out: how many tree levels are visible when it opens (1..4; 0 = all expanded,
+        // the historical behaviour) and whether the siblings at that deepest visible level are sorted A-Z.
+        public int OutlineLevel = 0;
+        public bool OutlineSortLevel = false;
 
         // Clarion's "Can move caret behind EOL": right-arrow at EOL keeps going right on the same line
         // instead of wrapping, and a click past EOL lands where you clicked. Monaco has NO virtual space
@@ -57,6 +61,13 @@ namespace ClarionAssistant.Services
         /// as a single compact-JSON value (no CR/LF) under "ModernEmbeditor.KeyBindings".
         /// </summary>
         public Dictionary<string, string> KeyBindings = new Dictionary<string, string>(StringComparer.Ordinal);
+
+        /// <summary>
+        /// GH #206: the keymap profile the overrides sit on ("clarion", "vscode", "vs", "npp"). The profiles' chords
+        /// live in the HTML (KEY_PROFILES) like the command defaults do; C# stores only the id. Global per developer,
+        /// persisted under "ModernEmbeditor.KeyProfile".
+        /// </summary>
+        public string KeyProfile = "clarion";
 
         /// <summary>
         /// Smart Formatter gear-panel options (deac3d16). Pass-through bag: the host stays agnostic to
@@ -82,9 +93,13 @@ namespace ClarionAssistant.Services
         private static readonly HashSet<string> FormatterKeySet = new HashSet<string>(FormatterKeys, StringComparer.Ordinal);
         private const int MaxFormatterStringLen = 32;
 
-        // Safety caps for the untrusted JS payload: bound how many overrides and how long a chord can be
-        // so a crafted settings.txt / postMessage can't bloat the file or the binding map.
-        private const int MaxKeyBindings = 64;
+        // Safety caps for the untrusted JS payload: bound how many overrides, how long a command id and how long a
+        // chord can be so a crafted settings.txt / postMessage can't bloat the file or the binding map.
+        // GH #206: the Keyboard table lists every Monaco action beside the Clarion commands (~150 rows today), so
+        // the override cap must cover ALL of them — at the old 64 a developer's 65th override was silently dropped.
+        // 256 leaves room for Monaco to grow. The id cap mirrors the page's looksLikeActionId (1 + 120 chars).
+        private const int MaxKeyBindings = 256;
+        private const int MaxCommandIdLength = 121;
         private const int MaxChordLength = 40;
 
         private const string Prefix = "ModernEmbeditor.";
@@ -109,6 +124,9 @@ namespace ClarionAssistant.Services
                 s.HorizontalScrollbar = NormalizeScrollbar(sv.Get(Prefix + "HorizontalScrollbar"));
                 s.SplitOrientation = NormalizeSplitOrientation(sv.Get(Prefix + "SplitOrientation"));
                 s.CursorBehindEOL = GetBool(sv, "CursorBehindEOL", s.CursorBehindEOL);
+                s.KeyProfile = NormalizeKeyProfile(sv.Get(Prefix + "KeyProfile"));
+                s.OutlineLevel = GetInt(sv, "OutlineLevel", s.OutlineLevel, 0, 4);
+                s.OutlineSortLevel = GetBool(sv, "OutlineSortLevel", s.OutlineSortLevel);
                 s.KeyBindings = ParseKeyBindings(sv.Get(Prefix + "KeyBindings"));
                 s.Formatter = ParseFormatter(sv.Get(Prefix + "Formatter"));
             }
@@ -133,8 +151,11 @@ namespace ClarionAssistant.Services
             sv.Set(Prefix + "HorizontalScrollbar", NormalizeScrollbar(HorizontalScrollbar));
             sv.Set(Prefix + "SplitOrientation", NormalizeSplitOrientation(SplitOrientation));
             sv.Set(Prefix + "CursorBehindEOL", CursorBehindEOL ? "true" : "false");
+            sv.Set(Prefix + "OutlineLevel", Clamp(OutlineLevel, 0, 4).ToString());
+            sv.Set(Prefix + "OutlineSortLevel", OutlineSortLevel ? "true" : "false");
             // Compact JSON, single line — SettingsService rejects CR/LF in values, and the serializer
             // never emits them. Empty map persists as "{}" (clears any prior overrides).
+            sv.Set(Prefix + "KeyProfile", NormalizeKeyProfile(KeyProfile));
             sv.Set(Prefix + "KeyBindings", new JavaScriptSerializer().Serialize(SanitizeBindings(KeyBindings)));
             // Compact JSON, single line (the serializer never emits CR/LF, which SettingsService rejects).
             // Empty map persists as "{}" — the panel then seeds every formatter control from DEFAULTS.
@@ -165,6 +186,11 @@ namespace ClarionAssistant.Services
             if (d.TryGetValue("splitOrientation", out so) && so != null)
                 s.SplitOrientation = NormalizeSplitOrientation(so.ToString());
             s.CursorBehindEOL = ToBool(d, "cursorBehindEOL", s.CursorBehindEOL);
+            object kp;
+            if (d.TryGetValue("keyProfile", out kp) && kp != null)
+                s.KeyProfile = NormalizeKeyProfile(kp.ToString());
+            s.OutlineLevel = Clamp(ToInt(d, "outlineLevel", s.OutlineLevel), 0, 4);
+            s.OutlineSortLevel = ToBool(d, "outlineSortLevel", s.OutlineSortLevel);
             object kb;
             if (d.TryGetValue("keyBindings", out kb) && kb is IDictionary<string, object>)
             {
@@ -202,6 +228,9 @@ namespace ClarionAssistant.Services
                 { "horizontalScrollbar", HorizontalScrollbar },
                 { "splitOrientation", SplitOrientation },
                 { "cursorBehindEOL", CursorBehindEOL },
+                { "keyProfile", NormalizeKeyProfile(KeyProfile) },
+                { "outlineLevel", OutlineLevel },
+                { "outlineSortLevel", OutlineSortLevel },
                 { "keyBindings", SanitizeBindings(KeyBindings) }
             };
             // Merge the formatter pass-through bag so the bridge payload (load + cross-tab broadcast) carries
@@ -346,6 +375,7 @@ namespace ClarionAssistant.Services
                 if (outp.Count >= MaxKeyBindings) break;
                 string id = kv.Key, chord = kv.Value;
                 if (string.IsNullOrEmpty(id) || string.IsNullOrEmpty(chord)) continue;
+                if (id.Length > MaxCommandIdLength) continue;
                 if (chord.Length > MaxChordLength) continue;
                 if (id.IndexOf('\r') >= 0 || id.IndexOf('\n') >= 0) continue;
                 if (chord.IndexOf('\r') >= 0 || chord.IndexOf('\n') >= 0) continue;
@@ -380,6 +410,19 @@ namespace ClarionAssistant.Services
         private static string NormalizeScrollbar(string v)
         {
             return (v == "visible" || v == "hidden") ? v : "auto";
+        }
+
+        /// <summary>
+        /// A keymap profile id: lowercase letters, digits and '-', at most 32 chars. The HTML owns the list of real
+        /// profiles (an unknown id falls back to Clarion there); C# only keeps a garbage or crafted value out of
+        /// settings.txt. Anything else is "clarion".
+        /// </summary>
+        private static string NormalizeKeyProfile(string v)
+        {
+            if (string.IsNullOrEmpty(v) || v.Length > 32) return "clarion";
+            foreach (char ch in v)
+                if (!((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-')) return "clarion";
+            return v;
         }
 
         private static string NormalizeSplitOrientation(string v)

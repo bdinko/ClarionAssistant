@@ -168,6 +168,30 @@ namespace ClarionAssistant
         }
 
         /// <summary>
+        /// 44a1b10c: the text a live CA Monaco source tab holds for <paramref name="path"/>, unsaved edits included, or
+        /// null when no tab has it open or the page has not mirrored an edit yet (its buffer is then the disk file).
+        /// Safe off the UI thread: a reference read of a field the page's fileState message replaces whole, at worst
+        /// one keystroke behind.
+        /// </summary>
+        internal static string TryGetLiveText(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return null;
+            List<MonacoClarionEditor> snapshot;
+            lock (_instances) { snapshot = new List<MonacoClarionEditor>(_instances); }
+            foreach (var inst in snapshot)
+            {
+                try
+                {
+                    if (string.IsNullOrEmpty(inst._filePath) || !PathsEqual(inst._filePath, path)) continue;
+                    var text = inst._overlayLiveText;
+                    if (text != null) return text;
+                }
+                catch { }
+            }
+            return null;
+        }
+
+        /// <summary>
         /// Is <paramref name="path"/> open in a live CA Monaco source tab, and does that tab have unsaved
         /// edits? Needed by the editable-compare write-back (task 0d47078b), which must never write a file
         /// out from under an editor holding newer text.
@@ -382,8 +406,12 @@ namespace ClarionAssistant
                 // persisted localStorage pref; this only sets the pre-paint backdrop so there's no flash of the
                 // WRONG color on load, in either theme).
                 _editor = new MonacoEditorControl(this, Services.CaEditorSettings.MonacoThemeDark, "monaco-embeditor.html", "clarion-embeditor-data");
+                _editor.InitFailed += OnEditorInitFailed;
                 host.Controls.Add(_editor);
                 _editor.BringToFront();
+                // Remember the displayed tab per solution (ActiveDocumentRestoreCommand). The IDE's own
+                // active-window event only fires once a document takes focus, so a plain tab click can go unreported.
+                _editor.VisibleChanged += (s, e) => { try { if (_editor != null && _editor.Visible) ActiveDocumentRestoreCommand.NotifyTabShown(_filePath); } catch { } };
                 HideNativeNavBar(host);   // hide the native class/members drop-down bar so it doesn't peek through the overlay top
                 // Participate in cross-surface gear-settings sync: receive applySettings broadcasts from any
                 // other Monaco surface (embeditor or another source editor). Our OnSaveSettings publishes. (deac3d16)
@@ -1788,6 +1816,132 @@ namespace ClarionAssistant
         /// Callers want this in preference to CaEditorSettings.MonacoThemeDark, which records only
         /// whichever page posted last and so drifts from the active editor as soon as two disagree.
         /// </summary>
+        // ── fc420c30: the MCP editor tools routed to this CA Editor ────────────────────────────────
+
+        /// <summary>The overlay as EditorToolRouter sees it: the file, readiness, and requests to the page.</summary>
+        private sealed class OverlayChannel : Services.IEditorOverlayChannel
+        {
+            private readonly MonacoClarionEditor _me;
+            public OverlayChannel(MonacoClarionEditor me) { _me = me; }
+            public string FilePath { get { return _me._filePath; } }
+            public bool PageReady { get { return _me._editor != null && _me._pageReady; } }
+            public Dictionary<string, object> Request(string action, Dictionary<string, object> args, int timeoutMs)
+            {
+                var ed = _me._editor;
+                if (ed == null) throw new TimeoutException("the CA Editor for " + _me._filePath + " closed");
+                return ed.Request(action, args, timeoutMs);
+            }
+        }
+
+        /// <summary>
+        /// EditorToolRouter.ActiveOverlayResolver: the CA Editor of the ACTIVE workbench view, or null when the active
+        /// view has no overlay (the native editor answers then). UI thread. Same lookup as ActiveEditorIsDark.
+        /// </summary>
+        internal static Services.IEditorOverlayChannel ResolveActiveOverlay()
+        {
+            try
+            {
+                var wb = ICSharpCode.SharpDevelop.Gui.WorkbenchSingleton.Workbench;
+                if (wb == null) return null;
+                var aw = ReflectProp(wb, "ActiveWorkbenchWindow");
+                if (aw == null) return null;
+                var vc = ReflectProp(aw, "ActiveViewContent") ?? ReflectProp(aw, "ViewContent");
+                var me = vc as MonacoClarionEditor;
+                if (me == null || me._editor == null) return null;
+                return new OverlayChannel(me);
+            }
+            catch { return null; }
+        }
+
+        /// <summary>
+        /// get_open_files: mark tabs whose CA Editor holds unsaved edits ("* path"). The native shell of an overlay tab
+        /// stays clean by design, so the native list called them saved. UI thread.
+        /// </summary>
+        internal static List<string> MarkOverlayDirty(List<string> files)
+        {
+            if (files == null) return files;
+            List<MonacoClarionEditor> snapshot;
+            lock (_instances) { snapshot = new List<MonacoClarionEditor>(_instances); }
+            foreach (var inst in snapshot)
+            {
+                try
+                {
+                    if (inst._editor == null || !inst._overlayDirty || string.IsNullOrEmpty(inst._filePath)) continue;
+                    string full = inst._filePath, name = Path.GetFileName(full);
+                    for (int i = 0; i < files.Count; i++)
+                    {
+                        string f = files[i];
+                        if (f.StartsWith("* ")) continue;
+                        if (PathsEqual(f, full) || string.Equals(f, name, StringComparison.OrdinalIgnoreCase)) files[i] = "* " + f;
+                    }
+                }
+                catch { }
+            }
+            return files;
+        }
+
+        /// <summary>44a1b10c / fc420c30: is <paramref name="path"/> open in a tab whose CA Editor is UP (with or without
+        /// edits)? A tab in native mode (overlay toggled off, or the file type excluded) has an instance but no overlay:
+        /// that is <see cref="IsOpenInNativeEditor"/>, whose unsaved edits the tools cannot see.</summary>
+        internal static bool IsOpenInOverlay(string path) { return OpenTabHasOverlay(path) == true; }
+
+        /// <summary>fc420c30: is <paramref name="path"/> open in a source tab showing the NATIVE Clarion editor?</summary>
+        internal static bool IsOpenInNativeEditor(string path) { return OpenTabHasOverlay(path) == false; }
+
+        /// <summary>
+        /// fc420c30, EditorToolRouter.FocusTab: give <paramref name="path"/>'s tab keyboard focus (UI thread), so the IDE
+        /// makes it the ActiveWorkbenchWindow; SelectWindow alone only displays it. The CA Editor when it is up (both
+        /// levels: the WebView2 and Monaco), else the native text area. False when no source tab holds the path.
+        /// </summary>
+        internal static bool FocusTabFor(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return false;
+            List<MonacoClarionEditor> snapshot;
+            lock (_instances) { snapshot = new List<MonacoClarionEditor>(_instances); }
+            foreach (var inst in snapshot)
+            {
+                try
+                {
+                    if (string.IsNullOrEmpty(inst._filePath) || !PathsEqual(inst._filePath, path)) continue;
+                    if (inst._editor != null)
+                    {
+                        ClarionAssistant.Services.CaFindBroker.NotifyActivity(inst);
+                        inst._editor.FocusEditor();
+                        inst._editor.PostJson("{\"type\":\"focusEditor\"}");
+                    }
+                    else if (inst._hostEditor != null)
+                    {
+                        var area = inst._hostEditor.ActiveTextAreaControl;
+                        if (area != null && area.TextArea != null) area.TextArea.Focus(); else inst._hostEditor.Focus();
+                    }
+                    MonacoSpikeLog.Write("[editor-route] focus tab for open_file: " + Path.GetFileName(path) + (inst._editor != null ? " (CA Editor)" : " (native)"));
+                    return true;
+                }
+                catch (Exception ex) { MonacoSpikeLog.Write("[editor-route] focus tab failed: " + ex.Message); }
+            }
+            return false;
+        }
+
+        // null = no source tab on that path; else whether its CA Editor overlay is up.
+        private static bool? OpenTabHasOverlay(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return null;
+            List<MonacoClarionEditor> snapshot;
+            lock (_instances) { snapshot = new List<MonacoClarionEditor>(_instances); }
+            bool? found = null;
+            foreach (var inst in snapshot)
+            {
+                try
+                {
+                    if (string.IsNullOrEmpty(inst._filePath) || !PathsEqual(inst._filePath, path)) continue;
+                    if (inst._editor != null) return true;
+                    found = false;
+                }
+                catch { }
+            }
+            return found;
+        }
+
         public static bool? ActiveEditorIsDark()
         {
             try
@@ -2497,6 +2651,25 @@ namespace ClarionAssistant
             return null;
         }
 
+        /// <summary>7116020b: the WebView2 never started. The native text editor is underneath and fully working,
+        /// so take the overlay off (deferred: never dispose the control on its own failing call stack) and say
+        /// why, instead of leaving a blank surface once the cover's safety timer fires. The page never loaded,
+        /// so there are no Monaco-side edits to lose.</summary>
+        private void OnEditorInitFailed(MonacoEditorControl editor, string reason)
+        {
+            MonacoSpikeLog.Write("[webview-init] source editor gave up, showing native: file=" + System.IO.Path.GetFileName(_filePath ?? "?") + " reason=" + reason);
+            try
+            {
+                var host = editor.Parent;
+                if (host != null && host.IsHandleCreated) host.BeginInvoke((Action)(() => { if (ReferenceEquals(_editor, editor)) DisposeOverlay(); }));
+                else if (ReferenceEquals(_editor, editor)) DisposeOverlay();
+            }
+            catch (Exception ex) { MonacoSpikeLog.Write("[webview-init] source editor fallback failed: " + ex.Message); }
+            Terminal.CaNotice.Post("editor-init-failed", "CA Editor could not start",
+                "It could not open " + System.IO.Path.GetFileName(_filePath ?? "this file") + " because " + reason
+                + ". You are in Clarion's own editor for this file instead. If this keeps happening, save your work and restart Clarion.");
+        }
+
         private void DisposeOverlay()
         {
             try
@@ -2526,6 +2699,10 @@ namespace ClarionAssistant
                 try { if (_navBar != null && !_navBar.IsDisposed) _navBar.Visible = true; } catch { }
                 _navBar = null;
                 RemoveCover();
+                // 7116020b: a big file's buffer copies sit in the large-object heap; compact once after close.
+                long fileChars = 0;
+                try { if (!string.IsNullOrEmpty(_filePath) && System.IO.File.Exists(_filePath)) fileChars = new System.IO.FileInfo(_filePath).Length; } catch { }
+                Services.MemoryHeadroom.CompactAfterClose("source editor " + System.IO.Path.GetFileName(_filePath ?? "?"), fileChars);
             }
             catch { }
         }
@@ -2859,16 +3036,57 @@ namespace ClarionAssistant
             try { if (!Directory.Exists(DataDir)) Directory.CreateDirectory(DataDir); } catch { }
         }
 
+        private static readonly object _writeLock = new object();   // pool-thread writers exist (WriteWithMemAsync)
+
         public static void Write(string message)
         {
             try
             {
-                EnsureDir();
-                File.AppendAllText(
-                    Path.Combine(DataDir, "monaco-spike.log"),
-                    DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + "  " + message + Environment.NewLine);
+                lock (_writeLock)
+                {
+                    EnsureDir();
+                    File.AppendAllText(
+                        Path.Combine(DataDir, "monaco-spike.log"),
+                        DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + "  " + message + Environment.NewLine);
+                }
             }
             catch { }
+        }
+
+        /// <summary>
+        /// 7116020b: one-line memory snapshot for the log — `mem virt= priv= ws= gc= free= largestFree=` (MB).
+        /// Clarion.exe is 32-bit and not LargeAddressAware, so what kills it is the LARGEST FREE BLOCK of its
+        /// 2 GB address space, not the working set (the OOM on 2026-09-30 hit at 975 MB working set). Walking
+        /// the region list with VirtualQuery is a few thousand calls — cheap enough per attach/init event, not
+        /// per keystroke. Never throws.
+        /// </summary>
+        /// <summary>Write <paramref name="prefix"/> + " " + MemSummary() from a pool thread. For the embed-open hot
+        /// path: a snapshot is ~15-70 ms in Clarion, and the UI thread is what keeps the cover up (7116020b).
+        /// The line's timestamp is the moment it is written, a few ms after the event.</summary>
+        public static void WriteWithMemAsync(string prefix)
+        {
+            try { System.Threading.ThreadPool.QueueUserWorkItem(_ => Write(prefix + " " + MemSummary())); }
+            catch { Write(prefix + " mem=unavailable"); }
+        }
+
+        public static string MemSummary()
+        {
+            var sb = new StringBuilder("mem");
+            try
+            {
+                using (var p = System.Diagnostics.Process.GetCurrentProcess())
+                {
+                    sb.Append(" virt=").Append(p.VirtualMemorySize64 >> 20)
+                      .Append(" priv=").Append(p.PrivateMemorySize64 >> 20)
+                      .Append(" ws=").Append(p.WorkingSet64 >> 20);
+                }
+            }
+            catch (Exception ex) { sb.Append(" proc=err(").Append(ex.GetType().Name).Append(')'); }
+            try { sb.Append(" gc=").Append(GC.GetTotalMemory(false) >> 20); } catch { }
+            var a = Services.MemoryHeadroom.Measure();
+            if (a.Ok) sb.Append(" free=").Append(a.FreeMB).Append(" largestFree=").Append(a.LargestFreeMB).Append(" space=").Append(a.UserSpaceMB);
+            else sb.Append(" vq=err");
+            return sb.Append(" (MB)").ToString();
         }
     }
 

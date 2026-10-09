@@ -30,12 +30,26 @@ namespace ClarionAssistant.Terminal
         // Fixed height (82938fc7): there is no splitter and no saved height. Values are CSS px, measured in
         // header.html with headless Edge at 320, 420 and 800 px wide, dark and light (all identical):
         // the title row + tab strip end at 72; the Solution pane, the tallest pane, ends the page at 188.
+        // CssFullHeight adds 8 px under that (d4e941e3): the host's terminal tab strip, now always visible,
+        // sat right under the Reindex / Update buttons.
         // While Schema Sources or Source Control is active the page shrinks to the strip and the host's
         // SchemaSourcesView fills the pane below it (PanePixelHeight), so the header's total stays fixed.
+        // GH #234: these are now only the defaults until the page reports its measured heights (headerSize),
+        // and the CSS-to-pixel scale is checked against the page's real viewport: at some Windows scaling
+        // settings the WebView renders larger than zoom * DeviceDpi / 96 says, and the fixed heights clipped it.
         public const int CssStripHeight = 72;
-        public const int CssFullHeight = 188;
+        public const int CssFullHeight = 197;
 
         private string _activeTab = "solution";
+        private int _measuredStripCss;   // 0 until the page reports
+        private int _measuredFullCss;
+        private double _scaleCorrection = 1.0;
+
+        /// <summary>
+        /// Host pixels per CSS px beyond zoom * DeviceDpi / 96, learned from the page's viewport (GH #234).
+        /// 1.0 normally; the host hands it to the SchemaSourcesView, which shares the header's zoom and DPI.
+        /// </summary>
+        public double ScaleCorrection { get { return _scaleCorrection; } }
 
         /// <summary>The zoom key the header and the SchemaSourcesView under it share.</summary>
         public const string ZoomKey = "header";
@@ -57,7 +71,10 @@ namespace ClarionAssistant.Terminal
         public event EventHandler LayoutChanged;
 
         /// <summary>Pixel height of the pane under the tab strip, at the header's zoom and DPI.</summary>
-        public int PanePixelHeight { get { return ToPixels(CssFullHeight - CssStripHeight); } }
+        public int PanePixelHeight { get { return ToPixels(FullCss - StripCss); } }
+
+        private int StripCss { get { return _measuredStripCss > 0 ? _measuredStripCss : CssStripHeight; } }
+        private int FullCss { get { return _measuredFullCss > _measuredStripCss ? _measuredFullCss : CssFullHeight; } }
 
         public HeaderWebView()
         {
@@ -120,7 +137,33 @@ namespace ClarionAssistant.Terminal
         private int ToPixels(int cssPixels)
         {
             double zoom = _webView != null ? _webView.ZoomFactor : 1.0;
-            return (int)Math.Ceiling(cssPixels * zoom * DeviceDpi / 96.0);
+            return (int)Math.Ceiling(cssPixels * zoom * DeviceDpi / 96.0 * _scaleCorrection);
+        }
+
+        // The page's "strip,full,viewport" (CSS px, header.html reportSize). The viewport against this control's
+        // own pixel height is the real CSS-to-pixel scale; a deviation of more than 2 % from zoom * DPI becomes
+        // the correction (the threshold keeps whole-pixel rounding from feeding back into a resize loop).
+        private void OnHeaderSize(string data)
+        {
+            string[] parts = (data ?? "").Split(',');
+            int strip, full, viewport;
+            if (parts.Length != 3
+                || !int.TryParse(parts[0], System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out strip)
+                || !int.TryParse(parts[1], System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out full)
+                || !int.TryParse(parts[2], System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out viewport))
+                return;
+            if (strip > 0 && strip < 1000) _measuredStripCss = strip;
+            if (full > strip && full < 2000) _measuredFullCss = full;
+
+            int hostPx = _webView != null ? _webView.ClientSize.Height : 0;
+            double zoom = _webView != null ? _webView.ZoomFactor : 1.0;
+            if (viewport >= 20 && hostPx >= 20 && zoom > 0)
+            {
+                double correction = hostPx / (viewport * zoom * DeviceDpi / 96.0);
+                if (correction >= 0.5 && correction <= 4.0 && Math.Abs(correction - _scaleCorrection) > 0.02 * _scaleCorrection)
+                    _scaleCorrection = correction;
+            }
+            ApplyHeight();
         }
 
         // Clarion moved to a monitor with another DPI: the fixed CSS heights map to a new pixel height.
@@ -133,7 +176,8 @@ namespace ClarionAssistant.Terminal
         private void ApplyHeight()
         {
             if (IsDisposed) return;
-            Height = ToPixels(_activeTab == "solution" ? CssFullHeight : CssStripHeight);
+            // Measured heights once the page reported them (GH #234), the CssFullHeight / CssStripHeight defaults before.
+            Height = ToPixels(_activeTab == "solution" ? FullCss : StripCss);
             LayoutChanged?.Invoke(this, EventArgs.Empty);
         }
 
@@ -145,6 +189,7 @@ namespace ClarionAssistant.Terminal
                 // Simple JSON parse — avoid dependency on JSON library
                 string action = ExtractJsonValue(json, "action");
                 string data = ExtractJsonValue(json, "data");
+                if (action == "headerSize") { OnHeaderSize(data); return; }   // host-only: sizes this view
                 if (action == "headerTab")
                 {
                     if (data != "solution" && !IsPanelTab(data)) return;
@@ -176,21 +221,20 @@ namespace ClarionAssistant.Terminal
             SendMessage("{\"type\":\"setVersion\",\"label\":\"" + EscapeJson(label) + "\",\"title\":\"" + EscapeJson(title) + "\"}");
         }
 
-        /// <summary>Set the solution dropdown items.</summary>
-        public void SetSolutions(string[] paths, int selectedIndex)
+        /// <summary>
+        /// The SOLUTION field (d4e941e3): read-only, like VERSION, because the IDE decides which solution is open.
+        /// <paramref name="openInIde"/> false means CA is still on the last solution (CodeGraph and the MCP tools
+        /// keep working on it) while the IDE has none or another open; the page dims it and says so.
+        /// </summary>
+        public void SetSolution(string path, bool openInIde)
         {
-            var items = new System.Text.StringBuilder("[");
-            for (int i = 0; i < paths.Length; i++)
-            {
-                if (i > 0) items.Append(",");
-                string label = paths[i].Length > 60
-                    ? "..." + paths[i].Substring(paths[i].Length - 57)
-                    : paths[i];
-                items.AppendFormat("{{\"label\":\"{0}\",\"value\":\"{1}\",\"selected\":{2}}}",
-                    EscapeJson(label), EscapeJson(paths[i]), i == selectedIndex ? "true" : "false");
-            }
-            items.Append("]");
-            SendMessage("{\"type\":\"setSolutions\",\"items\":" + items + "}");
+            path = path ?? "";
+            // Show the solution's name only: in a narrow pane a full path cut off before the name never said
+            // which solution it was (testing feedback). The page's hover text carries the full path, and the
+            // copy button copies the host's own full path.
+            string label = path.Length == 0 ? "" : System.IO.Path.GetFileNameWithoutExtension(path);
+            SendMessage("{\"type\":\"setSolution\",\"label\":\"" + EscapeJson(label) + "\",\"path\":\"" + EscapeJson(path)
+                + "\",\"open\":" + (openInIde ? "true" : "false") + "}");
         }
 
         /// <summary>Update the MCP/status text in the header.</summary>

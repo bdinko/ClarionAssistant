@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://github.com/ClarionLive/ClarionAssistant/releases/latest"><img src="https://img.shields.io/github/v/release/ClarionLive/ClarionAssistant?include_prereleases&label=download&style=for-the-badge" alt="Download"></a>
   <img src="https://img.shields.io/badge/Clarion-10%20%7C%2011%20%7C%2011.1%20%7C%2012-blue?style=for-the-badge" alt="Clarion 10 | 11 | 11.1 | 12">
-  <img src="https://img.shields.io/badge/version-5.5-blue?style=for-the-badge" alt="v5.5">
+  <img src="https://img.shields.io/badge/version-6.0-blue?style=for-the-badge" alt="v6.0">
 </p>
 
 <p align="center">
@@ -57,6 +57,20 @@ Ask it to write Clarion code, explain procedures, refactor classes, build COM co
 
 ## What's New (Unreleased)
 
+<!-- Entries for the next release go here, in the same shape as the release blocks below. -->
+
+## What's New in v6.0
+
+6.0 is a major release. Claude's editor and embed tools now work on the text you see in the CA Editor and CA Embeditor, the bundled language server moves to v1.0.8 with incremental sync, hover, completion and diagnostics are more accurate, and the CA Editor gains keymap profiles. Full notes: **[docs/releases/v6.0.0.md](docs/releases/v6.0.0.md)**.
+
+### MultiTerminal messages reach IDE terminals again
+
+MultiTerminal has retired its "channels" for delivering messages into a Claude Code session and now writes into the session directly. Clarion Assistant only loaded the MultiTerminal plugin when the channel server was present, so once MultiTerminal removed it, every IDE terminal launched without the plugin: nothing could message it, and it could only find its messages by polling. IDE terminals now load the plugin again, and no longer pass the development-channels flag or answer its warning prompt. Messages arrive in the session without polling once your MultiTerminal includes native delivery for IDE terminals.
+
+IDE terminals now have short, numbered MultiTerminal names: **CA1**, **CA2** and so on, instead of `CA-Terminal-2-CC`. Each launch takes the lowest number that is free across this IDE's tabs and MultiTerminal's live roster, so two IDEs get CA1 and CA2 rather than two names that differ only by a `-2` suffix. The tab shows the same name the roster does, keeping any context it was opened with (`CA2 · MySolution`), and the number is released when the assistant in that tab exits.
+
+Each terminal is also told its own name, and keeps it through `/clear`. Before this, with a Clarion Assistant chat open in two IDEs, a terminal that received a message could not tell which of the similar names on the roster was its own, so it could not reliably reply. And closing a tab no longer removes it from MultiTerminal by name, which could drop a same-named tab in another IDE off MultiTerminal's list. With the MultiTerminal update above, MultiTerminal retires a closed tab itself.
+
 ### Unsupported Windows is reported, not a blank terminal, and the installer refuses it ([#236](https://github.com/ClarionLive/ClarionAssistant/issues/236))
 
 Clarion Assistant's terminals need Windows 10 version 1809 or Windows Server 2019, or later: they run on the Windows ConPTY API, which first shipped in that release, and Claude Code has the same minimum. On older Windows, such as Server 2016, a tab used to open empty with no explanation. It now says which Windows build it found and what it needs. Any other failure to start the assistant is shown in the tab too, instead of leaving it blank. The installer now checks the Windows version before installing.
@@ -65,9 +79,160 @@ Clarion Assistant's terminals need Windows 10 version 1809 or Windows Server 201
 
 The UltimateCOM class that Clarion Assistant installs into `accessory\libsrc\win` kept one event queue for the whole program but locked it per control, so two COM controls on different threads (for example one on the main frame and one in an MDI child) could raise events at the same moment and free each other's event data, which crashed with an access violation in `WindowManager.Ask`. The queue now has a single shared lock, and each control's thread only ever sees and removes its own events. `UltimateCOM.inc` is unchanged, so existing apps and templates need nothing but a recompile.
 
+<!-- release-docs: covered=editor,embeditor -->
+### Large procedures: the CA editors warn before Clarion runs out of memory, and say why when they can't start
+
+Clarion is a 32-bit program with 2 GB of address space, and a big solution fills most of it. Opening a very large procedure (a 3.2 MB generated module, for example) needs a few hundred MB in one piece, and when that is not there Clarion itself fails with an out-of-memory error inside its own embeditor. Three changes:
+
+- **A warning before it happens.** When the largest free block of Clarion's memory drops below 48 MB, a small notice at the bottom right of the IDE says so and suggests saving and restarting. It never takes focus and closes itself when memory recovers. The threshold can be changed by putting a number of MB in `%LOCALAPPDATA%\ClarionAssistant\mem-watch-warn-mb.txt`.
+- **No more silent fallback.** If the CA Embeditor or CA Editor cannot start, it now steps aside so Clarion's own editor is usable, and a notice says why. Before, you were left in the native editor with no explanation.
+- **Memory is given back.** Closing a CA editor on a big procedure or file now returns its memory to Clarion (about 230 MB on the 3.2 MB test procedure), where before it stayed in use until Clarion restarted. When there is plenty of room this step is skipped, so it costs nothing.
+
+These checks also understand a `Clarion.exe` that has been marked **LargeAddressAware** (4 GB of address space instead of 2 GB), so they see the full 4 GB and do not warn falsely. On the 3.2 MB test procedure, that flag took the largest free block with the procedure open from 39 MB to over 1.5 GB.
+
+<!-- release-docs: covered=embeditor,lsp,memory -->
+### Opening a large procedure in the CA Embeditor uses far less memory
+
+Measured on a 3.2 MB generated procedure, where every large block of memory counts in 32-bit Clarion:
+
+- **The Data pad no longer keeps a copy of the whole application.** Each open exported the entire app (20 MB on the test app) and kept it as one 38 MB block of text, then re-read the whole thing on every refresh. It now reads the export once, line by line, and keeps only the data sections the pad shows, about 7% of it. The pad shows exactly the same Local Data, Global Data, Other Files and browse file as before; this was checked against all 367 procedures of the test app.
+- **No more whole-procedure copies on every open.** Two steps split the entire procedure into lines on every open, about 65 MB in total. One now happens only when you click an Errors-pane row, and the other copies just the embed sections.
+- **Sending the procedure to the language server costs almost nothing.** Every open, and every pause while typing, turned the whole procedure into one 34 MB message in memory before sending it. It is now written to the language server piece by piece, at about 0.05 MB.
+
+<!-- release-docs: covered=embeditor -->
+### CA Embeditor hovers are as fast and as accurate as the CA Editor's
+
+In a large procedure, hovering a global such as `GlobalRequest` in the CA Embeditor could sit on "Loading" for seconds, and a procedure call such as `PASSWORD(...)` was described as the ENTRY attribute of the same name. The CA Editor, on the same code, answered both instantly. The embeditor's quick lookups need the project's CodeGraph database, which is found from the procedure's generated module, and the embeditor often could not locate that module: it lives in the folder the redirection file names (for example `.\Source`), and the redirection file was only loaded once the Clarion Assistant chat panel had opened. The embeditor now loads the redirection file for the IDE's Clarion version itself, and falls back to the open solution's folder when the module still can't be found, so hovers answer immediately either way.
+
+<!-- release-docs: covered=lsp,embeditor,red,data-pad -->
+### Build > Set Clarion Version takes effect with no chat panel open
+
+Switching versions with Build > Set Clarion Version only reached the language server and the redirection file when the Clarion Assistant chat panel was open. Without it, the language server went on resolving through the old version's redirection file and libraries until the IDE was restarted. The addin now follows the IDE's version from startup: on a switch it reloads the redirection file and restarts the language server on the new version, whether or not a chat tab exists.
+
+If the new version's redirection file can't be read (missing, or held open by another program), Clarion Assistant no longer goes on quietly using the previous version's. It stops using a redirection file until the right one loads, and it retries every 30 seconds, so it recovers by itself once the file is readable. The Data pad's redirection-file header follows the switch too, on every tab.
+
+<!-- release-docs: covered=mcp,editor,embeditor -->
+### Claude now edits what you see in the CA Editor and CA Embeditor
+
+With a file open in the CA Editor, or a procedure open in the CA Embeditor, Claude's editor and embed tools used to read and write the native Clarion document hidden underneath it. You saw no change, and saving from the CA editor then threw Claude's edits away; `save_file` saved the hidden copy, without your own unsaved edits. The tools now work on the text in front of you:
+
+- **Reads include your unsaved edits**, and **Claude's edits appear at once**, each as one undo step. `undo` and `redo` use the CA editor's own undo history.
+- **Saving is the CA editor's own save.** `save_file` and `save_and_close_embeditor` do exactly what your Save button does.
+- **Nothing falls through to the hidden document.** If the CA editor is still loading or doesn't answer, the tool returns an error and changes nothing. Tools that would discard your work &mdash; `cancel_embeditor`, `close_file` with unsaved changes, `apply_embed_edits` &mdash; refuse and leave it to you.
+- **`open_file` waits until the file is really in front.** It used to report "Opened" while the previous tab stayed active, so the next edit could land in the wrong file. It now returns only once the file is the active editor, including a tab that is already open behind the `.app` view, and returns an error otherwise. `get_open_files` lists full paths.
+- **Every edit says where it landed**, naming the file and line (and, in the CA Embeditor, the procedure and embed slot). The edit tools take an optional `file_path` and refuse, changing nothing, if a different file is active. In the CA Embeditor `file_path` can name the app, the procedure's module or the procedure itself.
+- **Embed source shows real line numbers.** Each code line of `get_embeditor_source` / `search_embeditor_source` carries the buffer line number that `get_line_text`, `replace_range` and `go_to_line` use.
+- **Undoing back to the saved text reads as unmodified** again, in the tab marker, `is_modified` and `get_open_files`.
+- **`open_procedure_embed` opens the procedure you asked for.** Asked for `CheckComma`, it could open `VerifyInventoryFiles`: it typed the name into the app tree's search and opened whatever row was selected. It now checks the name is an exact procedure of the app, checks the selection before opening and the procedure after, and cancels without saving if the wrong one opened. It also works with a CA Editor tab in front of the app tree.
+
+<!-- release-docs: covered=embeditor -->
+### CA Embeditor: a save that can't go through no longer loses your text
+
+A CA Embeditor save matched embed slots to the procedure by line number. After any multi-line change elsewhere in the procedure the numbers no longer agreed, and the save cancelled the embed: the text was gone. Closing with Ctrl+F4 had a second route to the same loss. Slots are now matched by the generated code around them, so line shifts don't matter. A save that genuinely can't be done leaves the CA Embeditor open with your edits and says why. A second save while one is running (Ctrl+S, Ctrl+Q, or Claude's save) is refused with *"A save is already in progress"* instead of racing the first, and Ctrl+Q never closes on lost edits.
+
+<!-- release-docs: covered=lsp,diagnostics -->
+### `lsp_diagnostics` checks the text in your editor, and says how far it got
+
+- **It checks what you are editing.** It used to check the file on disk, never the edit just made, and could not check an embed edit at all, since that only reaches the module `.clw` at the next generate. It now checks the open editor's text &mdash; the embeditor of that module, a CA Editor tab or a CA Embeditor file tab &mdash; and the disk only when the file isn't open. The answer's `analysed` field says which it used, and `source: "disk"` checks the saved file on purpose.
+- **A slow analysis returns what it has.** On a 62,000-line generated module the complete answer takes about 17 seconds, so the 3-second default always came back empty-handed. When time runs out it now returns the problems found so far, flagged `partial`, and a new `timeout_ms` lets you wait longer (up to 120 seconds).
+- **The first call of a session no longer reports a partial answer as complete** (165 problems instead of 437 on the test module).
+- **A repeated call no longer waits its whole timeout for nothing.** It re-sent text the language server already had; the server ignores identical text, so the call could never be answered.
+- **A fresh standalone server no longer reads "pending" for up to a minute** when it can't work out a Clarion version: it now always tells the language server which solution is open.
+- **Fewer false "not declared" squiggles.** Globals the language server reported as undeclared were already filtered out of the tool's answer, but the CA Editor's squiggles and the language-server status count read the unfiltered list and showed them anyway. And in a template-generated PROGRAM, whose CLASS prototypes sit in column 1, every global FILE label stayed flagged because the filter stopped reading at the first prototype.
+
+<!-- release-docs: covered=lsp -->
+### The bundled language server is now v1.0.8 ([#253](https://github.com/ClarionLive/ClarionAssistant/issues/253))
+
+Re-pinned from v1.0.5 straight to v1.0.8, skipping v1.0.6 (which could parse a stale copy after an edit) on Mark Sarson's advice. v1.0.8 brings diagnostics about three times faster, and answers hover, completion and go-to-definition ahead of its background validation. The installer ships the same version.
+
+<!-- release-docs: covered=lsp -->
+### Typing in a large module no longer sends the whole file to the language server ([PR #252](https://github.com/ClarionLive/ClarionAssistant/pull/252))
+
+Every edit used to go to the language server as the entire buffer. It now goes as the one changed range. On a 61,000-line generated module, sending a change dropped from about 1.4 seconds (6 seconds at worst) to about 21 ms, and the slowest hover just after an edit from 7.3 seconds to under 1.5. Measured with Mark Sarson's new HoverBench ([PR #251](https://github.com/ClarionLive/ClarionAssistant/pull/251), [PR #254](https://github.com/ClarionLive/ClarionAssistant/pull/254)), which times the CA editors' own hover layer against any language server build on your own solution.
+
+<!-- release-docs: covered=hover,local-scope -->
+### Hover: the language server's card answers where it says more ([#250](https://github.com/ClarionLive/ClarionAssistant/issues/250), [PR #255](https://github.com/ClarionLive/ClarionAssistant/pull/255), [PR #256](https://github.com/ClarionLive/ClarionAssistant/pull/256))
+
+The CA Editor and CA Embeditor answer most hovers instantly from their own index. For some words that quick card was hiding a better one:
+
+- **`END`, `ELSE`, `OF` and the other structure keywords** show the language server's cards again (*"closes CASE"*, *"branch 2 of 3"*), a regression in 5.9.0 ([#250](https://github.com/ClarionLive/ClarionAssistant/issues/250)).
+- **Module data, and GROUP, QUEUE, CLASS and INTERFACE declarations,** show the server's card, with the real scope (not a hard-coded "local"), the field count, and a clickable file-and-line link ([PR #255](https://github.com/ClarionLive/ClarionAssistant/pull/255)).
+- In each case the quick card still appears when the server has nothing, is down, or takes longer than 300 ms. One card either way.
+- **A keyword in a declaration is no longer taken for a symbol.** Hovering `TEXT` on a WINDOW's control line showed an unrelated library equate called `Text`. Keywords in a declaration's keyword slot now get their keyword card, and the index only offers an equate from an `.inc` or `.equ` file the module can actually see. Index cards' locations are clickable links too ([PR #256](https://github.com/ClarionLive/ClarionAssistant/pull/256)).
+- **Procedures are labelled by where they are declared.** Every procedure used to be called a "local procedure". Hover and completion now say *global procedure* (the PROGRAM's MAP), *module procedure* (a MEMBER module's MAP), *local procedure of &lt;Owner&gt;* (a MAP inside a procedure), or just *procedure* when the prototype is elsewhere.
+
+<!-- release-docs: covered=completion,embeditor,codegraph -->
+### Completion: colon names, GROUP fields and include-file equates
+
+- **Typing `:` after a name opens the list again** (`glo:`, `PROP:`, `EVENT:`). The list closed on the colon and nothing came back until Ctrl+Space. And when the language server's items arrive after the editor has already shown an empty list, the list now reopens with them.
+- **GROUP and QUEUE fields are listed once after a dot**, not once with their type and once without ([PR #238](https://github.com/ClarionLive/ClarionAssistant/pull/238)).
+- **Colon-qualified completion keeps the language server's items** ([PR #241](https://github.com/ClarionLive/ClarionAssistant/pull/241)). They were dropped as soon as CodeGraph found a single match of its own, so a global declared in a header the PROGRAM includes never appeared, although hover found it. A dictionary field both sources know is listed once, with the dictionary's type.
+- **Equates declared at file level in an `.inc`** are offered in the files that include it, directly or through the PROGRAM ([PR #243](https://github.com/ClarionLive/ClarionAssistant/pull/243)). Equates from `.inc` files the current file can't see are left out, so short prefixes aren't flooded. They are picked up the next time the solution is indexed; `winerr.inc`'s equates are no longer indexed twice.
+
+<!-- release-docs: covered=editor -->
+### CA Editor: keymap profiles, and every editor key in one table ([#206](https://github.com/ClarionLive/ClarionAssistant/issues/206), [PR #249](https://github.com/ClarionLive/ClarionAssistant/pull/249))
+
+The Keyboard section of the editor settings (gear panel) now covers the whole keyboard:
+
+- **Keymap profiles:** Clarion (the default, unchanged), VS Code, Visual Studio and Notepad++. Your own key changes sit on top of the profile.
+- **Every key in one table.** The editor's own actions are listed beside the Clarion commands with all their keys, including two-key chords such as `Ctrl+K Ctrl+C`. The table opens on the Clarion commands; **All / Editor / Changed / Clashes** and a search box show the rest.
+- **Clashes are shown.** A Clarion command that takes a key from an editor action now says so on both rows; before, the action just stopped working.
+- **Core editing keys are protected.** Nothing can be moved onto undo, cut/copy/paste, select all, plain typing keys or word movement. Switching profile names the keys it reset, and switching back restores them.
+- **Two-key chords work in every profile.** In Visual Studio's, `Ctrl+K Ctrl+U` no longer stops at Lowercase on `Ctrl+U`.
+
+<!-- release-docs: covered=editor,outline -->
+### CA Editor: your tab comes back, and Document structure opens where you want it
+
+- **Reopening a solution re-selects the tab you were on** ([PR #237](https://github.com/ClarionLive/ClarionAssistant/pull/237)). The IDE restores the open files but always left the last one in the list active.
+- **The Document structure pane can open at a chosen level** ([PR #242](https://github.com/ClarionLive/ClarionAssistant/pull/242)): All (as before), or 1 to 4 levels, optionally sorted A&ndash;Z at that level only &mdash; for example, each class's method names sorted, and the classes left in source order. Both settings are in the editor settings.
+- **No false "could not start" notice** when a CA Editor tab is closed (for example by closing the solution) while it is still starting.
+
+<!-- release-docs: covered=version,mcp-server -->
+### The right Clarion, when more than one is installed ([#247](https://github.com/ClarionLive/ClarionAssistant/issues/247), [PR #248](https://github.com/ClarionLive/ClarionAssistant/pull/248))
+
+In [#247](https://github.com/ClarionLive/ClarionAssistant/issues/247) CodeGraph indexed none of a project's 94 files. The standalone server picked which `ClarionProperties.xml` to read from its own version number, found no such settings folder, and read the newest one: another Clarion's. And every Clarion install also registers a Clarion.NET compiler on the same folders, so a machine whose settings list it first was handed the .NET redirection file and libraries.
+
+- **The standalone server now reads the settings of the Clarion it is installed in**, found from that install's `Clarion.exe`, and never guesses from the newest settings folder.
+- **A Win32 Clarion is never given the Clarion.NET entry's redirection file.**
+- **A version named explicitly reads that version's own settings**, not the host Clarion's copy, which goes stale whenever the other IDE saves (part of [#244](https://github.com/ClarionLive/ClarionAssistant/issues/244)).
+- **A solution follows the IDE's own choice of Clarion for it.** A Clarion 10 solution browsed in the Clarion 12 IDE was resolved against Clarion 12 by `lsp_diagnostics`, `resolve_red_path` and `get_solution_info`, so its includes "could not be found".
+
+<!-- release-docs: covered=dashboard,projects,tabs,header -->
+### Home: COM controls and IDE addins get their own tabs
+
+- **COM controls and IDE addins each have a tab**, opened from two new Dashboard cards that show how many you have. The Dashboard's old "Clarion COM and Addin Projects" table was read as "make a project per Clarion app"; working with your open solution needs no setup, and the Dashboard now says so.
+- **The tab strip is always there, with Home first**, instead of appearing with the first opened tab and vanishing with the last.
+- **SOLUTION follows the IDE.** It is read-only, like VERSION, and shows the solution's name, with the full path on hover and on the copy button. Switching solution in the IDE now does what the old dropdown did: releases the previous solution's databases and indexes the new one in the background.
+- **Opening a project whose folder doesn't exist yet** offers to create it, instead of a "Project folder not found" box.
+
+<!-- release-docs: covered=header -->
+### The header panes size to their content ([#234](https://github.com/ClarionLive/ClarionAssistant/issues/234))
+
+The Solution, Source Control and Schema Sources header panes size to their content instead of clipping it at larger text scaling.
+
+<!-- release-docs: covered=codegraph -->
+### CodeGraph indexes CLASS labels that contain a colon (part of [#246](https://github.com/ClarionLive/ClarionAssistant/issues/246))
+
+A CLASS whose label contains a colon was not indexed, so calls through it could not be linked to its methods.
+
+<!-- release-docs: covered=skills -->
+### The Clarion skill's guidance is corrected and compile-checked ([PR #239](https://github.com/ClarionLive/ClarionAssistant/pull/239), [PR #240](https://github.com/ClarionLive/ClarionAssistant/pull/240))
+
+The bundled `clarion` skill's guidance on CRLF line endings, MEMBER, DECIMAL return values and TXA embeds is corrected, each point reproduced with a standalone compile against Clarion 12. A new pitfalls reference lists rules verified the same way, and plausible-sounding rules that are false, so they don't creep back in. Following the same method: a missing `,PROC` is a warning (*"Calling function as procedure"*), not a compile error; redeclaring a PROGRAM global as `EXTERNAL` in a MEMBER fails at link time; and in a TXA each embed entry has its own `[END]` count, with one `[EMBED]` wrapping all of a procedure's embeds.
+
+<!-- release-docs: covered=safety-hook -->
+### The plugin's safety hook asks about a kill only when one is run
+
+The Clarion Assistant plugin's safety hook asked for confirmation whenever `kill`, `taskkill` or `Stop-Process` appeared anywhere in a command, even in a search for the word. A hook's question overrides bypass mode, so an agent could sit on that prompt until someone answered it. It now asks only when a kill command is actually run: at the start of a command, after a separator or `then`/`do`, after `find -exec`, or behind `sudo`, `timeout`, `xargs` and the like. Quoted text and heredocs count as data only when they are read cleanly to their end, so anything ambiguous still asks. `pkill`, `killall`, `kill-port` and `fkill` are now caught too. Text handed to another shell or language (`powershell -Command`, `bash -c`, `node -e`, `python -c`) is still checked word by word, as before.
+
 ### Thanks
 
 - **[@Aarhusdk](https://github.com/Aarhusdk)** &mdash; [#235](https://github.com/ClarionLive/ClarionAssistant/issues/235): a production crash traced to its root cause with DebugView timings, a complete patch, and a retest on the affected install before we had even looked at it.
+- **[@geircodes](https://github.com/geircodes)** &mdash; eight merged PRs: [#255](https://github.com/ClarionLive/ClarionAssistant/pull/255) and [#256](https://github.com/ClarionLive/ClarionAssistant/pull/256) (hover), [#238](https://github.com/ClarionLive/ClarionAssistant/pull/238), [#241](https://github.com/ClarionLive/ClarionAssistant/pull/241) and [#243](https://github.com/ClarionLive/ClarionAssistant/pull/243) (completion), [#237](https://github.com/ClarionLive/ClarionAssistant/pull/237) and [#242](https://github.com/ClarionLive/ClarionAssistant/pull/242) (CA Editor), and [#233](https://github.com/ClarionLive/ClarionAssistant/pull/233), a code comment put right. Also [#250](https://github.com/ClarionLive/ClarionAssistant/issues/250), which named the exact cards the 5.9.0 hover change had hidden.
+- **[Mark Sarson](https://github.com/msarson)** &mdash; keymap profiles ([PR #249](https://github.com/ClarionLive/ClarionAssistant/pull/249), from his own request [#206](https://github.com/ClarionLive/ClarionAssistant/issues/206)); the #247 fixes ([PR #248](https://github.com/ClarionLive/ClarionAssistant/pull/248)), including the cause nobody had suspected; incremental document sync ([PR #252](https://github.com/ClarionLive/ClarionAssistant/pull/252)); HoverBench ([PR #251](https://github.com/ClarionLive/ClarionAssistant/pull/251), [PR #254](https://github.com/ClarionLive/ClarionAssistant/pull/254)), so hover decisions can follow numbers instead of argument; and [#253](https://github.com/ClarionLive/ClarionAssistant/issues/253), the advice to go straight to v1.0.8.
+- **[OkayPlunk](https://github.com/OkayPlunk)** (Paul Konyk) &mdash; [PR #239](https://github.com/ClarionLive/ClarionAssistant/pull/239) and [PR #240](https://github.com/ClarionLive/ClarionAssistant/pull/240): Clarion skill corrections, every one checked with a real compile, and a list of the false rules to keep out.
+- **[@KevinErskine](https://github.com/KevinErskine)** &mdash; [#247](https://github.com/ClarionLive/ClarionAssistant/issues/247) and [#234](https://github.com/ClarionLive/ClarionAssistant/issues/234).
+- **[@MarkGoldberg](https://github.com/MarkGoldberg)** &mdash; [#244](https://github.com/ClarionLive/ClarionAssistant/issues/244) and [#246](https://github.com/ClarionLive/ClarionAssistant/issues/246).
 
 ## What's New in v5.9
 
@@ -347,202 +512,9 @@ The blanket rule against generating Clarion code was also too broad, and is narr
 
 ---
 
-## What's New in v5.8.1
-
-A patch release that fixes something 5.8 broke. Full notes: **[docs/releases/v5.8.1.md](docs/releases/v5.8.1.md)**.
-
-<!-- release-docs: covered=installer -->
-### Clarion starts again after installing the Markdown editor
-
-Installing 5.8 could leave `accessory\addins\MarkdownEditor` holding **exactly one file** &mdash; the `.addin` manifest &mdash; and none of the assemblies it names. Clarion reads that manifest at startup, fails to load the DLL beside it, and **stops with two dialogs instead of opening**. The editor's files ship as one wildcard entry, and Inno Setup evaluates such an entry's install check *once per expanded file*; the manifest sorts alphabetically first, so it was written, and every remaining file then re-ran the check, found the manifest just written reporting the version being installed, took the "you already have this" branch and was skipped. The gate destroyed its own precondition. Reinstalling did not help &mdash; that lone manifest kept reporting the current version, so the broken state was exactly the state the repair logic refused to repair. The decision is now made once per Clarion version and frozen before the first write, and a manifest with no assembly beside it is treated as damage rather than as an install, which is what **repairs already-broken machines in place**. A copy of the editor newer than the bundled one is still left alone.
-
-### Markdown editor v1.3.0
-
-The bundled editor moves to **[v1.3.0](https://github.com/msarson/ClarionMarkdownEditor/releases/tag/v1.3.0)** &mdash; auto-refresh, remembered view preferences, and resizable panes.
-
-> The Clarion Assistant addin itself is unchanged from 5.8: same binaries, same version stamp. Only the installer's logic and the Markdown editor it carries are different.
-
-### Thanks
-
-- The user who reported this on **Discord**, with both dialogs captured. The screenshots named the file and the path, which is what separated "the DLL is missing" from "the DLL cannot load" &mdash; very different bugs.
-
----
-
-## What's New in v5.8
-
-5.8 is the CodeGraph release &mdash; and one apology. Full notes: **[docs/releases/v5.8.0.md](docs/releases/v5.8.0.md)**.
-
-> **Re-index your solutions and re-import your documentation after updating.** This release corrects what gets *read*, not what is already stored.
-
-### Installing no longer wipes your Claude Code settings ([#190](https://github.com/ClarionLive/ClarionAssistant/issues/190))
-
-Every install, on every machine, overwrote `%USERPROFILE%\.claude\settings.json` &mdash; Claude Code's own global configuration &mdash; leaving only the handful of keys the installer itself writes. `hooks`, `statusLine`, `model`, `tui`, your plugins and your own `permissions.allow` entries were gone, and losing `hooks` is the worst of it because nothing announces it. The installer runs its configuration step under Windows PowerShell 5.1 and the script asked for a JSON option that only exists in PowerShell 6+, so the parse failed every time &mdash; and the error handler mistook its own unsupported call for a corrupt user file, backed it up, and rebuilt from empty. **If this hit you, your settings are still on disk:** look next to the file for `settings.json.backup.` plus a timestamp. The parse works on both hosts now, a genuine failure leaves your file alone, a guard refuses any write that would drop a top-level key, and the installer build fails if any of its scripts would not load under real 5.1.
-
-### CodeGraph: thirty times faster, and no longer confidently wrong
-
-A full index of a 27-app production solution fell from **1:12 to 2:42**, with the output verified identical row by row. The correctness half matters more: "who calls X" could answer with the wrong X entirely, because every call in every app resolved to one arbitrary copy of a shared procedure name. Resolution is now scoped the way the compiler thinks, genuinely ambiguous picks are **marked** rather than asserted, and prototypes are told apart from implementations &mdash; which also fixes a documented dead-code query that was returning **98.7% false positives**.
-
-Three whole categories of code had been invisible. **Procedures whose labels contain a colon** were never indexed at all &mdash; in generated Clarion that is the entire referential-integrity layer, so "what breaks if I delete from this table" returned nothing. **Routine bodies** were never scanned, because a `ROUTINE` label switched the scanner off and `DO ProcedureReturn` prefix-matched the PROCEDURE pattern. And **global data** &mdash; your PROGRAM file's declaration section &mdash; was skipped entirely, with references to an imported global landing on the importing app's copy instead of the declaration you navigate to. The test solution went from 478 thousand relationships to **1.1 million**.
-
-### Indexing shows its work, and the tools stream it
-
-Starting an index opens a **progress window**: apps ticked off as they parse, the file being read, a bar weighted by where the time actually goes, and an estimate seeded from your last run. It can be **cancelled** &mdash; a cancelled full index deletes the partial database rather than leaving something that passes for complete. The transcript is always written to `%APPDATA%\ClarionAssistant\codegraph-index.log`, and the window no longer steals focus from the IDE. Over MCP, `index_solution` and `index_codegraph` now stream live progress and return real completion stats instead of an hour of silence.
-
-### Asking the assistant to build compiles what is on your screen
-
-The assistant's build tools shelled straight out to `ClarionCL` without entering the IDE's build pipeline, so the hook that saves unsaved CA Editor tabs never ran &mdash; the toolbar button saved them, the assistant did not, and you got the stale build. Alongside it: **saving no longer throws the caret to line 1** (our own write looked like an external change to the native editor underneath, whose caret reset was then faithfully mirrored into view), and the editor no longer keeps its unsaved-changes dot on a file it has just saved. **`.tpl` and `.tpw`** listed in Editor Surfaces finally open in the editor, and writing an entry as `*.tpl` no longer produces a pattern that silently matches nothing.
-
-### Markdown editor, embeditor, and per-environment history
-
-Mark Sarson's **[Markdown editor](https://github.com/msarson/ClarionMarkdownEditor)** now ships in the installer, pinned like the bundled language server, and is left alone if you already have a newer copy. The **CA Embeditor** attaches in colon-named procedure suites ([#196](https://github.com/ClarionLive/ClarionAssistant/issues/196)) &mdash; on one reporter's application it had never attached once in six weeks. Two Clarion environments started with `/ConfigDir=` no longer **share one application history** ([#197](https://github.com/ClarionLive/ClarionAssistant/issues/197)); CA had been rebuilding the path from the executable's version stamp, and Clarion 11 and 11.1 both report `11.0`. Migration-free &mdash; a default install resolves to exactly the string it did before.
-
-### Also fixed
-
-**Documentation search stops mangling accented characters** &mdash; the ingester read UTF-8 documents as the machine's ANSI codepage, and the wrong encoding was passed *explicitly*, which is how it survived two previous sweeps. The **embedded assistant knows about every tool it has** in the copy that actually ships: 5.7 went out with a prompt missing 51 registered tools, because the fix had landed in a file that gets overwritten on every terminal start. A release **could ship with no language server** and say so in one grey line among thirty green ones. And CA terminals now **leave the MultiTerminal roster** when they close &mdash; three separate defects, the decisive one being that `localhost` stalled every call to its timeout, which had also left the Agents pad showing stale data.
-
-### Thanks
-
-- **[@KevinErskine](https://github.com/KevinErskine)** &mdash; [#190](https://github.com/ClarionLive/ClarionAssistant/issues/190), and the before-and-after copies of his settings file that made the damage measurable rather than inferred.
-- **[@bill-atchison](https://github.com/bill-atchison)** &mdash; [#196](https://github.com/ClarionLive/ClarionAssistant/issues/196), reported with the root cause and a proposed fix, both of which held up against the source.
-- **[@BoxSoft](https://github.com/BoxSoft)** &mdash; [#197](https://github.com/ClarionLive/ClarionAssistant/issues/197), and the dual-environment detail that explained why two Clarion versions collided on one identity.
-- **[Mark Sarson](https://github.com/msarson)** &mdash; for the Markdown editor this release redistributes.
-
----
-
-## What's New in v5.7
-
-5.7 is a parity-and-reliability release. Full notes: **[docs/releases/v5.7.0.md](docs/releases/v5.7.0.md)**.
-
-### Native embeditor parity &mdash; Ctrl+J / Ctrl+B
-
-The CA Embeditor answers **Ctrl+J** (next filled embed) and **Ctrl+B** (previous) like the native one, wrapping at either end and acting on the focused split pane ([#185](https://github.com/ClarionLive/ClarionAssistant/issues/185), BoxSoft). The code-snippet picker moves to **Ctrl+Shift+J** &mdash; Ctrl+J is classic Clarion's snippet gesture in the *text* editor, but the *embeditor* owes it to embed navigation &mdash; and becomes rebindable like every other command, so it can be put back if you prefer. An unfiltered **Next/Previous Embed (any)** ships unbound.
-
-### Errors-pane navigation survives opening a generated .clw
-
-Clicking a row for one procedure after another row had opened the generated `.clw` appeared to do nothing. The reveal was always computing the right line &mdash; but the embeditor is a view *inside* the application window rather than a tab of its own, so raising it needed both levels, and opening the `.clw` closes the native embed underneath, leaving a surface where **Save** said "nothing to save" and **Cancel** blanked the buffer. Such a row now goes to Clarion's own navigation, which re-opens the embeditor properly.
-
-### A language server call can no longer freeze the IDE
-
-An embed save or cancel could hang the IDE for close to a minute &mdash; measured at 57.7s &mdash; waiting synchronously on an async language-server call from the UI thread. An audit found **twelve** such sites, not the two reported, so the pattern is fixed rather than one more symptom. Separately, an application **global** flagged `'X' is not declared in this file` while hovering correctly as a global is suppressed pending the upstream fix ([Clarion-Extension issue 396](https://github.com/msarson/Clarion-Extension/issues/396)).
-
-### Community fixes
-
-**Go-to-definition** stops resolving to an unrelated procedure's local variable ([#182](https://github.com/ClarionLive/ClarionAssistant/pull/182)) &mdash; a guard the hover path already used and the definition path never called. The **editor follows Clarion's live font** ([#183](https://github.com/ClarionLive/ClarionAssistant/pull/183)): it had been reading a property the Options dialog no longer writes to, so font changes never reached the editor. Both from [@geircodes](https://github.com/geircodes). Reviewing #183 turned up a way to lose your own font &mdash; with following on, any unrelated gear change persisted the IDE's font as your stored preference &mdash; fixed before release, along with the same shape in cursor-behind-EOL.
-
-### Folds, encoding, search, installer
-
-Collapsed **folds** are restored on reopen (the state saved but always read back empty), and an ambiguous drifted fold is refused rather than collapsing the wrong region. The Windows-1252 **encoding** sweep is finished &mdash; nineteen more reads, two of them read-modify-*write* &mdash; and reads no longer decode every file twice. **CA Search** opens in your theme instead of always dark ([#181](https://github.com/ClarionLive/ClarionAssistant/issues/181)). The **installer** checks that a folder's Clarion version matches the row it was entered in, and a row now accepts several folders for the same version via **`+`**, closing the gap 5.5's known issues warned about.
-
-### Thanks
-
-- **[@geircodes](https://github.com/geircodes)** &mdash; [#182](https://github.com/ClarionLive/ClarionAssistant/pull/182) and [#183](https://github.com/ClarionLive/ClarionAssistant/pull/183), with reproducers and live verification against a real IDE.
-- **Adrián Santarelli** &mdash; the WebView2 post-after-dispose fix, reporting [#179](https://github.com/ClarionLive/ClarionAssistant/issues/179), and the original Ctrl+J snippet requests ([#49](https://github.com/ClarionLive/ClarionAssistant/issues/49), [#154](https://github.com/ClarionLive/ClarionAssistant/issues/154)).
-- **BoxSoft** &mdash; [#185](https://github.com/ClarionLive/ClarionAssistant/issues/185), the embed-navigation hotkeys.
-
----
-
-## What's New in v5.6
-
-Documentation search is the headline: PDF text extraction now works on every machine instead of only ones that happened to have a third-party tool installed, the extracted text is more accurate, and it is indexed so that a question is answered by the first result rather than the fifth query. Alongside that, a cycle of fixes across the diagnostics path, completion scoping, and the CA Editor's Monaco overlay &mdash; plus a build fix that restores Clarion 10 to the shipped set.
-
-<!-- release-docs: covered=docgraph -->
-### PDF documentation actually imports &mdash; and is correct (#167)
-
-Importing a folder of PDFs reported "No documentation files found", naming `pdf` as supported in the very message saying nothing was there. The files were found. Text extraction shelled out to an external `pdftotext.exe` that CA never bundled and nothing it requires installs &mdash; not Git for Windows, contrary to what the code's own probe paths assumed. So PDF import worked only on machines where a developer happened to have put one, and silently produced nothing everywhere else.
-
-Extraction is now in-process (PdfPig, Apache-2.0), so it works everywhere with no external dependency.
-
-The bigger surprise was accuracy. Where the old path *did* run, it misaligned multi-column tables: in the Language Reference's date-picture table it paired `@D6` (`dd/mm/yyyy`) with `10/1959` &mdash; which is `@D14`'s value, and cannot be a `dd/mm/yyyy` rendering of any date &mdash; while dropping other cells entirely. Every row now reads correctly. Those tables are exactly what a Clarion developer searches the documentation for, so the old path was not merely unavailable; where it ran, it was indexing wrong answers.
-
-> **Re-import your own PDFs.** Anything already in a personal DocGraph was indexed through the old path and keeps the old text. The bundled documentation shipped with this release is already rebuilt.
-
-### Documentation search answers the question, not the index (#167)
-
-Extraction being correct is not the same as the answer being findable. Asking which three categories `ASCIIFileClass`'s non-virtual methods divide into took **five** queries; it now takes one, and the answer is the first result.
-
-Four things were wrong at once. **Nothing identified the owning class** &mdash; every chunk in the ABC Library Reference was labelled with the book's name, and since every ABC class has an identically-named "Occasional Use" subsection, results from five different classes interleaved with nothing to tell them apart. **Table-of-contents pages outranked real content**: 28.7% of the index was dot-leader lines, which are almost pure keyword, so searching a class name returned page-number lists ahead of prose. **Clarion keywords lifted out of example code became headings** &mdash; 486 chunks titled `ACCEPT`, `PROGRAM` or `RETURN`, including the one holding the ASCIIFileClass text. And **subsection labels were splitting sections apart**, so the three categories landed in three different chunks and no single result could answer the question.
-
-Chunks now carry their real class, contents pages rank below prose, headings read `ASCIIFileClass > GetLastLineNo`, and a section stays whole. Property references in the Language Reference (`PROP:NumTabs` and the rest) get their own headings too, so the definition outranks a passing mention in an example.
-
-Verified against a fixed set of eight retrieval tests, kept with the code at [`ClarionAssistant/docs/DocGraph-Chunking-Verification.md`](ClarionAssistant/docs/DocGraph-Chunking-Verification.md), including a guard on the date-picture table above so a future chunking change cannot quietly undo the extraction fix.
-
-Index-noise suppression currently covers documentation whose contents pages put the title and page number on one line &mdash; SoftVelocity's and CapeSoft's. BoxSoft's manuals wrap them across two lines and are not yet recognised.
-
-### Spot which libraries need re-importing
-
-The Documentation Graph panel (Settings &rarr; Data &rarr; Info) gains a **Type** column showing each library's source format, and every column header &mdash; Library, Type, Vendor, Chunks &mdash; is now a sort toggle. Click **Type** to group the PDFs together, which is the fastest way to see what wants a re-import after this release.
-
-### The installer remembers where your Clarion actually is (#142)
-
-Setup derived each Clarion path fresh on every run, registry first, and discarded whatever you corrected in the wizard. If your Clarion isn't where SoftVelocity's installer registered it &mdash; a second copy, or one launched with `/Configdir=` against its own settings folder &mdash; you had to re-enter the path on every release, and forget once.
-
-That failure is quiet: the addin lands in a tree you don't launch, the IDE keeps loading the old one, and the symptoms get reported against a build replaced weeks ago. Paths a run actually installs to are now remembered and offered next time, and validated on read so a tree that has since moved falls back to detection.
-
-### Diagnostics stop reporting false corruption (#168)
-
-Clarion source is saved as Windows-1252/ANSI with no BOM, but four `File.ReadAllText` calls on the LSP text-sync path read it with no encoding argument &mdash; and .NET only auto-detects via BOM. Every single-byte high-bit character (a copyright symbol, say) silently became `U+FFFD` *before* the text reached the language server, which then correctly flagged the replacement character it had been handed. The result was waves of "this character will corrupt the file" warnings &mdash; dozens per file &mdash; on files that are perfectly valid on disk. All four sites now read through `EncodingHelper.DetectFileEncoding`, the same helper the diff viewer got in #94.
-
-### Squiggles stop vanishing (#170)
-
-The squiggle overlay could render nothing at all for a file that the diagnostics pill correctly reported an error for moments later. Four defects, one symptom, all rooted in treating "no information yet" as "authoritatively zero": a premature empty LSP republish was trusted as final (the server publishes progressively, and a slower cross-file check can land in a later batch); a timed-out round-trip was folded into an empty marker list, which *erased* every existing squiggle and its gutter mark rather than merely failing to add one; the client's timeout sat below the host's own worst case, discarding slow-but-successful analyses; and the settle loop parked a thread-pool thread per request. Empty results now get a short settle window before being believed, a timeout leaves the rendered markers alone, the diagnostics call gets its own longer budget while completion and hover keep their short interactive one, and the wait is properly async.
-
-### Diagnostics window follows the CA Editor's theme &mdash; and appears at all (#169)
-
-The LSP status bar and the diagnostics popup rendered in the chat pane's theme, which is a separate setting from the CA Editor's own. They now follow the **active editor's** theme, tracked per Monaco surface rather than read from a process-wide mirror that only ever recorded whichever page spoke last.
-
-Three correctness bugs surfaced in the same code path and are fixed here too. The status bar pill **never appeared** when the IDE's own ClarionLsp addin was the active client &mdash; the visibility check asked the bundled `LspClient`, which in that configuration is never started, so the pill was hidden on every tick and the window it opens was unreachable. Both the liveness check and the cache read now go through `SharedLspBridge`, and the target file is resolved from the active editor instead of "the last file any LSP tool touched". The pill also stopped claiming a green **OK** for files nothing had ever been published about &mdash; unknown now renders as its own muted state rather than being flattened into "clean" during exactly the window when results are still arriving, and the status bar **asks** for diagnostics when it finds none cached instead of reporting "unknown" indefinitely at a cache nothing else was going to fill. And severity colours now survive a live dark&#8646;light switch instead of keeping the previous theme's palette until the rows next rebuilt.
-
-Rounding it out: owner-drawn column headers and grid lines that actually follow the theme, a selection highlight that no longer overrides each row's severity colour, a dark-mode-aware native title bar, and no more hover flicker.
-
-### Completion stops leaking other procedures' locals (#172)
-
-Follow-up to #159. The CodeGraph backfill in bare-prefix completion matched symbol names across the whole indexed solution with no scope awareness, so a variable declared **private to some unrelated procedure in a different file** was offered exactly like a genuine global &mdash; typing `Include` at the top of a PROGRAM file could surface an `IncludeAddress` local from elsewhere entirely. Symbols the indexer already tags as procedure-private are now filtered out of that merge. Locals in the procedure you're actually standing in are unaffected: those come from a live-buffer parse, not the database.
-
-### `DO` completes routines, and only routines
-
-`DO` takes a ROUTINE label and nothing else, so it is now its own completion context answered from routines alone. Routine names are read **from the live buffer**, scoped to the enclosing procedure &mdash; which is a routine's real visibility in Clarion &mdash; so a routine you just typed and haven't saved completes too. Previously `DO` was answered from the general symbol set: typing `DO ref` offered methods from an unrelated `Reflection` class while missing the `RefreshWindow` routine a few lines up.
-
-### Ctrl+X in the CA Editor reaches the clipboard (#173)
-
-Clarion-style Ctrl+X posted the cut text to the host before deleting it from the buffer &mdash; and the CA Editor never implemented its half of that contract, so **Ctrl+X deleted the line without putting anything on the Windows clipboard**. Both stubs left inert since the original overlay spike are now wired: the cut text reaches `Clipboard.SetText`, and a Data-pad field dropped directly onto the editor surface now returns activation to the editor's own tab instead of leaving focus stranded on the pad.
-
-### Show the diagnostics bar again after dismissing it
-
-The LSP status bar &mdash; the strip at the bottom of the assistant pane carrying the diagnostics pill &mdash; has always had its own **&#10005;**, and nothing brought it back: restarting Clarion was the only way. A **&#9678;** button joins the header's title-row actions, beside the theme toggle, and shows or hides it on demand. It repaints from the current state on the way back rather than returning with whatever it was showing when dismissed.
-
-<!-- release-docs: covered=deploy -->
-### Clarion 10 builds again
-
-`DiffService` called a `FileService` method that doesn't exist on Clarion 10's older SharpDevelop fork, so the C10 build had been failing outright since the CA Compare write-back work landed &mdash; while 11, 11.1 and 12 compiled clean. It now reaches the same information through an API present on every fork, from one code path.
-
-**If you run Clarion 10, this release is the first to include roughly a week of changes** that never made it into a working C10 binary. The installer ships a per-Clarion build (`bin\Debug-C10` and siblings), so a broken build for one release meant that release shipping stale or not at all.
-
-The deploy script no longer lets one bad target take the others down with it, either: a build failure for a single Clarion version used to abort the run *before* the deploy step, so **nothing** was deployed anywhere while the console showed the other three building successfully. Failures are now collected, every version that built is deployed, and the run ends by naming what didn't ship.
-
-<!-- release-docs: covered=create-class -->
-### Class model preview renders again (#171)
-
-In **Create New Class**, any model whose declaration put a Clarion keyword and a quoted string on the same line &mdash; a standard `CLASS,TYPE,MODULE('X.CLW'),LINK('X.CLW')` &mdash; rendered visibly broken markup instead of coloured code. The keyword pass ran over the HTML the string pass had just produced and matched the literal `class` and `string` inside its own attributes. The two passes are now ordered so there is no HTML for the keyword pass to collide with.
-
-### Smart formatter keeps comments where they belong (#161)
-
-Two fixes to **Ctrl+I**, both reported and diagnosed by [@geircodes](https://github.com/geircodes).
-
-A comment sitting among declarations &mdash; inside a `GROUP`/`QUEUE`/`RECORD`/`FILE`, or directly in a procedure's or routine's DATA section &mdash; was indented to the CODE-section column rather than the field column it had been aligned to. It visibly jumped left while every declaration around it formatted correctly, which read as arbitrary rather than as a rule; comments inside `IF`/`CASE`/`LOOP` bodies were never affected, which is what made it look inconsistent. Those comments now line up with the fields they sit among &mdash; and a long banner comment does *not* drag the whole structure's field column to the right with it.
-
-**"Indent comments" now means what it says.** Switching it off used to *delete* a comment's indentation and dump it at column 1, including comments hand-aligned deep inside nested control structures. Off now means leave the comment exactly where it is.
-
-### Thanks
-
-- **geircodes** &mdash; the bulk of this cycle again: the LSP source-encoding fix that ended a wave of false "this character will corrupt the file" warnings (#168), the squiggle overlay going blank on slow or premature results (#170), the diagnostics window's theme plus three correctness bugs found alongside it &mdash; including the status bar pill that never appeared at all (#169), the completion scope leak that surfaced other procedures' locals solution-wide (#172), the CA Editor clipboard and drop-focus stubs (#173), and the class-model preview highlighting (#171). Also reported, diagnosed and wrote the patch for the Ctrl+I comment-indenting fixes (#161), filing it as an issue with the semantics question open rather than as a PR &mdash; which is why "Indent comments OFF" now means something deliberate.
-- **Bill Atchison** &mdash; reporting that PDFs would not import (#167). The bug was invisible to anyone whose machine happened to carry a stray `pdftotext.exe`, which is every developer machine here; without the report it would have kept shipping.
-- **BoxSoft** &mdash; the installer path report (#142) that turned out to be the reason a whole diagnostic round was spent chasing symptoms in a build that had already been replaced.
-
----
-
 ## Release History
 
-Summaries for **v5.5 and earlier** &mdash; back to v3.0 &mdash; are archived in **[docs/releases/CHANGELOG.md](docs/releases/CHANGELOG.md)**.
+Summaries for **v5.8.1 and earlier** &mdash; back to v3.0 &mdash; are archived in **[docs/releases/CHANGELOG.md](docs/releases/CHANGELOG.md)**.
 
 Full per-release notes live in **[docs/releases/](docs/releases/)**.
 
@@ -815,7 +787,7 @@ The installer includes 22 Clarion-specific skills for Claude Code (installed as 
 - Visual Studio 2022 (Community or higher)
 - .NET Framework 4.8 SDK
 - Clarion IDE (for reference assemblies in `{Clarion}\bin\`)
-- [Inno Setup 6](https://jrsoftware.org/isdownload.php) (for building the installer)
+- [Inno Setup 6](https://jrsoftware.org/isdl.php) (for building the installer)
 
 ### Configuring your Clarion path
 

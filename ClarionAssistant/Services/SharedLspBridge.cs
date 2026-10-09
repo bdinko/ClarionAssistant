@@ -542,6 +542,26 @@ namespace ClarionAssistant.Services
             // reached Monaco as identical rows. Collapse them first; the merges are unchanged.
             RemoveDuplicateServerItems(primary);
 
+            // Colon-qualified context ("Glob:S", "Cus:Na", "PROP:Be"): the server labels its qualifier
+            // items with the bare name ("Svc", detail "Glob:Svc"), while every host merge below labels the
+            // same kind of item "Glob:Svc" and dedupes by label. Give the server's items that full-label
+            // shape FIRST, so each merge skips a name the server already supplied, and the qualifier
+            // scoping at the end keeps them instead of dropping every one once CodeGraph has a match.
+            string qualifier = null;
+            Dictionary<string, LspClient.CompletionItemInfo> serverQualified = null;
+            try
+            {
+                qualifier = ColonQualifierAt(filePath, line, character, bufferText);
+                if (qualifier != null)
+                {
+                    ColonQualifierScope.NormalizeServerItems(primary, qualifier);
+                    // What the server supplied, so the dictionary and IDENT:* merges below skip those names
+                    // (and lend the server row their type) instead of adding a second row (PR #241 review).
+                    serverQualified = ColonQualifierScope.ServerQualifiedItems(primary);
+                }
+            }
+            catch (Exception ex) { LspTrace.Write("[SharedLspBridge] colon-qualifier normalize failed: " + ex.Message); }
+
             // CodeGraph prefix-completion augmentation (task a47a6cac Phase 1). Mark's pure upstream
             // server does MEMBER-ACCESS-ONLY completion; for a BARE PREFIX (line not ending in '.') it
             // returns nothing. We merge in global symbols (procedures/functions/classes/vars) from the
@@ -564,7 +584,7 @@ namespace ClarionAssistant.Services
             // prefix, so this deliberately does NOT dedupe against what MergeQualifiedFieldCompletions already
             // added; both are shown, distinguished by Detail ("... field, dictionary" vs "... (field)").
             // Never throws, never overrides.
-            try { MergeDictionaryFieldCompletions(primary, filePath, line, character, bufferText); }
+            try { MergeDictionaryFieldCompletions(primary, filePath, line, character, bufferText, serverQualified); }
             catch (Exception ex) { LspTrace.Write("[SharedLspBridge] dictionary field completion merge failed: " + ex.Message); }
 
             // Class member-access (ticket 6e8f2439, item 5b): "oInstance." → that instance's ABC/library
@@ -603,32 +623,19 @@ namespace ClarionAssistant.Services
             }
             catch (Exception ex) { LspTrace.Write("[SharedLspBridge] member-access scoping failed: " + ex.Message); }
 
-            // Colon-qualifier scoping. When the cursor sits right after an "IDENT:" qualifier (PROP:/EVENT:/
-            // PROPLIST:/group-PRE like Cus:...), the Monaco replace-range breaks on the ':' and is EMPTY, so
-            // the client does NO prefix filtering — Mark's LSP also returns its global built-in/keyword set
-            // (ACOS, ABS, ...) which then shows alongside the relevant IDENT:* items. Scope the list to labels
-            // starting with the qualifier (those carry the prefix: "PROP:Bevel", "Cus:Field"). Defensive:
-            // only apply when matches remain, so it can never blank out an otherwise-working list. Member
-            // access ('.') has no colon → unaffected.
-            // Colon-qualified completion (PROP:/EVENT:/PROPLIST:/group-PRE Cus:...). In this context the LSP
-            // returns a broad in-scope symbol dump (locals, globals, builtins like ACOS) — NOT IDENT:* members
-            // — and because the Monaco replace-range breaks on ':' (empty range) the client shows them
-            // unfiltered. Fix in two moves: (1) supply the IDENT:* members from ClarionGraph/CodeGraph (e.g.
-            // every PROP:* property equate from property.clw), then (2) scope the list to labels starting with
-            // the qualifier, which drops the LSP noise. Guard: only scope when matches remain.
+            // Colon-qualified completion (PROP:/EVENT:/PROPLIST:/group-PRE Cus:...). The Monaco replace-range
+            // breaks on ':', so the client does no prefix filtering of its own here. Two moves: (1) supply the
+            // IDENT:* members from ClarionGraph/CodeGraph (e.g. every PROP:* property equate from
+            // property.clw), then (2) scope the list to labels starting with the qualifier, which drops
+            // anything else that reached it. The server's own qualifier items already carry the qualified
+            // label (normalized at the top), so the scoping keeps them. Guard: only scope when matches remain.
+            // Member access ('.') has no colon, so it is unaffected.
             try
             {
-                string qualifier = ColonQualifierAt(filePath, line, character, bufferText);
                 if (qualifier != null)
                 {
-                    MergeColonQualifierCompletions(primary, qualifier, filePath);
-                    if (primary.Count > 0)
-                    {
-                        var scoped = primary.FindAll(it =>
-                            it != null && !string.IsNullOrEmpty(it.Label) &&
-                            it.Label.StartsWith(qualifier, StringComparison.OrdinalIgnoreCase));
-                        if (scoped.Count > 0) primary = scoped;
-                    }
+                    MergeColonQualifierCompletions(primary, qualifier, filePath, serverQualified);
+                    primary = ColonQualifierScope.Scope(primary, qualifier);
                 }
             }
             catch (Exception ex) { LspTrace.Write("[SharedLspBridge] colon-qualifier completion failed: " + ex.Message); }
@@ -684,13 +691,16 @@ namespace ClarionAssistant.Services
         /// itself returns only a broad scope dump here, so this is what actually populates PROP:/EVENT:
         /// completion. Never throws.</summary>
         private static void MergeColonQualifierCompletions(
-            List<LspClient.CompletionItemInfo> primary, string qualifier, string filePath)
+            List<LspClient.CompletionItemInfo> primary, string qualifier, string filePath,
+            Dictionary<string, LspClient.CompletionItemInfo> serverQualified = null)
         {
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var it in primary)
                 if (it != null && !string.IsNullOrEmpty(it.Label)) seen.Add(it.Label);
 
             string[] dbs = { ResolveCodeGraphDb(filePath), ClarionGraphService.ResolveDbPath() };
+            // A colon-named .inc equate (EVENT:Foo) follows the same include-closure rule as a bare prefix.
+            var includedFiles = SymbolIndex.IncludeClosure(filePath, dbs);
             foreach (string db in dbs)
             {
                 try
@@ -700,9 +710,12 @@ namespace ClarionAssistant.Services
                     // "LOC:x") no longer leak in: in-scope colon labels come from LocalScopeIndex.
                     var idx = SymbolIndex.For(db);
                     if (idx == null) continue;
-                    foreach (var s in idx.ByPrefix(qualifier, 2000))
+                    foreach (var s in idx.ByPrefix(qualifier, 2000, equateFiles: includedFiles))
                     {
-                        if (s == null || string.IsNullOrEmpty(s.Name) || !seen.Add(s.Name)) continue;
+                        if (s == null || string.IsNullOrEmpty(s.Name)) continue;
+                        // A name the server supplied keeps the server's row, which takes CodeGraph's detail.
+                        if (ColonQualifierScope.ServerHas(serverQualified, s.Name, SymbolIndex.CompletionDetail(s))) continue;
+                        if (!seen.Add(s.Name)) continue;
                         int ci = s.Name.IndexOf(':');
                         string insert = (ci >= 0 && ci < s.Name.Length - 1) ? s.Name.Substring(ci + 1) : s.Name;
                         primary.Add(new LspClient.CompletionItemInfo
@@ -769,6 +782,148 @@ namespace ClarionAssistant.Services
                     : new LspClient.DiagnosticWaitResult { Entries = new List<LspClient.DiagnosticEntry>(), Pending = true }, filePath);
             }
             return DropUndeclaredWeCanResolve(SharedGetDiagnostics(c, filePath, timeoutMs, false), filePath);
+        }
+
+        // ===========================================================================================
+        // 44a1b10c: lsp_diagnostics diagnoses the open editor's text when there is one, else the disk
+        // ===========================================================================================
+
+        /// <summary>An open editor's current text for a path, as the LiveTextProvider reports it.</summary>
+        public sealed class LiveText
+        {
+            /// <summary>The text to diagnose, exactly as the editor syncs it (an embed is already wrapped). Null =
+            /// no usable text; <see cref="Reason"/> then says why, and the tool falls back to the disk.</summary>
+            public string Text;
+            /// <summary>"ca-editor-buffer" | "embeditor-file-buffer" | "embeditor-document".</summary>
+            public string Origin;
+            /// <summary>Lines the wrapping put in front of the editor's own first line (embeditor-document: 0 or 1).
+            /// A diagnostic's line minus this is its line in the editor's numbering; one before it is dropped.</summary>
+            public int LineOffset;
+            /// <summary>Optional 1-based inclusive [start,end] embed-slot ranges in the editor's numbering; when
+            /// present each diagnostic is marked inEmbed.</summary>
+            public List<int[]> EmbedRanges;
+            /// <summary>Why there is no text (e.g. "the IDE did not answer within 2 s"); shown as the fallback reason.</summary>
+            public string Reason;
+            /// <summary>embeditor-document: the procedure open in the embeditor (get_embed_info does not name it).</summary>
+            public string Procedure;
+        }
+
+        /// <summary>
+        /// Answers "which text is open for this path?" for lsp_diagnostics. The addin registers it at startup (the
+        /// editors live there); the standalone server leaves it null, which means the disk. It is called on the MCP
+        /// worker thread and must never block on the UI thread: it reads with BeginInvoke and a short bounded wait,
+        /// and on a timeout returns a LiveText with a Reason (the tool then reports analysed: disk with that reason).
+        /// Returns null when no editor has the path open.
+        /// </summary>
+        public static Func<string, LiveText> LiveTextProvider;
+
+        /// <summary>What lsp_diagnostics answered for: the result plus which text and which line numbering.</summary>
+        public sealed class ToolDiagnostics
+        {
+            public LspClient.DiagnosticWaitResult Result;
+            /// <summary>"disk" | "ca-editor-buffer" | "embeditor-file-buffer" | "embeditor-document".</summary>
+            public string Analysed = "disk";
+            /// <summary>"file" (the file's own lines) | "embeditor-document" (the embeditor's lines, = «E:N»).</summary>
+            public string LineBase = "file";
+            /// <summary>Why the disk was used although auto was asked for (null when no editor had it open).</summary>
+            public string FallbackReason;
+            /// <summary>Per entry, parallel to Result.Entries: inside an embed slot (null = unknown).</summary>
+            public List<bool?> InEmbed;
+            /// <summary>Set when the call was refused (source "buffer" with no open editor).</summary>
+            public string Error;
+            /// <summary>embeditor-document: the procedure whose embeditor document was checked.</summary>
+            public string Procedure;
+        }
+
+        /// <summary>
+        /// lsp_diagnostics' one entry point (44a1b10c). <paramref name="source"/>: "auto" (an open editor's text if
+        /// there is one, else the disk), "disk", or "buffer" (refused when no editor has the path open).
+        /// </summary>
+        public static ToolDiagnostics GetDiagnosticsForTool(string filePath, int timeoutMs, string source)
+        {
+            var answer = new ToolDiagnostics();
+            source = string.IsNullOrEmpty(source) ? "auto" : source.Trim().ToLowerInvariant();
+
+            LiveText live = null;
+            if (source != "disk")
+            {
+                var provider = LiveTextProvider;
+                if (provider != null)
+                {
+                    try { live = provider(filePath); }
+                    catch (Exception ex) { live = new LiveText { Reason = "the editor lookup failed: " + ex.Message }; }
+                }
+            }
+
+            bool haveText = live != null && live.Text != null;
+            if (!haveText)
+            {
+                if (source == "buffer")
+                {
+                    answer.Error = "No open editor buffer for " + filePath
+                        + (live != null && !string.IsNullOrEmpty(live.Reason) ? " (" + live.Reason + ")" : "")
+                        + ". Use source \"auto\" or \"disk\".";
+                    answer.Result = new LspClient.DiagnosticWaitResult { Entries = new List<LspClient.DiagnosticEntry>(), Pending = true };
+                    return answer;
+                }
+                if (live != null) answer.FallbackReason = live.Reason;
+                answer.Result = GetDiagnostics(filePath, timeoutMs);
+                return answer;
+            }
+
+            answer.Analysed = string.IsNullOrEmpty(live.Origin) ? "ca-editor-buffer" : live.Origin;
+            answer.Procedure = live.Procedure;
+            answer.Result = DropUndeclaredWeCanResolve(DiagnosticsForText(filePath, live.Text, timeoutMs), filePath);
+
+            if (answer.Analysed == "embeditor-document")
+            {
+                answer.LineBase = "embeditor-document";
+                answer.Result = ToEditorLines(answer.Result, live.LineOffset);
+            }
+            if (live.EmbedRanges != null && answer.Result.Entries != null)
+            {
+                answer.InEmbed = new List<bool?>(answer.Result.Entries.Count);
+                foreach (var e in answer.Result.Entries)
+                {
+                    int line1 = e.Line + 1;   // already in the editor's numbering
+                    bool inside = false;
+                    foreach (var r in live.EmbedRanges)
+                        if (r != null && r.Length >= 2 && line1 >= r[0] && line1 <= r[1]) { inside = true; break; }
+                    answer.InEmbed.Add(inside);
+                }
+            }
+            return answer;
+        }
+
+        // The given text, never the disk: the bundled client syncs it hash-gated (nothing re-sent when the server holds
+        // it, #359), the shared client gets it as the buffer of its single request.
+        private static LspClient.DiagnosticWaitResult DiagnosticsForText(string filePath, string text, int timeoutMs)
+        {
+            var c = Shared;
+            if (c != null) return SharedGetDiagnostics(c, filePath, timeoutMs, true, text);
+            var lsp = LspClient.Active;
+            return lsp != null
+                ? lsp.GetDiagnosticsForText(filePath, text, timeoutMs)
+                : new LspClient.DiagnosticWaitResult { Entries = new List<LspClient.DiagnosticEntry>(), Pending = true };
+        }
+
+        // Shift entries from the wrapped text's lines to the editor's own (minus the injected header lines), dropping
+        // any that fall on the header. Copies: the entries may be the cache's own objects.
+        private static LspClient.DiagnosticWaitResult ToEditorLines(LspClient.DiagnosticWaitResult r, int offset)
+        {
+            if (r == null || r.Entries == null || offset <= 0) return r;
+            var kept = new List<LspClient.DiagnosticEntry>(r.Entries.Count);
+            foreach (var e in r.Entries)
+            {
+                if (e == null || e.Line - offset < 0) continue;
+                kept.Add(new LspClient.DiagnosticEntry
+                {
+                    Severity = e.Severity, Message = e.Message, Source = e.Source,
+                    Line = e.Line - offset, Character = e.Character,
+                    EndLine = Math.Max(e.Line - offset, e.EndLine - offset), EndCharacter = e.EndCharacter
+                });
+            }
+            return new LspClient.DiagnosticWaitResult { Entries = kept, Pending = r.Pending, Partial = r.Partial && kept.Count > 0 };
         }
 
         // ===========================================================================================
@@ -846,7 +1001,7 @@ namespace ClarionAssistant.Services
 
                 LspTrace.Write("[SharedLspBridge] suppressed " + dropped
                     + " 'not declared in this file' diagnostic(s) CodeGraph resolves non-locally in '" + filePath + "'.");
-                return new LspClient.DiagnosticWaitResult { Entries = kept, Pending = result.Pending };
+                return new LspClient.DiagnosticWaitResult { Entries = kept, Pending = result.Pending, Partial = result.Partial };
             }
             catch (Exception ex)
             {
@@ -865,7 +1020,7 @@ namespace ClarionAssistant.Services
         /// Clear every still-unresolved name that the owning PROGRAM module declares as global data. Follows
         /// <paramref name="modulePath"/>'s own MEMBER('…') line to the PROGRAM .clw, then looks for a
         /// column-1 label in its DECLARATION section (everything before the global CODE, per
-        /// ClarionParser.FindMainTailStart). Column-1 anchoring is what keeps indented MAP prototypes and
+        /// FindProgramGlobalCode). Column-1 anchoring is what keeps indented MAP prototypes and
         /// nested structure fields out; GROUP/QUEUE depth tracking in FindDataLabelInRange does the rest.
         ///
         /// This is the .app-globals case the whole filter exists for: in the CA Embeditor the buffer is a
@@ -913,13 +1068,9 @@ namespace ClarionAssistant.Services
                     if (!File.Exists(programPath)) return;
                 }
 
-                int tailStart;
-                try { tailStart = new ClarionParser().FindMainTailStart(programPath); }
-                catch { return; }
-
                 var lines = EncodingHelper.ReadAllLines(programPath, out _);
                 if (lines == null || lines.Length == 0) return;
-                if (tailStart <= 0 || tailStart > lines.Length) tailStart = lines.Length;
+                int tailStart = FindProgramGlobalCode(lines);
 
                 var pending = new List<string>();
                 foreach (var kv in names) if (!kv.Value) pending.Add(kv.Key);
@@ -930,6 +1081,41 @@ namespace ClarionAssistant.Services
             {
                 LspTrace.Write("[SharedLspBridge] ResolveNamesFromProgramGlobals('" + modulePath + "'): " + ex.Message);
             }
+        }
+
+        // A bare CODE statement, and an unconditional OMIT('term') (no second argument: dead in every build).
+        private static readonly Regex CgBareCode = new Regex(@"^\s*CODE\s*(!.*)?$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+        private static readonly Regex CgUnconditionalOmit = new Regex(
+            @"^\s*OMIT\s*\(\s*'([^']+)'\s*\)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        /// <summary>
+        /// Line index of a PROGRAM's global CODE statement — the end of its declaration section — or
+        /// lines.Length when there is none. The first bare CODE line outside an unconditional OMIT block:
+        /// no declaration-section construct contains one.
+        ///
+        /// e2f87efb: this used to be ClarionParser.FindMainTailStart, whose defensive rule also stops at the
+        /// first column-1 "X PROCEDURE" line. A template-generated PROGRAM writes CLASS method prototypes at
+        /// column 1 (PRM002.clw: "TranslateString PROCEDURE(...),STRING,VIRTUAL" inside a CLASS,TYPE at line
+        /// 92), so the range ended there and none of the FILE labels thousands of lines further down were
+        /// seen. A column-1 field label CODE (`CODE  STRING(16)` in a FILE's RECORD) is not bare and does
+        /// not end the range either.
+        /// </summary>
+        private static int FindProgramGlobalCode(string[] lines)
+        {
+            for (int i = 0; i < lines.Length; i++)
+            {
+                var omit = CgUnconditionalOmit.Match(lines[i]);
+                if (omit.Success)
+                {
+                    string term = omit.Groups[1].Value;
+                    int j = i + 1;
+                    while (j < lines.Length && !lines[j].Contains(term)) j++;
+                    i = j;
+                    continue;
+                }
+                if (CgBareCode.IsMatch(lines[i])) return i;
+            }
+            return lines.Length;
         }
 
         private static readonly Regex CgGroupQueueOpen = LocalScopeIndex.GroupQueueOpen;
@@ -996,7 +1182,6 @@ namespace ClarionAssistant.Services
             return false;
         }
 
-        /// <summary>Last diagnostics computed for a file (no re-query).</summary>
         /// <summary>K2 (1c685f2e): forget the cached diagnostics for <paramref name="filePath"/> (both clients).
         /// EmbedLspContext.RevertShadow calls it after pushing the on-disk text back, so the next embeditor on this
         /// module never inherits the disk text's publish.</summary>
@@ -1006,9 +1191,27 @@ namespace ClarionAssistant.Services
             var lsp = LspClient.Active;
             if (lsp != null) lsp.ClearDiagnostics(filePath);
             lock (_sharedDiagLock) { _sharedDiagCache.Remove(filePath); }
+            lock (_filteredDiagCache) { _filteredDiagCache.Remove(filePath); }
         }
 
+        /// <summary>
+        /// Last diagnostics published for a file (no re-query), with the same 'not declared' filter the wait
+        /// paths apply (DropUndeclaredWeCanResolve). null = nothing ever published; empty = clean.
+        ///
+        /// 2abfbba2: this is the ONLY reader of the cached diagnostics, so the raw cache cannot reach the user.
+        /// It used to return it raw. When the filter cleared every entry (PRM002004.clw: the server's 3 false
+        /// "'GlobalRequest' is not declared" warnings), the waited answer was empty, ModernEmbeditorDiagnostics'
+        /// settle loop read this cache to check for a late republish, and painted the 3 squiggles back in the
+        /// CA Editor. The status pill (AssistantChatControl.PollLspUi) counted them too.
+        /// </summary>
         public static List<LspClient.DiagnosticEntry> GetCachedDiagnostics(string filePath)
+        {
+            var raw = GetCachedDiagnosticsRaw(filePath);
+            if (raw == null || raw.Count == 0) return raw;
+            return FilterCachedDiagnostics(filePath, raw);
+        }
+
+        private static List<LspClient.DiagnosticEntry> GetCachedDiagnosticsRaw(string filePath)
         {
             var c = Shared;
             if (c == null) { var lsp = LspClient.Active; return lsp != null ? lsp.GetCachedDiagnostics(filePath) : null; }
@@ -1017,6 +1220,49 @@ namespace ClarionAssistant.Services
                 List<LspClient.DiagnosticEntry> entries;
                 return _sharedDiagCache.TryGetValue(filePath, out entries) ? new List<LspClient.DiagnosticEntry>(entries) : null;
             }
+        }
+
+        // The status pill reads the cache every 2 s on the UI thread, and the filter reads the PROGRAM file and
+        // CodeGraph. So the filtered list is kept per file until the raw entries change, and for at most
+        // FilteredCacheTtlMs, so a re-index or an edited PROGRAM file is picked up without a new publish.
+        private const int FilteredCacheTtlMs = 30000;
+        private sealed class FilteredCacheEntry { public string Signature; public long Ticks; public List<LspClient.DiagnosticEntry> Entries; }
+        private static readonly Dictionary<string, FilteredCacheEntry> _filteredDiagCache =
+            new Dictionary<string, FilteredCacheEntry>(StringComparer.OrdinalIgnoreCase);
+
+        private static List<LspClient.DiagnosticEntry> FilterCachedDiagnostics(string filePath, List<LspClient.DiagnosticEntry> raw)
+        {
+            string sig = DiagnosticsSignature(raw);
+            long now = DateTime.UtcNow.Ticks;
+            lock (_filteredDiagCache)
+            {
+                FilteredCacheEntry hit;
+                if (_filteredDiagCache.TryGetValue(filePath, out hit) && hit.Signature == sig
+                    && (now - hit.Ticks) / TimeSpan.TicksPerMillisecond < FilteredCacheTtlMs)
+                    return new List<LspClient.DiagnosticEntry>(hit.Entries);
+            }
+
+            var filtered = DropUndeclaredWeCanResolve(
+                new LspClient.DiagnosticWaitResult { Entries = raw, Pending = false }, filePath);
+            var entries = (filtered != null && filtered.Entries != null) ? filtered.Entries : raw;
+            lock (_filteredDiagCache)
+            {
+                if (_filteredDiagCache.Count > 64) _filteredDiagCache.Clear();   // a bound, not an LRU: refills on demand
+                _filteredDiagCache[filePath] = new FilteredCacheEntry { Signature = sig, Ticks = now, Entries = entries };
+            }
+            return new List<LspClient.DiagnosticEntry>(entries);
+        }
+
+        private static string DiagnosticsSignature(List<LspClient.DiagnosticEntry> entries)
+        {
+            var sb = new System.Text.StringBuilder(entries.Count * 48);
+            foreach (var e in entries)
+            {
+                if (e == null) { sb.Append("~\n"); continue; }
+                sb.Append(e.Line).Append(':').Append(e.Character).Append(':').Append(e.EndLine).Append(':')
+                  .Append(e.EndCharacter).Append(':').Append(e.Severity).Append(':').Append(e.Message).Append('\n');
+            }
+            return sb.ToString();
         }
 
         // ===========================================================================================
@@ -1047,8 +1293,15 @@ namespace ClarionAssistant.Services
         /// surface unwrapped, exactly as .GetAwaiter().GetResult() did, so existing catches still work.</summary>
         private static T Block<T>(Func<Task<T>> start, string what)
         {
+            return Block(start, what, BlockCapMs);
+        }
+
+        /// <summary>As above with the caller's own cap: lsp_diagnostics' timeout_ms may ask for more than
+        /// BlockCapMs (92d06c29), and the cap must not cut that wait short.</summary>
+        private static T Block<T>(Func<Task<T>> start, string what, int capMs)
+        {
             var t = Task.Run(start);
-            if (!WaitBounded(t, what)) throw new TimeoutException("LSP '" + what + "' exceeded " + BlockCapMs + "ms");
+            if (!WaitBounded(t, what, capMs)) throw new TimeoutException("LSP '" + what + "' exceeded " + capMs + "ms");
             return t.GetAwaiter().GetResult();
         }
 
@@ -1062,9 +1315,9 @@ namespace ClarionAssistant.Services
 
         // Wait swallowing only the AggregateException a faulted task raises, so the caller can rethrow it
         // UNWRAPPED via GetResult() and preserve the original exception type in the existing catch blocks.
-        private static bool WaitBounded(Task t, string what)
+        private static bool WaitBounded(Task t, string what, int capMs = BlockCapMs)
         {
-            try { return t.Wait(BlockCapMs); }
+            try { return t.Wait(capMs); }
             catch (AggregateException) { return true; }   // faulted — let GetResult() rethrow it unwrapped
         }
 
@@ -1210,10 +1463,11 @@ namespace ClarionAssistant.Services
         /// fallback branch (LspClient.GetDiagnostics) carries the #216 gate itself.
         /// This call runs on the caller's thread through Block (bounded), never the UI thread:
         /// lsp_diagnostics is an MCP tool call, and AssistantChatControl dispatches it via Task.Run.</summary>
-        private static LspClient.DiagnosticWaitResult SharedGetDiagnostics(IClarionLanguageClient c, string filePath, int timeoutMs, bool liveBuffer)
+        private static LspClient.DiagnosticWaitResult SharedGetDiagnostics(IClarionLanguageClient c, string filePath, int timeoutMs, bool liveBuffer,
+                                                                           string explicitText = null)
         {
-            string buffer = null;
-            if (liveBuffer) { lock (_sharedBufLock) { _sharedBuffers.TryGetValue(filePath, out buffer); } }
+            string buffer = explicitText;   // 44a1b10c: an open editor's text, chosen by the caller
+            if (buffer == null && liveBuffer) { lock (_sharedBufLock) { _sharedBuffers.TryGetValue(filePath, out buffer); } }
             if (buffer == null && File.Exists(filePath)) { try { buffer = EncodingHelper.ReadAllText(filePath, out _); } catch { } }
 
             var result = new LspClient.DiagnosticWaitResult { Entries = new List<LspClient.DiagnosticEntry>(), Pending = true };
@@ -1221,7 +1475,8 @@ namespace ClarionAssistant.Services
             {
                 string capturedBuffer = buffer ?? "";
                 LspModels.DiagnosticResult[] diags =
-                    Block(() => c.GetDiagnosticsAsync(filePath, capturedBuffer, timeoutMs), "diagnostics");
+                    Block(() => c.GetDiagnosticsAsync(filePath, capturedBuffer, timeoutMs), "diagnostics",
+                          Math.Max(BlockCapMs, timeoutMs + 5000));
                 result.Entries = DiagnosticsToEntries(diags);
                 result.Pending = false;
                 lock (_sharedDiagLock) { _sharedDiagCache[filePath] = result.Entries; }
@@ -1692,8 +1947,13 @@ namespace ClarionAssistant.Services
                 // Bare word (class name, equate). Project CodeGraph first (most specific), then ClarionGraph.
                 string word = CgWordAt(filePath, line, character, bufferText);
                 if (string.IsNullOrEmpty(word)) return null;
-                return CgDefinitionFromDb(word, ResolveCodeGraphDb(filePath))
-                    ?? CgDefinitionFromDb(word, ClarionGraphService.ResolveDbPath());
+                // Scoped to the include files this file can see, as the hover fallback is (CodeGraphHover): the
+                // lookup is by name alone, so a bare "Text" otherwise jumped to an equate of that name in a
+                // library include the module never includes.
+                string projectDb = ResolveCodeGraphDb(filePath), libraryDb = ClarionGraphService.ResolveDbPath();
+                var closureDbs = new[] { projectDb, libraryDb };
+                return CgDefinitionFromDb(word, projectDb, filePath, closureDbs)
+                    ?? CgDefinitionFromDb(word, libraryDb, filePath, closureDbs);
             }
             catch { return null; }
         }
@@ -1764,7 +2024,8 @@ namespace ClarionAssistant.Services
         /// genuinely undeclared in scope (LSP correctly returns empty) could still resolve F12 to an
         /// unrelated procedure's local via CodeGraphProvider.FindSymbolByName's unordered `LIMIT 1`. Never
         /// throws.</summary>
-        private static Dictionary<string, object> CgDefinitionFromDb(string word, string db)
+        private static Dictionary<string, object> CgDefinitionFromDb(string word, string db,
+                                                                     string contextFile = null, string[] closureDbs = null)
         {
             try
             {
@@ -1775,6 +2036,9 @@ namespace ClarionAssistant.Services
                     var sym = p.FindSymbolByName(word);
                     if (sym == null || string.IsNullOrEmpty(sym.FilePath)) return null;
                     if (IsUnreachableLocalVariable(p, sym)) return null;
+                    // An equate from an include file the context file never includes is not visible there.
+                    sym = SymbolIndex.ScopeEquateToIncludes(sym, word, db, contextFile, closureDbs);
+                    if (sym == null || string.IsNullOrEmpty(sym.FilePath)) return null;
                     return WrapResult(new System.Collections.ArrayList { CgLocation(sym.FilePath, sym.LineNumber) });
                 }
             }
@@ -1882,8 +2146,13 @@ namespace ClarionAssistant.Services
                 // slot ("Test PRO" typed before "PROCEDURE" finishes) or is just referenced in CODE (a typo
                 // or a not-yet-declared local, e.g. "PRO = 12" inside a procedure that never declared it) —
                 // so CgHoverFromDb always rejects a procedure/routine-scoped "variable" match here.
-                var hov = CgHoverFromDb(word, ResolveCodeGraphDb(filePath), "CodeGraph")
-                    ?? CgHoverFromDb(word, ClarionGraphService.ResolveDbPath(), "ClarionGraph");
+                // Also scoped to the include files this file can see: the lookup is by name alone, so a bare
+                // "Text" in a module that never includes the library file declaring an equate of that name
+                // (an XML or web-control include) otherwise hovered as that equate.
+                string projectDb = ResolveCodeGraphDb(filePath), libraryDb = ClarionGraphService.ResolveDbPath();
+                var closureDbs = new[] { projectDb, libraryDb };
+                var hov = CgHoverFromDb(word, projectDb, "CodeGraph", filePath, closureDbs)
+                    ?? CgHoverFromDb(word, libraryDb, "ClarionGraph", filePath, closureDbs);
                 if (hov != null) return hov;
                 // Template-generated ABC globals (GlobalRequest/Response, VCRRequest, GlobalErrors …) live in
                 // no libsrc file, so no DB has them — resolve their hover from the curated built-in list. This
@@ -1914,7 +2183,8 @@ namespace ClarionAssistant.Services
         /// since the caller already exhausted this file's own local/routine/module scope via
         /// BufferLocalHover before falling back here). <paramref name="sourceLabel"/> names the DB (e.g.
         /// "ClarionGraph") for the detail line when the symbol has no project name. Never throws.</summary>
-        private static Dictionary<string, object> CgHoverFromDb(string word, string db, string sourceLabel)
+        private static Dictionary<string, object> CgHoverFromDb(string word, string db, string sourceLabel,
+                                                                string contextFile = null, string[] closureDbs = null)
         {
             try
             {
@@ -1925,6 +2195,9 @@ namespace ClarionAssistant.Services
                     var sym = p.FindSymbolByName(word);
                     if (sym == null) return null;
                     if (IsUnreachableLocalVariable(p, sym)) return null;
+                    // An equate from an include file the context file never includes is not visible there.
+                    sym = SymbolIndex.ScopeEquateToIncludes(sym, word, db, contextFile, closureDbs);
+                    if (sym == null) return null;
                     string contents = CgHoverText(sym, sourceLabel);
                     if (string.IsNullOrEmpty(contents)) return null;
                     return WrapResult(new Dictionary<string, object> { { "contents", contents } });
@@ -2163,13 +2436,17 @@ namespace ClarionAssistant.Services
             }
 
             // (4) CodeGraph global symbols (procedures/functions/classes/vars) — project .codegraph.db.
-            MergeDbBarePrefix(primary, seen, prefix, ResolveCodeGraphDb(filePath));
+            // File-level equates are offered only from .inc files the current file includes (see
+            // SymbolIndex.IncludeClosure); null (no filtering) when the closure can't be built.
+            string projectDb = ResolveCodeGraphDb(filePath), libraryDb = ClarionGraphService.ResolveDbPath();
+            var includedFiles = SymbolIndex.IncludeClosure(filePath, new[] { projectDb, libraryDb });
+            MergeDbBarePrefix(primary, seen, prefix, projectDb, includedFiles);
 
             // (5) ClarionGraph static LIBRARY symbols (ABC + library classes, equates) — version-keyed
             // cache (ticket 6e8f2439). Bare-prefix offers class/interface NAMES + equates; ClassName.Method
             // entries are skipped here (they belong to member-access completion). No-op until the version
             // DB is built. Additive + defensive: only ADDS, never overrides an LSP item.
-            MergeDbBarePrefix(primary, seen, prefix, ClarionGraphService.ResolveDbPath());
+            MergeDbBarePrefix(primary, seen, prefix, libraryDb, includedFiles);
 
             // (6) Dictionary TABLE names (e.g. "Cus" → "Customers") from the ingested .schemagraph.db.
             // Deliberately does NOT gate on `seen` — a table name colliding with a code symbol is a rare,
@@ -2197,13 +2474,14 @@ namespace ClarionAssistant.Services
         /// missing or busy. Never throws.
         /// </summary>
         private static void MergeDbBarePrefix(
-            List<LspClient.CompletionItemInfo> primary, HashSet<string> seen, string prefix, string db)
+            List<LspClient.CompletionItemInfo> primary, HashSet<string> seen, string prefix, string db,
+            ISet<string> includedFiles)
         {
             try
             {
                 var idx = SymbolIndex.For(db);
                 if (idx == null) return;
-                foreach (var s in idx.ByPrefix(prefix, 100))
+                foreach (var s in idx.ByPrefix(prefix, 100, equateFiles: includedFiles))
                 {
                     if (s == null || string.IsNullOrEmpty(s.Name) || !seen.Add(s.Name)) continue;
                     primary.Add(SymbolIndex.ToCompletionItem(s));
@@ -2276,9 +2554,18 @@ namespace ClarionAssistant.Services
             var scope = text == null ? null : LocalScopeIndex.GetScope(text, line);
             if (scope == null || scope.Structures.Count == 0) return;
 
+            // The server labels a dotted field with its type ("Address STRING(40)") and inserts the bare
+            // name, so a Label-only guard never matches the bare label AddQualifiedFields adds and every
+            // field is listed twice - the same Label-vs-bare-identifier mismatch as the member-access
+            // dedupe. Only the '.' form keys on InsertText too: for "Pre:partial" the server may insert
+            // just the untyped remainder.
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var it in primary)
-                if (it != null && !string.IsNullOrEmpty(it.Label)) seen.Add(it.Label);
+            {
+                if (it == null) continue;
+                if (!string.IsNullOrEmpty(it.Label)) seen.Add(it.Label);
+                if (sep == '.' && !string.IsNullOrEmpty(it.InsertText)) seen.Add(it.InsertText);
+            }
             scope.AddQualifiedFields(qualifier, sep, partial, seen, primary);
         }
 
@@ -2288,10 +2575,13 @@ namespace ClarionAssistant.Services
         /// class/instance member-access, owned by MergeMemberAccessCompletions). Deliberately does NOT
         /// dedupe against items MergeQualifiedFieldCompletions already added for a same-named in-buffer
         /// GROUP/QUEUE — a hand-coded structure and a dictionary table can legitimately share a PRE, and
-        /// per design both should surface (Detail distinguishes "(field)" vs "(field, dictionary)"). Never
+        /// per design both should surface (Detail distinguishes "(field)" vs "(field, dictionary)"). It DOES
+        /// skip a name the language server itself supplied (<paramref name="serverQualified"/>), lending that
+        /// row the dictionary's detail - otherwise every field both know shows twice (PR #241). Never
         /// throws.</summary>
         private static void MergeDictionaryFieldCompletions(
-            List<LspClient.CompletionItemInfo> primary, string filePath, int line, int character, string bufferText)
+            List<LspClient.CompletionItemInfo> primary, string filePath, int line, int character, string bufferText,
+            Dictionary<string, LspClient.CompletionItemInfo> serverQualified = null)
         {
             string lineText = CgLineAt(bufferText, filePath, line);
             if (lineText == null) return;
@@ -2313,7 +2603,9 @@ namespace ClarionAssistant.Services
                 string db = ResolveSchemaGraphDb(filePath);
                 return string.IsNullOrEmpty(db) ? null : new SchemaGraphService(db).GetQualifierCompletions(qualifier, partial);
             });
-            if (items != null) primary.AddRange(items);
+            if (items == null) return;
+            foreach (var it in items)
+                if (it != null && !ColonQualifierScope.ServerHas(serverQualified, it.Label, it.Detail)) primary.Add(it);
         }
 
         // === Class member-access completion (ticket 6e8f2439, item 5b) ===

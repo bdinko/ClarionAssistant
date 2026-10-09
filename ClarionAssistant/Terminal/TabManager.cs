@@ -97,6 +97,7 @@ namespace ClarionAssistant.Terminal
         public TerminalTab CreateTerminalTab(string name, WebViewTerminalRenderer renderer)
         {
             _terminalCounter++;
+            // "Terminal N" is matched by CaAgentIdentity.IsDefaultTabName: keep the two in step.
             var tab = new TerminalTab
             {
                 Name = string.IsNullOrEmpty(name) ? "Terminal " + _terminalCounter : name,
@@ -179,7 +180,9 @@ namespace ClarionAssistant.Terminal
 
         private void UpdateTabStripVisibility()
         {
-            bool shouldShow = _tabs.Count > 1;
+            // Always shown once Home exists (d4e941e3): hiding it while Home was the only tab made the strip
+            // appear with the first opened tab and vanish again with the last closed one.
+            bool shouldShow = _tabs.Count > 0;
             if (_tabStrip.Visible != shouldShow)
                 _tabStrip.Visible = shouldShow;
         }

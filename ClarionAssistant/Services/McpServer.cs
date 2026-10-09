@@ -25,6 +25,22 @@ namespace ClarionAssistant.Services
         private McpToolRegistry _toolRegistry;
         private int _port;
 
+        // The port Start() was asked for. When it is taken - typically by the previous IDE
+        // still shutting down while the new one starts (upgrade, restart) - the server runs
+        // on a fallback port and keeps trying to add the preferred one, so clients that are
+        // configured with the stable URL (http://localhost:19372/mcp + external token in
+        // ~/.claude.json, e.g. MultiTerminal or Claude Desktop) reconnect without anyone
+        // editing their config. The fallback port stays bound for the sessions launched with it.
+        private int _preferredPort;
+        private volatile int _reclaimedPort;
+        private System.Threading.Timer _reclaimTimer;
+        private const int ReclaimIntervalMs = 10000;
+        // Serialises a reclaim tick against Start/Stop. A tick runs on a pool thread; without this,
+        // one already in flight across a restart could add the port to the NEW listener and then
+        // have Start's reset clear _reclaimedPort (403s on the preferred port), or dispose the new
+        // timer through StopReclaimTimer.
+        private readonly object _reclaimLock = new object();
+
         // (The UI-thread tool timeout moved to McpDispatcher with the dispatch it guards. Left
         // here it would have read as the live knob and silently done nothing when tuned.)
 
@@ -123,6 +139,21 @@ namespace ClarionAssistant.Services
                     };
                     _listenerThread.Start();
 
+                    // 44a1b10c: let the standalone clarion-mcp-server find this pane, to ask it for an open editor's
+                    // text (get_live_text). Removed in Stop.
+                    IdeEndpointRecord.Publish(port, _sessionToken);
+
+                    lock (_reclaimLock)
+                    {
+                        _preferredPort = preferredPort;
+                        _reclaimedPort = 0;
+                        // The listener rides along as the timer state, so a tick can tell it belongs
+                        // to this run and not to one a restart has since replaced.
+                        if (port != preferredPort)
+                            _reclaimTimer = new System.Threading.Timer(TryReclaimPreferredPort, _listener,
+                                                                       ReclaimIntervalMs, ReclaimIntervalMs);
+                    }
+
                     RaiseStatusChanged(true, port);
                     return true;
                 }
@@ -214,6 +245,83 @@ namespace ClarionAssistant.Services
         }
 
         /// <summary>
+        /// Port the server also answers on after reclaiming the preferred port, or 0.
+        /// </summary>
+        public int ReclaimedPort { get { return _reclaimedPort; } }
+
+        /// <summary>
+        /// The port to give external MCP clients: the preferred port once reclaimed (the stable
+        /// URL they are configured with), else the port the server started on.
+        /// </summary>
+        public int ExternalPort { get { int r = _reclaimedPort; return r != 0 ? r : _port; } }
+
+        /// <summary>Every port the server answers on, for status text: "19373" or "19373 + 19372".</summary>
+        public string PortsLabel
+        {
+            get { int r = _reclaimedPort; return r != 0 ? _port + " + " + r : _port.ToString(); }
+        }
+
+        /// <summary>
+        /// Timer callback while the server sits on a fallback port: add the preferred port
+        /// to the running listener as soon as nothing else holds it. HttpListener accepts new
+        /// prefixes while listening; a prefix another process still owns throws and is retried
+        /// on the next tick.
+        /// </summary>
+        private void TryReclaimPreferredPort(object state)
+        {
+            bool reclaimed = false;
+            lock (_reclaimLock)
+            {
+                // A tick from a run that has since been stopped/restarted: the current _reclaimTimer
+                // is not ours (Stop disposed ours), so leave it and the reclaim state alone.
+                if (!ReferenceEquals(state, _listener)) return;
+                if (!_running || _reclaimedPort != 0) { StopReclaimTimer(); return; }
+                string prefix = string.Format("http://localhost:{0}/", _preferredPort);
+                try
+                {
+                    _listener.Prefixes.Add(prefix);
+                    _reclaimedPort = _preferredPort;
+                    StopReclaimTimer();
+                    reclaimed = true;
+                }
+                catch (HttpListenerException)
+                {
+                    try { _listener.Prefixes.Remove(prefix); } catch { }
+                }
+                catch (Exception)
+                {
+                    // Listener stopped/disposed under us - nothing to reclaim.
+                    StopReclaimTimer();
+                }
+            }
+            // Outside the lock: RaiseStatusChanged only BeginInvokes, but keep UI work off it anyway.
+            if (reclaimed) RaiseStatusChanged(true, _port);
+        }
+
+        private void StopReclaimTimer()
+        {
+            var timer = Interlocked.Exchange(ref _reclaimTimer, null);
+            if (timer != null) { try { timer.Dispose(); } catch { } }
+        }
+
+        private bool IsServedPort(int port)
+        {
+            return port == _port || (port != 0 && port == _reclaimedPort);
+        }
+
+        /// <summary>"localhost:&lt;port&gt;" or "127.0.0.1:&lt;port&gt;" for a port this server listens on.</summary>
+        private bool IsLoopbackAuthority(string authority)
+        {
+            if (string.IsNullOrEmpty(authority)) return false;
+            int colon = authority.LastIndexOf(':');
+            if (colon <= 0) return false;
+            int port;
+            if (!int.TryParse(authority.Substring(colon + 1), out port) || !IsServedPort(port)) return false;
+            string name = authority.Substring(0, colon);
+            return string.Equals(name, "localhost", StringComparison.OrdinalIgnoreCase) || name == "127.0.0.1";
+        }
+
+        /// <summary>
         /// Reject requests whose Host header isn't one of our expected loopback
         /// aliases — defends against DNS rebinding where an attacker-controlled
         /// hostname resolves to 127.0.0.1 after the browser has already committed
@@ -222,8 +330,7 @@ namespace ClarionAssistant.Services
         private bool ValidateHost(HttpListenerContext context)
         {
             string host = context.Request.Headers["Host"] ?? "";
-            if (string.Equals(host, "localhost:" + _port, StringComparison.OrdinalIgnoreCase)) return true;
-            if (string.Equals(host, "127.0.0.1:" + _port, StringComparison.OrdinalIgnoreCase)) return true;
+            if (IsLoopbackAuthority(host)) return true;
             try
             {
                 context.Response.StatusCode = 403;
@@ -243,10 +350,9 @@ namespace ClarionAssistant.Services
         {
             string origin = context.Request.Headers["Origin"];
             if (string.IsNullOrEmpty(origin)) return true;
-            string expected1 = "http://localhost:" + _port;
-            string expected2 = "http://127.0.0.1:" + _port;
-            if (string.Equals(origin, expected1, StringComparison.OrdinalIgnoreCase)) return true;
-            if (string.Equals(origin, expected2, StringComparison.OrdinalIgnoreCase)) return true;
+            const string scheme = "http://";
+            if (origin.StartsWith(scheme, StringComparison.OrdinalIgnoreCase)
+                && IsLoopbackAuthority(origin.Substring(scheme.Length))) return true;
             try
             {
                 context.Response.StatusCode = 403;
@@ -258,8 +364,15 @@ namespace ClarionAssistant.Services
 
         public void Stop()
         {
+            bool wasRunning = _running;
             _running = false;
             _sessionToken = null;
+            lock (_reclaimLock)
+            {
+                StopReclaimTimer();
+                _reclaimedPort = 0;
+            }
+            if (wasRunning) IdeEndpointRecord.Remove(_port);   // 44a1b10c: withdraw the endpoint before the port closes
 
             // Close all SSE connections
             foreach (var kvp in _sseClients)
@@ -277,19 +390,21 @@ namespace ClarionAssistant.Services
         public bool IncludeMultiTerminal { get; set; }
         public string MultiTerminalMcpPath { get; set; }
 
+        /// <summary>
+        /// True when the Claude MCP config actually gets a "multiterminal" server: the setting is on
+        /// AND its index.js exists. The one condition both the config below and anything that tells
+        /// the model about MultiTerminal tools (ticket c175492a) must agree on.
+        /// </summary>
+        public bool MultiTerminalConfigured
+        {
+            get { return IncludeMultiTerminal && !string.IsNullOrEmpty(MultiTerminalMcpPath) && File.Exists(MultiTerminalMcpPath); }
+        }
+
         public enum McpConfigFormat
         {
             Claude,
             Copilot
         }
-
-        /// <summary>
-        /// True if the multiterminal-channel plugin .mjs file is present on disk.
-        /// Set by GenerateMcpConfig when it successfully resolves the path.
-        /// AssistantChatControl reads this to decide whether to grant the matching
-        /// tool permissions in --allowedTools.
-        /// </summary>
-        public bool IncludeMultiTerminalChannel { get; private set; }
 
         /// <summary>
         /// Names of user-supplied MCP servers merged in from
@@ -304,7 +419,7 @@ namespace ClarionAssistant.Services
         /// Path to the optional user-owned sidecar that lets developers add MCP servers to
         /// the IDE-pane Claude session without losing them on every regen of mcp-config.json.
         /// Format: { "mcpServers": { "&lt;name&gt;": { ...standard MCP server entry... } } }
-        /// Addin-supplied servers (clarion-assistant, multiterminal, multiterminal-channel) win
+        /// Addin-supplied servers (clarion-assistant, clarion-tools, multiterminal) win
         /// on key collision.
         /// </summary>
         public static string GetMcpExtraConfigPath()
@@ -382,8 +497,7 @@ namespace ClarionAssistant.Services
             }
 
             // Conditionally add MultiTerminal (Claude-only for now)
-            if (format == McpConfigFormat.Claude && IncludeMultiTerminal && !string.IsNullOrEmpty(MultiTerminalMcpPath)
-                && File.Exists(MultiTerminalMcpPath))
+            if (format == McpConfigFormat.Claude && MultiTerminalConfigured)
             {
                 var mt = new Dictionary<string, object>
                 {
@@ -395,8 +509,9 @@ namespace ClarionAssistant.Services
             }
 
             // The editor-agnostic half, served by clarion-mcp-server.exe as its own stdio process
-            // (ticket d051fbd1). Together with the entry above this partitions all 115 tools:
-            // clarion-assistant keeps the 56 that drive the IDE, clarion-tools serves the other 59.
+            // (ticket d051fbd1). Together with the entry above this partitions all the tools (119 as of 44a1b10c;
+            // clarion-mcp-server --selftest prints the live split): clarion-assistant keeps the 58 that drive the
+            // IDE, including get_live_text, which the standalone's lsp_diagnostics calls back; clarion-tools serves the other 61.
             //
             // --strict-mcp-config means the plugin's own clarion-tools entry never reaches this
             // pane, so declaring it here is not a duplicate - it is the ONLY way those tools arrive
@@ -446,39 +561,12 @@ namespace ClarionAssistant.Services
                 }
             }
 
-            // Add the multiterminal-channel MCP server so the embedded Claude receives
-            // real <channel> notifications. Parent-process env vars MULTITERMINAL_NAME
-            // and MULTITERMINAL_DOC_ID are exported from LaunchClaudeForTab per tab and
-            // inherited by this stdio subprocess. --strict-mcp-config blocks user-level
-            // mcpServers entries, so we must include the channel server here explicitly.
-            // THE CHANNEL IS NO LONGER DECLARED HERE. It arrives via --plugin-dir instead, and this
-            // block used to be the reason it did not arrive at all (ticket 7913ead6).
-            //
-            // Claude Code 2.1.265 resolves "--dangerously-load-development-channels server:<name>"
-            // against five PERSISTED config scopes only - enterprise, managed, user, project, local.
-            // A server supplied through --mcp-config is in none of them, so a channel declared here
-            // could never be authorised, and the launch printed
-            //     server:multiterminal-channel - no MCP server configured with that name
-            // The old code was not wrong when written: it put the server here PRECISELY because
-            // --strict-mcp-config blocks user-scope entries. 2.1.265 made those two requirements
-            // mutually exclusive, and the plugin form is the way out of the bind.
-            //
-            // MultiTerminal already does it this way and is unaffected - its terminals carry
-            // "plugin:multiterminal@inline" and declare no channel server in their own --mcp-config.
-            // We now mirror that, so there is exactly ONE channel provider rather than a plugin copy
-            // and a redundant second stdio copy of the same .mjs.
-            //
-            // NOTHING IS LOST BY DROPPING THE ENTRY: both paths resolve the same file in the same
-            // MultiTerminal plugin, so if the plugin is absent there was never a channel to declare.
-            //
-            // IDENTITY NOW RIDES ON INHERITANCE ALONE. The env block above used to declare
-            // MULTITERMINAL_NAME / MULTITERMINAL_DOC_ID explicitly as belt-and-braces alongside
-            // inheritance. The plugin-loaded server inherits them from the pwsh process, which
-            // LaunchClaudeForTab exports per tab (see channelEnv). That is also how MultiTerminal
-            // does it. If a tab ever registers under the wrong identity, this is the first place to
-            // look.
-            IncludeMultiTerminalChannel =
-                (format == McpConfigFormat.Claude) && GetMultiTerminalPluginPath() != null;
+            // NO MULTITERMINAL CHANNEL SERVER, here or anywhere. MultiTerminal retired channels for
+            // native session messaging (ticket b24bcaf4): Claude Code exports
+            // CLAUDE_CODE_MESSAGING_SOCKET/TOKEN into the session, something inside the session hands
+            // them to the broker, and MultiTerminal writes into the live session directly. The
+            // "multiterminal" server above inherits those variables like any stdio child, which is
+            // what lets its register_terminal tool post them.
 
             // Merge user-supplied MCP servers from
             // %APPDATA%\ClarionAssistant\mcp-extra.json. Claude format only —
@@ -520,11 +608,13 @@ namespace ClarionAssistant.Services
         /// The MultiTerminal PLUGIN DIRECTORY, or null when it is not installed:
         /// %USERPROFILE%\.claude\plugins\marketplaces\multiterminal-marketplace\plugins\multiterminal
         ///
-        /// This is what gets passed to --plugin-dir, and the channel server lives INSIDE it at
-        /// server\multiterminal-channel.mjs. Presence of that file is the gate, which is the same
-        /// test MultiTerminal itself applies before emitting the channels flag; a plugin folder
-        /// without a server\ subtree cannot serve a channel, and claiming otherwise would produce a
-        /// flag naming a channel that never registers.
+        /// This is what gets passed to --plugin-dir. The gate is the plugin MANIFEST
+        /// (.claude-plugin\plugin.json), i.e. "is this a loadable plugin", and nothing inside it.
+        /// It used to be server\multiterminal-channel.mjs, the channel server; MultiTerminal deleted
+        /// that when it retired channels for native session messaging (plugin f560d72), and the old
+        /// gate then returned null on every machine with a current plugin, silently launching every
+        /// CA tab with no MultiTerminal plugin at all (ticket b24bcaf4). Gating on a feature file
+        /// ties CA to that feature's lifetime; gate on the plugin.
         ///
         /// THE LAST PATH SEGMENT IS LOAD-BEARING - DO NOT "SIMPLIFY" IT TO THE PARENT. Claude Code
         /// treats a --plugin-dir pointing at a FOLDER OF PLUGINS as "load every child", so trimming
@@ -532,9 +622,6 @@ namespace ClarionAssistant.Services
         /// holds exactly one entry today, so both spellings behave identically right now - which is
         /// what would make the change look correct, test clean, and only misbehave the day a second
         /// plugin is added. Flagged by Alice, who owns the MultiTerminal side (ticket c9285d2a).
-        ///
-        /// The DIRECTORY BASENAME is also the token before the '@' in the channels flag, so callers
-        /// derive that from this path rather than hard-coding "multiterminal" twice.
         /// </summary>
         public static string GetMultiTerminalPluginPath()
         {
@@ -545,7 +632,7 @@ namespace ClarionAssistant.Services
 
                 string pluginRoot = Path.Combine(userProfile, ".claude", "plugins", "marketplaces",
                     "multiterminal-marketplace", "plugins", "multiterminal");
-                if (File.Exists(Path.Combine(pluginRoot, "server", "multiterminal-channel.mjs")))
+                if (File.Exists(Path.Combine(pluginRoot, ".claude-plugin", "plugin.json")))
                     return pluginRoot;
             }
             catch { }

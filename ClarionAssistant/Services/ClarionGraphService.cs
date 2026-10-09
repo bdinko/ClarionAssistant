@@ -47,7 +47,9 @@ namespace ClarionAssistant.Services
         // DBs built by an older parser are treated as stale and auto-rebuilt (LibSrc mtimes alone can't detect
         // a parser change). v2: capture CLASS data members (dotted "Class.Member"); member queries dotted-only.
         // v3: index keycodes.clw + errors.clw equates (MouseRight, NoFileErr, …) so F12/hover resolve them.
-        private const int ParserVersion = 3;
+        // v4: index file-level EQUATEs in library .inc files (declared outside any CLASS body).
+        // v5: ITEMIZE members named Prefix:Name under PRE (were bare), value-less members indexed.
+        private const int ParserVersion = 5;
 
         // Flat equate files (no class structure) — ingested via the dedicated EQUATE scan. keycodes.clw
         // (MouseRight, Key* …) and errors.clw (NoFileErr, …) added so their equates resolve for F12/hover. (task 37e2079f)
@@ -276,7 +278,7 @@ namespace ClarionAssistant.Services
                 result.DbPath = dbPath;
 
                 // Never resolve silently: record which version (and which source chose it) this DB is for.
-                try { result.VersionSource = EffectiveClarionVersion.Resolve().Describe(); } catch { }
+                try { result.VersionSource = EffectiveClarionVersion.DescribeCurrent(); } catch { }
                 LspTrace.Write("[ClarionGraph] " + dbPath + " - " + (result.VersionSource ?? "(version source unknown)"));
 
                 // Reuse the cached DB unless forced — and only if it was built from THIS version's LibSrc.
@@ -356,6 +358,11 @@ namespace ClarionAssistant.Services
 
                         foreach (string incPath in incFiles)
                         {
+                            // A flat equate file that is also a .inc (winerr.inc) is ingested by the EQUATE scan
+                            // below; since v4 ParseIncFile also emits file-level equates, parsing it here too would
+                            // index every one of them twice (PR #243 review). It declares no classes.
+                            if (Array.Exists(EquateFileNames, n => string.Equals(n, Path.GetFileName(incPath), StringComparison.OrdinalIgnoreCase)))
+                                continue;
                             try
                             {
                                 var pr = parser.ParseIncFile(incPath, projectId);
@@ -428,6 +435,7 @@ namespace ClarionAssistant.Services
             try { lines = EncodingHelper.ReadAllLines(filePath, out _); }
             catch { return 0; }
 
+            var itemize = new ClarionParser.ItemizeScope();
             for (int i = 0; i < lines.Length; i++)
             {
                 string line = lines[i].Trim();
@@ -436,6 +444,30 @@ namespace ClarionAssistant.Services
 
                 int commentIdx = line.IndexOf('!');
                 string codePart = commentIdx >= 0 ? line.Substring(0, commentIdx).Trim() : line;
+
+                // ITEMIZE members are named Prefix:Name under PRE(Prefix) and may omit their value.
+                if (itemize.TryClose(codePart) || itemize.TryOpen(codePart))
+                    continue;
+                if (itemize.IsOpen)
+                {
+                    string itemName = itemize.MemberName(codePart);
+                    if (itemName != null)
+                    {
+                        db.InsertSymbol(new ClarionSymbol
+                        {
+                            Name = itemName,
+                            Type = "variable",
+                            FilePath = filePath,
+                            LineNumber = i + 1,
+                            ProjectId = projectId,
+                            Params = "EQUATE",
+                            Scope = "global",
+                            SourcePreview = codePart
+                        });
+                        count++;
+                    }
+                    continue;
+                }
 
                 var match = EquateRegex.Match(codePart);
                 if (match.Success)

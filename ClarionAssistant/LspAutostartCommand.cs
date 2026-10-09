@@ -18,7 +18,9 @@ namespace ClarionAssistant
     ///   (b) starts immediately if a solution is already restored,
     ///   (c) subscribes to ProjectService.SolutionLoaded to start on later solution loads,
     ///   (d) keeps a low-frequency fallback timer that retries while no server is running
-    ///       and a solution is open (idempotent).
+    ///       and a solution is open (idempotent),
+    ///   (e) follows Build &gt; Set Clarion Version: reloads the .red and restarts the server on a switch
+    ///       (905928c7; that too was chat-only).
     ///
     /// Everything is guarded — this MUST NOT throw at workbench load, and it must NOT
     /// construct AssistantChatControl or any pad.
@@ -44,6 +46,12 @@ namespace ClarionAssistant
         private static Delegate _solutionClosedHandler;
         private static System.Windows.Forms.Timer _fallbackTimer;
 
+        // 905928c7: follows Build > Set Clarion Version with or without a CA chat tab. Rooted with its
+        // PropertyChanged handler (PropertyService.PropertyChanged is static).
+        private static IdeVersionFollower _versionFollower;
+        private static PropertyChangedEventHandler _versionHandler;
+        private static System.Threading.SynchronizationContext _uiContext;
+
         public void Run()
         {
             // 1c685f2e item 8: a node crash or a dead reader loop gets a line in monaco-spike.log, beside
@@ -53,6 +61,13 @@ namespace ClarionAssistant
             // The local layer's databases (both Monaco surfaces): the solution's CodeGraph and the ClarionGraph library.
             LocalLayerHandlers.ProjectDbPath = () => { var p = SharedLspBridge.CodeGraphDbPathProvider; return p != null ? p() : null; };
             LocalLayerHandlers.LibraryDbPath = ClarionGraphService.ResolveDbPath;
+            // f64ba833: where the walk-up starts when a surface has no real module path (a CA Embeditor whose
+            // module context wasn't captured): the IDE's open solution folder.
+            LocalLayerHandlers.SolutionDirPath = () =>
+            {
+                string sln = EditorService.GetOpenSolutionPath();
+                return string.IsNullOrEmpty(sln) ? null : System.IO.Path.GetDirectoryName(sln);
+            };
 
             // 1c685f2e L2 (pre-existing on master 2fcb940): the LSP never started unless a CA chat tab had opened.
             // Every start funnels through LspService.EnsureRunning, which takes the solution from
@@ -62,6 +77,53 @@ namespace ClarionAssistant
             if (LspService.SolutionPathProvider == null)
                 LspService.SolutionPathProvider = () => EditorService.GetOpenSolutionPath();
             LspService.StartLog = MonacoSpikeLog.Write;   // [lsp-autostart] start|skip reason=
+
+            // 44a1b10c: lsp_diagnostics checks an open editor's text, not the disk. Here, not in the chat panel, so it
+            // works with no chat tab (the chat-only-initialization trap); Run() is on the UI thread, whose context the
+            // provider posts its embeditor reads to.
+            try { EditorLiveTextProvider.Register(); }
+            catch (Exception ex) { Debug.WriteLine("[LspAutostart] live-text provider failed: " + ex.Message); }
+
+            // fc420c30: the MCP editor tools reach the CA Editor (Monaco) instead of the native document hidden under it.
+            // At addin start, on the UI thread, so it works with no chat tab and the router knows the UI thread.
+            try
+            {
+                EditorToolRouter.UiThreadId = System.Threading.Thread.CurrentThread.ManagedThreadId;
+                // 73bd1f03 fix (2): composed, not replaced. The CA Editor of the active view first; else the CA
+                // Embeditor overlay when the active view is the native embeditor it covers.
+                EditorToolRouter.ActiveOverlayResolver = () =>
+                    MonacoClarionEditor.ResolveActiveOverlay() ?? Terminal.ModernEmbeditorViewContent.ResolveCoveredEmbedOverlay();
+                EditorToolRouter.OpenFilesAdjuster = MonacoClarionEditor.MarkOverlayDirty;
+                EditorToolRouter.Log = MonacoSpikeLog.Write;
+                // open_file waits for the CA Editor's page too when one will take the file (the overlay's own rule).
+                EditorToolRouter.OverlayExpectedFor = path => MonacoSourceOverlay.Enabled && CaEditorSettings.SourceAppliesTo(path);
+                // ...and activates an already-open tab at both levels: select it, then focus its editor.
+                EditorToolRouter.FocusTab = MonacoClarionEditor.FocusTabFor;
+
+                // 73bd1f03 fix (2): the embed tools reach the CA Embeditor's Monaco buffer while it holds the procedure.
+                EmbedToolRouter.LiveEmbedResolver = Terminal.ModernEmbeditorViewContent.ResolveLiveEmbedChannel;
+                EmbedToolRouter.NativeEmbedColumn = line => new AppTreeService().GetEmbedColumn(line);
+                EmbedToolRouter.Log = MonacoSpikeLog.Write;
+                // A native write names its procedure: the col-0 PROCEDURE of the open embeditor's own buffer
+                // (the same source-derived name the CA Embeditor uses; never the temp pwee file name).
+                EmbedToolRouter.NativeEmbedProcedure = () =>
+                {
+                    string title, source, error;
+                    System.Collections.Generic.List<int[]> ranges;
+                    return EmbeditorCompletionService.TryGetActiveEmbeditorSource(out title, out source, out ranges, out error)
+                        ? ModernEmbeditorLauncher.ProcNameFromSource(source, null) : null;
+                };
+                McpToolRegistry.EmbedRoutableProbe = () => Terminal.ModernEmbeditorViewContent.EmbedRoutingReady;
+            }
+            catch (Exception ex) { Debug.WriteLine("[LspAutostart] editor router failed: " + ex.Message); }
+
+            try
+            {
+                // (e) Seed and subscribe BEFORE any start below (pipeline run 1): a seed taken after a start
+                // could absorb a version change that start had missed, and nothing would restart the server.
+                StartVersionFollower();
+            }
+            catch (Exception ex) { Debug.WriteLine("[LspAutostart] version follower failed: " + ex.Message); }
 
             try
             {
@@ -95,6 +157,88 @@ namespace ClarionAssistant
                 StartFallbackTimer();
             }
             catch (Exception ex) { Debug.WriteLine("[LspAutostart] fallback timer failed: " + ex.Message); }
+        }
+
+        /// <summary>
+        /// 905928c7: follow the IDE's Build &gt; Set Clarion Version from addin start. It used to be followed
+        /// only by AssistantChatControl.SyncVersionWithIde, so with no CA chat tab a switch left the language
+        /// server on the old version's paths and the .red unchanged. Clarion's Versions.SetActiveVersion (the
+        /// menu command) and SetActiveVersionFromSolution both end in PropertyService.Set("Clarion.Version"),
+        /// which raises PropertyChanged; the 5 s fallback tick re-checks, so a missed event only delays it.
+        /// The chat panel keeps its own header refresh and leaves the restart to this.
+        /// </summary>
+        private static void StartVersionFollower()
+        {
+            if (_versionFollower != null) return;
+
+            // 0ce0b5e2: the record this IDE publishes for the standalone clarion-mcp-server carries the IDE's live
+            // version choice - which the IDE restored from the solution's own preferences when it opened it - and
+            // the config dir holding those preferences. The standalone cannot read either for itself.
+            IdeSolutionRecord.VersionChoiceProvider = () =>
+            {
+                string live;
+                return ClarionVersionService.TryGetLiveIdeVersionName(out live)
+                    ? ClarionVersionSelector.NormalizeIdeChoice(live) : null;
+            };
+            IdeSolutionRecord.ConfigDirProvider = ClarionConfigDirectory.Resolve;
+
+            // Run() is a /Workspace/Autostart command, so this is the UI thread with the workbench's
+            // WindowsFormsSynchronizationContext installed. Without one the handler below runs inline
+            // (after the IDE has stored the new value), which is still correct.
+            _uiContext = System.Threading.SynchronizationContext.Current;
+            _versionFollower = new IdeVersionFollower();
+            _versionFollower.Changed += OnIdeVersionChanged;
+            CheckIdeVersion();   // seeds
+
+            _versionHandler = (s, e) =>
+            {
+                try
+                {
+                    if (e == null || e.Key != "Clarion.Version") return;
+                    // Posted, even on the UI thread: run after the IDE has finished its own switch.
+                    var ctx = _uiContext;
+                    if (ctx != null) ctx.Post(_ => CheckIdeVersion(), null);
+                    else CheckIdeVersion();
+                }
+                catch { }
+            };
+            PropertyService.PropertyChanged += _versionHandler;
+        }
+
+        /// <summary>One PropertyService read; raises OnIdeVersionChanged when the choice moved. Never throws.</summary>
+        private static void CheckIdeVersion()
+        {
+            try
+            {
+                var f = _versionFollower;
+                string live;
+                if (f == null || !ClarionVersionService.TryGetLiveIdeVersionName(out live)) return;
+                f.Observe(live);
+            }
+            catch (Exception ex) { Debug.WriteLine("[LspAutostart] version check failed: " + ex.Message); }
+        }
+
+        private static void OnIdeVersionChanged(string was, string now)
+        {
+            try
+            {
+                var sel = EffectiveClarionVersion.Resolve();
+                string name = sel.Config != null ? sel.Config.Name : null;
+                MonacoSpikeLog.Write("[version-follow] IDE Build > Set Clarion Version: " + was + " -> " + now
+                    + "; " + sel.Describe());
+                // Watchers keyed on the version (Data pad environment, library graph memo) — the chat panel
+                // was the only thing bumping these.
+                ClarionGraphService.InvalidateVersionCache();
+                EffectiveClarionVersion.NotifyChanged();
+                // The .red: keyed on version + .red path + solution, so this reloads only on a real change.
+                ModernEmbeditorLauncher.EnsureRedirectionLoaded();
+                // The server takes its .red and library paths once, at start. No-op when nothing is running,
+                // when it already serves this version, or while the shared ClarionLsp addin owns the LSP.
+                LspService.RestartIfVersionChanged(name);
+                // And tell the standalone clarion-mcp-server now, not at the next solution poll (0ce0b5e2).
+                IdeSolutionRecord.Republish();
+            }
+            catch (Exception ex) { MonacoSpikeLog.Write("[version-follow] failed: " + ex.Message); }
         }
 
         /// <summary>
@@ -197,6 +341,16 @@ namespace ClarionAssistant
             _fallbackTimer = new System.Windows.Forms.Timer { Interval = 5000 };
             _fallbackTimer.Tick += (s, e) =>
             {
+                try
+                {
+                    // Backstop for the Clarion.Version event, ahead of the shared-LSP return: the .red and the
+                    // version watchers follow the IDE even while the shared ClarionLsp addin owns the server.
+                    CheckIdeVersion();
+                    // f3b47441: a .red that failed to load is retried (throttled to 30 s inside).
+                    ModernEmbeditorLauncher.RetryRedirectionIfDue();
+                }
+                catch (Exception ex) { Debug.WriteLine("[LspAutostart] version/.red tick failed: " + ex.Message); }
+
                 try
                 {
                     // Single-process reconciliation: if the shared ClarionLsp server is now active
