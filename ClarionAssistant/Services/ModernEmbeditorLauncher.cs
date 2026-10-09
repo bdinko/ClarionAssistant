@@ -11,18 +11,105 @@ namespace ClarionAssistant.Services
     /// <summary>
     /// Path B multi-editor: open a procedure's embed source in a Monaco view via the mirror+snapshot
     /// model. Clarion's native generator allows only ONE embeditor at a time, so for each procedure we:
-    ///   1. OpenProcedureEmbed(name)  — native generation + Clarion's embeditor (transient)
+    ///   1. OpenProcedureEmbedChecked — native generation + Clarion's embeditor (transient), verified (a964cde3)
     ///   2. mirror the live buffer (source + editable-region map)
     ///   3. CancelEmbeditor()         — discard/close to release the native single-embeditor lock
     ///   4. ShowView(new ModernEmbeditorViewContent)
     /// The snapshot lives in our own tab, so any number of procedures can be open at once.
     ///
-    /// MUST run on the UI thread (OpenProcedureEmbed drives native focus + Application.DoEvents).
+    /// MUST run on the UI thread (the open drives native focus + Application.DoEvents).
     /// Snapshots are read-only-of-truth for now; the save round-trip (re-open → write → save → close)
     /// is M2. If the .app is regenerated underneath, an open snapshot can go stale (reload to refresh).
     /// </summary>
     public static class ModernEmbeditorLauncher
     {
+        /// <summary>
+        /// f64ba833: make sure a redirection file is loaded before EmbedLspContext.TryCapture looks for the
+        /// generated module. RedFileService.Active was loaded only by the CA chat panel, so with no chat tab
+        /// (or before it loaded) the lookup had no .red: on v61PRM004 the module lives in .\Source (from
+        /// CLARION120.red's "*.clw = .\Source"), and capture failed with "module 'PRM002023.clw' not found
+        /// beside ...PRM002.app or via the .red". The embeditor then had no real module path: no CodeGraph
+        /// DB for its local layer and a synthetic document for the LSP. Loads the IDE's effective version's
+        /// .red for the open solution, exactly as the chat panel does.
+        ///
+        /// Keyed on WHICH .red should be in force (effective version, its .red path, solution folder), not on
+        /// "is one loaded": the chat panel was also the only thing that reloaded the .red after Build > Set
+        /// Clarion Version, so without a chat tab a version or solution switch would keep the old file.
+        /// Re-resolving the version is an XML parse, once per embed open. LspAutostartCommand also calls it
+        /// when the IDE's version moves (905928c7), so the .red follows a switch before the next embed open.
+        ///
+        /// A failed load here leaves no stale .red in force (LoadForProject fails closed, f3b47441), and
+        /// <see cref="RetryRedirectionIfDue"/> tries again from the 5 s tick until one loads here, or another
+        /// caller (the chat panel, the Data pad) has put this version's .red in force.
+        /// </summary>
+        private static string _redKey;
+
+        /// <summary>True while this launcher's last attempt loaded nothing and no .red for the effective
+        /// version is in force; cleared by a successful load, here or by another caller.</summary>
+        private static bool _redLoadFailed;
+        private static int _redLastAttemptTick;
+        private static string _redLastOutcome;
+        private const int RedRetryIntervalMs = 30000;
+
+        internal static void EnsureRedirectionLoaded()
+        {
+            ClarionVersionConfig cfg = null;
+            try
+            {
+                cfg = EffectiveClarionVersion.CurrentConfig();
+                string sln = EditorService.GetOpenSolutionPath();
+                string slnDir = string.IsNullOrEmpty(sln) ? null : System.IO.Path.GetDirectoryName(sln);
+                string key = (cfg != null ? cfg.Name + "|" + cfg.RedFilePath : "none") + "|" + slnDir;
+                if (RedFileService.Active != null && string.Equals(key, _redKey, StringComparison.OrdinalIgnoreCase)) return;
+
+                string was = RedFileService.Active != null ? RedFileService.Active.RedFilePath : "none";
+                var red = new RedFileService();
+                bool ok = red.LoadForProject(slnDir, cfg);   // makes it Active; a failure clears a stale Active
+                _redKey = ok ? key : null;
+                // Another caller may already hold THIS version's .red (LoadForProject kept it): then there is
+                // nothing to recover, and retrying would only repeat this caller's failure.
+                var active = RedFileService.Active;
+                bool covered = !ok && active != null && cfg != null
+                    && string.Equals(active.LoadedForVersion, cfg.Name, StringComparison.OrdinalIgnoreCase);
+                _redLoadFailed = !ok && !covered;
+                _redLastAttemptTick = Environment.TickCount;
+
+                // One line per outcome, not per attempt: a retry that fails the same way stays quiet. A
+                // solution switch that lands on the same version and the same .red is deliberately not logged.
+                string outcome = (cfg != null ? cfg.Name : "not resolved") + "|"
+                    + (ok ? red.RedFilePath : covered ? "kept " + active.RedFilePath : "nothing loaded");
+                if (string.Equals(outcome, _redLastOutcome, StringComparison.OrdinalIgnoreCase)) return;
+                _redLastOutcome = outcome;
+                string from = cfg != null && !string.IsNullOrEmpty(cfg.RedFilePath) ? " from " + cfg.RedFilePath : "";
+                MonacoSpikeLog.Write("[embed-ctx] .red for version '" + (cfg != null ? cfg.Name : "not resolved") + "': "
+                    + (ok ? red.RedFilePath + " (was " + was + ")"
+                       : covered ? "nothing loaded" + from + "; keeping " + active.RedFilePath + " (same version, loaded by another caller)"
+                       : "nothing loaded" + from + "; no .red in force (was " + was + "), retrying every " + (RedRetryIntervalMs / 1000) + " s"));
+            }
+            catch (Exception ex)
+            {
+                // Fail closed here too (f3b47441 pipeline run 1): an exception is a failed load, and it must
+                // leave recovery scheduled rather than the previous version's .red in force.
+                _redKey = null;
+                _redLoadFailed = true;
+                _redLastAttemptTick = Environment.TickCount;
+                try { RedFileService.ClearActiveUnlessFor(cfg != null ? cfg.Name : null); } catch { }
+                MonacoSpikeLog.Write("[embed-ctx] .red load failed: " + ex.Message + "; retrying every " + (RedRetryIntervalMs / 1000) + " s");
+            }
+        }
+
+        /// <summary>
+        /// Called from LspAutostartCommand's 5 s tick: after a failed load (a .red missing, or held open by
+        /// an editor), try again at most every 30 s so it recovers without waiting for the next embed open or
+        /// version switch. A no-op until a load has failed. UI thread.
+        /// </summary>
+        internal static void RetryRedirectionIfDue()
+        {
+            if (!_redLoadFailed) return;
+            if (unchecked(Environment.TickCount - _redLastAttemptTick) < RedRetryIntervalMs) return;
+            EnsureRedirectionLoaded();
+        }
+
         /// <summary>Opens one procedure as a Monaco snapshot tab. Returns null on success, else an error message.</summary>
         public static string OpenProcedure(string procName, bool isDark)
         {
@@ -46,7 +133,9 @@ namespace ClarionAssistant.Services
                 // #56: capture the real-module LSP context NOW — PweeEditorDetails only exists while the
                 // native embeditor is open, and CancelEmbeditor below tears it down.
                 EmbedLspContext lspCtx = null;
+                EnsureRedirectionLoaded();   // f64ba833
                 try { lspCtx = EmbedLspContext.TryCapture(appTree); } catch { }
+                MonacoSpikeLog.Write("[embed-ctx] " + (EmbedLspContext.LastCaptureResult ?? "?"));   // f64ba833: a failed capture used to be silent
 
                 // OpenAndMirror leaves the embeditor open; we made no edits, so discard/close to free the lock.
                 try { appTree.CancelEmbeditor(); } catch { }
@@ -131,8 +220,12 @@ namespace ClarionAssistant.Services
                 // the ACTIVE embed's assembled source + editable-range map (Document.CustomLineManager.CustomLines).
                 string title, source, ferr;
                 List<int[]> ranges;
-                if (!EmbeditorCompletionService.TryGetActiveEmbeditorSource(out title, out source, out ranges, out ferr))
+                bool gotSource;
+                using (MemoryHeadroom.Phase("M1 readSource"))   // 1d8d1c49
+                    gotSource = EmbeditorCompletionService.TryGetActiveEmbeditorSource(out title, out source, out ranges, out ferr);
+                if (!gotSource)
                 { RemoveCover(preCover); return "Could not read the open embed source: " + ferr; }
+                MemoryHeadroom.MarkSettledSoon("embed chars=" + (source != null ? source.Length : 0));
 
                 // Authoritative proc name from source (cardinal rule #7 — never the temp pwee FileName/caption).
                 List<string> knownProcs = null;
@@ -151,7 +244,9 @@ namespace ClarionAssistant.Services
                 // #56: capture the real-module LSP context from the live embed (it stays open in overlay
                 // mode, but capture eagerly for symmetry with the snapshot path).
                 EmbedLspContext lspCtx = null;
+                EnsureRedirectionLoaded();   // f64ba833
                 try { lspCtx = EmbedLspContext.TryCapture(appTree); } catch { }
+                MonacoSpikeLog.Write("[embed-ctx] " + (EmbedLspContext.LastCaptureResult ?? "?"));   // f64ba833: a failed capture used to be silent
 
                 // Read the native caret position NOW (before the embed closes under us) so Monaco lands at the
                 // embed point the developer had the cursor on — not the last-saved cursor for this procedure.
@@ -267,41 +362,27 @@ namespace ClarionAssistant.Services
             EnterBusy();
             try
             {
-            for (int attempt = 0; attempt < CharDelaysMs.Length; attempt++)
+            if (!WaitForEmbedClosed(appTree, 3000))
+            { error = "An embeditor is still open; close it and try again."; return false; }
+
+            // a964cde3: the verified open. It brings the app tree forward (so it works while a Modern
+            // Embeditor or CA Editor tab is the active document), types the name at a quick speed then a slower
+            // one, checks the tree selection before clicking and the opened procedure's NAME after: a wrong
+            // procedure is cancelled without saving. This replaced a "the source mentions the name" check that
+            // a procedure merely CALLING the target passed.
+            var opened = appTree.OpenProcedureEmbedChecked(procName, CharDelaysMs);
+            if (!opened.Ok) { error = opened.Message; return false; }
+
+            string title, ferr;
+            if (!EmbeditorCompletionService.TryGetActiveEmbeditorSource(out title, out source, out ranges, out ferr))
             {
-                if (!WaitForEmbedClosed(appTree, 3000))
-                { error = "An embeditor is still open; close it and try again."; return false; }
-
-                // Bring the app tree to the front so the native automation works even when a Modern
-                // Embeditor tab is the active document.
-                appTree.ActivateAppView();
-                appTree.OpenProcedureEmbed(procName, CharDelaysMs[attempt]);
-
-                // First open loads the ABC libraries and can take many seconds; wait generously.
-                if (!WaitForEmbedOpen(appTree, 45000))
-                {
-                    try { appTree.CancelEmbeditor(); } catch { }
-                    error = "Embeditor did not open for '" + procName + "' within 45s.";
-                    continue;
-                }
-
-                string title, ferr;
-                if (!EmbeditorCompletionService.TryGetActiveEmbeditorSource(out title, out source, out ranges, out ferr))
-                {
-                    try { appTree.CancelEmbeditor(); } catch { }
-                    error = "Could not read embed source for '" + procName + "': " + ferr;
-                    continue;
-                }
-
-                if (SourceMentionsProcedure(source, procName))
-                    return true; // correct procedure — leave the embeditor open
-
-                // Wrong procedure: keystrokes were dropped at this speed. Close and retry slower.
                 try { appTree.CancelEmbeditor(); } catch { }
-                error = "Opened a different procedure than '" + procName + "' — the locator search missed.";
+                WaitForEmbedClosed(appTree, 3000);
+                error = "Could not read embed source for '" + procName + "': " + ferr;
                 source = null; ranges = null;
+                return false;
             }
-            return false;
+            return true; // correct procedure — leave the embeditor open
             }
             finally { LeaveBusy(); }
         }
@@ -312,12 +393,10 @@ namespace ClarionAssistant.Services
         /// open is unreliable, so the developer-opened editor is often the only handle that worked — refusing
         /// it makes the round-trip unusable in the case that needs it most.
         ///
-        /// The identity check here is deliberately STRICTER than the post-open sanity check in
-        /// <see cref="OpenAndMirror"/>. That one only asks whether the name appears anywhere in the source,
-        /// which is sound after WE typed the name into the locator (a mis-select is the unlikely branch).
-        /// Here the editor was opened by someone else, so a bare mention could just as well be a CALL to the
-        /// target from an unrelated procedure. We therefore take the column-0 declaration via
-        /// <see cref="ProcNameFromSource"/> and require an exact name match.
+        /// The identity check here requires an exact name, like the one <see cref="OpenAndMirror"/> gets from
+        /// ProcedureOpenFlow (a964cde3; it used to accept any mention of the name in the source). A bare mention
+        /// could just as well be a CALL to the target from an unrelated procedure, so we take the column-0
+        /// declaration via <see cref="ProcNameFromSource"/> and require an exact name match.
         ///
         /// It is also refused - see <see cref="EmbedAdoptPolicy"/>, which makes the decision - when the CA
         /// Embeditor (Monaco overlay or live tab) holds the embed, or when the native buffer has unsaved changes
@@ -432,23 +511,6 @@ namespace ClarionAssistant.Services
             foreach (var n in names)
                 if (string.Equals(n, name, StringComparison.OrdinalIgnoreCase)) return true;
             return false;
-        }
-
-        /// <summary>
-        /// Sanity check that the assembled embed source belongs to the procedure: its own name appears in
-        /// its generated source (e.g. "Name PROCEDURE"), so if it's absent we almost certainly opened the
-        /// wrong procedure.
-        /// </summary>
-        private static bool SourceMentionsProcedure(string source, string procName)
-        {
-            if (string.IsNullOrEmpty(source) || string.IsNullOrWhiteSpace(procName)) return false;
-            try
-            {
-                return System.Text.RegularExpressions.Regex.IsMatch(
-                    source, @"\b" + System.Text.RegularExpressions.Regex.Escape(procName) + @"\b",
-                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-            }
-            catch { return source.IndexOf(procName, StringComparison.OrdinalIgnoreCase) >= 0; }
         }
 
         // The native embed/ABC open + close are driven by the UI-thread MESSAGE LOOP. The old coarse

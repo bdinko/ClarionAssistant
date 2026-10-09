@@ -139,6 +139,9 @@
     <Compile Include="Services\ExecutionLineGate.cs" />
     <Compile Include="Services\ActiveProcedureContext.cs" />
     <Compile Include="Services\EditorService.cs" />
+    <Compile Include="Services\EditorTextOps.cs" />
+    <Compile Include="Services\EditorToolRouter.cs" />
+    <Compile Include="Services\HostRequestBroker.cs" />
     <Compile Include="Services\ClarionSourceText.cs" />
     <Compile Include="Services\SettingsService.cs" />
     <Compile Include="Services\CaEditorSettings.cs" />
@@ -158,6 +161,9 @@
     <Compile Include="Services\FileSchemaScopeReader.cs" />
     <Compile Include="Services\ClarionDeclarationParser.cs" />
     <Compile Include="Services\EmbedEditorMonitorService.cs" />
+    <Compile Include="Services\MemoryHeadroom.cs" />
+    <Compile Include="Services\TextLines.cs" />
+    <Compile Include="Services\JsonTextStream.cs" />
     <Compile Include="Services\ShutdownLog.cs" />
     <Compile Include="Services\ShutdownService.cs" />
     <Compile Include="Services\WebView2ProcessReaper.cs" />
@@ -165,14 +171,19 @@
     <Compile Include="Services\ClarionConfigDirectory.cs" />
     <Compile Include="Services\ClarionVersionService.cs" />
     <Compile Include="Services\EffectiveClarionVersion.cs" />
+    <Compile Include="Services\SolutionVersionResolver.cs" />
+    <Compile Include="Services\IdeVersionFollower.cs" />
     <Compile Include="Services\LspStartGate.cs" />
     <Compile Include="Services\RedFileService.cs" />
     <Compile Include="Services\LspTrace.cs" />
     <Compile Include="Services\LspClient.cs" />
+    <Compile Include="Services\LspTextDiff.cs" />
     <Compile Include="Services\LspService.cs" />
     <Compile Include="Services\LspStartResult.cs" />
     <Compile Include="Services\IdeSolutionRecord.cs" />
+    <Compile Include="Services\IdeEndpointRecord.cs" />
     <Compile Include="Services\SharedLspBridge.cs" />
+    <Compile Include="Services\ColonQualifierScope.cs" />
     <Compile Include="Services\LocalScopeIndex.cs" />
     <Compile Include="Services\SymbolIndex.cs" />
     <Compile Include="Services\LiveDictionaryIndex.cs" />
@@ -185,7 +196,9 @@
     <Compile Include="ShowModernEmbeditorCommand.cs" />
     <Compile Include="ClarionBindingAssemblyResolver.cs" />
     <Compile Include="LspAutostartCommand.cs" />
+    <Compile Include="EditorLiveTextProvider.cs" />
     <Compile Include="SaveSourceEditorsBeforeBuildCommand.cs" />
+    <Compile Include="ActiveDocumentRestoreCommand.cs" />
     <Compile Include="EmbedEditorMonitorAutostartCommand.cs" />
     <Compile Include="ShutdownTerminateCommand.cs" />
     <Compile Include="OpenModernEmbeditorPickerCommand.cs" />
@@ -200,7 +213,13 @@
     <Compile Include="Services\ModernEmbeditorLauncher.cs" />
     <Compile Include="Services\ModernEmbeditorSaver.cs" />
     <Compile Include="Services\EmbedAdoptPolicy.cs" />
+    <Compile Include="Services\EmbedOverlayGuard.cs" />
+    <Compile Include="Services\EmbedToolRouter.cs" />
+    <Compile Include="Services\EmbedSlotText.cs" />
     <Compile Include="Services\EmbedApplyFlow.cs" />
+    <Compile Include="Services\EmbedSaveFlow.cs" />
+    <Compile Include="Services\EmbedRecovery.cs" />
+    <Compile Include="Services\ProcedureOpenFlow.cs" />
     <Compile Include="Services\ModernEmbeditorDiagnostics.cs" />
     <Compile Include="Services\LocalLayerHandlers.cs" />
     <Compile Include="Services\WebMessageGuard.cs" />
@@ -218,6 +237,7 @@
     <Compile Include="Dialogs\ModernEmbeditorPickerDialog.cs" />
     <Compile Include="Dialogs\ClaudeChatSettingsDialog.cs" />
     <Compile Include="Dialogs\CheatSheetDialog.cs" />
+    <Compile Include="Dialogs\CreateProjectFolderDialog.cs" />
     <Compile Include="Terminal\NativeMethods.cs" />
     <Compile Include="Terminal\ConPtyTerminal.cs" />
     <Compile Include="Terminal\WebViewTerminalRenderer.cs" />
@@ -227,6 +247,7 @@
     <Compile Include="Terminal\SolutionStamp.cs" />
     <Compile Include="Terminal\HomeWebView.cs" />
     <Compile Include="Terminal\CreateClassWebView.cs" />
+    <Compile Include="Terminal\ProjectsWebView.cs" />
     <Compile Include="Terminal\TerminalTab.cs" />
     <Compile Include="Terminal\TabManager.cs" />
     <Compile Include="Terminal\DiffViewContent.cs" />
@@ -235,6 +256,7 @@
     <Compile Include="Terminal\NativeDiffViewContent.cs" />
     <Compile Include="Terminal\ModernEmbeditorViewContent.cs" />
     <Compile Include="Terminal\MonacoEditorControl.cs" />
+    <Compile Include="Terminal\CaNotice.cs" />
     <Compile Include="Terminal\MonacoBufferSync.cs" />
     <Compile Include="Services\DiffService.cs" />
     <Compile Include="Services\UnifiedDiffGenerator.cs" />
@@ -329,6 +351,9 @@
     </Content>
     <EmbeddedResource Include="Terminal\models.json" />
     <Content Include="Terminal\create-class.html">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="Terminal\projects.html">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
     <Content Include="Terminal\ClassModels\ctClarionLive.inc">

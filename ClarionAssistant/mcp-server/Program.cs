@@ -8,7 +8,7 @@ namespace ClarionAssistant.McpServer
     /// clarion-mcp-server — standalone host for the editor-agnostic half of Clarion Assistant's
     /// MCP tools, over stdio, with no Clarion IDE running (ticket d051fbd1).
     ///
-    /// Serves 57 of the addin's 115 tools. The other 58 drive the IDE itself and are withheld by
+    /// Serves 61 of the addin's 119 tools (as of 44a1b10c; --selftest prints the live split). The other 58 drive the IDE itself and are withheld by
     /// McpTool.IdeOnly — an MCP client reads the tool list as a contract, so a tool that can only
     /// throw is worse than an absent one.
     ///
@@ -439,12 +439,45 @@ namespace ClarionAssistant.McpServer
                     };
                 }
 
+                // 44a1b10c: lsp_diagnostics is served HERE, with no editors, so it asks the IDE that has this solution
+                // open for an open editor's text (get_live_text over the pane's MCP endpoint), else checks the disk and
+                // says why. The solution matched is the one this server's LSP uses: --solution, else the followed one.
+                ClarionAssistant.Services.IdeLiveTextClient.SolutionProvider = () =>
+                {
+                    string s = workspace.CurrentSolutionPath;
+                    if (!string.IsNullOrEmpty(s)) return s;
+                    if (!launchingIde.HasValue) return null;
+                    string note;
+                    return ClarionAssistant.Services.IdeSolutionRecord.ReadCached(launchingIde.Value, out note);
+                };
+                ClarionAssistant.Services.IdeLiveTextClient.PreferredIdePid = launchingIde;
+                ClarionAssistant.Services.IdeLiveTextClient.Log = ClarionAssistant.Services.LspTrace.Write;
+                ClarionAssistant.Services.SharedLspBridge.LiveTextProvider = ClarionAssistant.Services.IdeLiveTextClient.Get;
+
                 // And WHICH CLARION, for the same reason. Without this the LSP resolved its own
                 // version independently, so --clarion-version and the solution's committed
                 // clarion-assistant.json shaped the tools' answers but not the language server's
                 // redirection file or library paths — the two silently disagreeing (d051fbd1 item 5).
-                ClarionAssistant.Services.LspService.VersionConfigProvider =
+                // 0ce0b5e2: for the solution the LSP actually serves (--solution, or the IDE's followed one), and
+                // re-asked on every lsp_* call, so the IDE's own choice for that solution reaches the language
+                // server, and a change to it restarts the server.
+                ClarionAssistant.Services.LspService.SolutionVersionProvider = sln =>
+                {
+                    string note;
+                    var cfg = workspace.VersionConfigFor(sln, out note);
+                    return new ClarionAssistant.Services.SolutionVersionChoice { Config = cfg, Note = note };
+                };
+                // And the ClarionGraph library (root + key), for the same reason (GH #247): it used to run its own
+                // Detect(), which outside a Clarion tree read the newest settings folder.
+                ClarionAssistant.Services.EffectiveClarionVersion.HostConfigProvider =
                     () => workspace.CurrentVersionConfig;
+                // ...and the line that says which version that is and why, so ClarionGraph's log names the version it
+                // built for rather than what an independent Detect() would have picked.
+                ClarionAssistant.Services.EffectiveClarionVersion.HostDescribeProvider = () =>
+                {
+                    var unused = workspace.CurrentVersionConfig;   // resolves the version, which writes the note
+                    return workspace.VersionNote;
+                };
             }
 
             var dispatcher = new ClarionAssistant.Services.McpDispatcher(
@@ -850,6 +883,7 @@ namespace ClarionAssistant.McpServer
             public bool GoToLine(int lineNumber) { return Nope<bool>(); }
             public void NavigateToFileAndLine(string filePath, int lineNumber) { Nope<bool>(); }
             public void OpenFileOnly(string filePath) { Nope<bool>(); }
+            public bool ActivateOpenFile(string filePath) { return Nope<bool>(); }
             public bool SaveActiveDocument() { return Nope<bool>(); }
             public bool CloseActiveDocument() { return Nope<bool>(); }
         }

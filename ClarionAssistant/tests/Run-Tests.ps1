@@ -14,7 +14,7 @@
 #                          IDE references. Run outside Clarion entirely.
 #
 #   Terminal\test\*.test.js  node harnesses over the WebView2 pages. Mostly zero-dependency; the ones
-#                          that need jsdom (vscode-import-ui, header-tabs, schema-sources-solution-key,
+#                          that need jsdom (vscode-import-ui, header-tabs, projects-dashboard, schema-sources-solution-key,
 #                          editor-sweep-590) say so, and this script installs it into
 #                          Terminal\test\node_modules when missing.
 #
@@ -79,6 +79,16 @@ if (-not $NodeOnly -and -not $InstallerOnly) {
     else {
         New-Item -ItemType Directory -Force $OutDir | Out-Null
 
+        # LspClient.IncrementalSync.Test's stand-in server keeps documents as the real server does. When deploy.ps1's
+        # pinned LSP build cache is here, point it at the REAL vscode-languageserver-textdocument from the newest build;
+        # otherwise it uses its port of that package (it prints which). Either way the harness is runnable.
+        $textDocPkg = Get-ChildItem (Join-Path $RepoDir ".lsp-build") -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^v(\d+\.\d+\.\d+)$' } |
+            Sort-Object { [version]($_.Name.Substring(1)) } -Descending |
+            ForEach-Object { Join-Path $_.FullName "node_modules\vscode-languageserver-textdocument" } |
+            Where-Object { Test-Path $_ } | Select-Object -First 1
+        $env:FAKE_TEXTDOC_MODULE = if ($textDocPkg) { $textDocPkg } else { "" }
+
         # Each harness pairs with the service file(s) it exercises. Listing the sources explicitly
         # (rather than globbing) keeps it obvious WHICH production code each harness actually covers.
         $harnesses = @(
@@ -92,10 +102,30 @@ if (-not $NodeOnly -and -not $InstallerOnly) {
                Sources = @("tests\ClarionAppDataReader.StructureScan.cs", "tests\ClarionAppDataReader.StructureScan.Stubs.cs",
                            "Services\ClarionAppDataReader.cs", "Services\ClarionAppDataReader.Model.cs")
                Refs = @("System.dll", "System.Xml.dll") }
+            # 1d8d1c49: the streaming TXA [DATA]-region index must match the whole-string parsers exactly.
+            # Fixture only here; pass a real whole-app .txa (or set CA_TXA_REAL) to compare a real export.
+            # 1d8d1c49: the Split-free slot extractor must match the Split version, and allocate far less.
+            @{ Name = "TextLines.Test"
+               Sources = @("tests\TextLines.Test.cs", "Services\TextLines.cs")
+               Refs = @("System.dll", "System.Core.dll") }
+            # 1d8d1c49: streamed LSP text messages must parse identically to Serialize+GetBytes, far cheaper.
+            @{ Name = "JsonTextStream.Test"
+               Sources = @("tests\JsonTextStream.Test.cs", "Services\JsonTextStream.cs")
+               Refs = @("System.dll", "System.Core.dll", "System.Web.Extensions.dll") }
+            @{ Name = "TxaDataIndex.Test"
+               Sources = @("tests\TxaDataIndex.Test.cs", "tests\ClarionAppDataReader.StructureScan.Stubs.cs",
+                           "Services\ClarionAppDataReader.cs", "Services\ClarionAppDataReader.Model.cs")
+               Refs = @("System.dll", "System.Core.dll", "System.Xml.dll") }
             # GH #227: New Chat overwrote the user's global ~\.claude\CLAUDE.md. Gets the project dir
             # so it can check the real shipped prompt still opens with the ownership signature.
             @{ Name = "ClaudeMdDeployer.Test"
                Sources = @("tests\ClaudeMdDeployer.Test.cs", "Services\ClaudeMdDeployer.cs", "Services\EncodingHelper.cs")
+               Refs = @("System.dll")
+               Args = @($RepoDir) }
+            # c175492a: two IDEs' CA tabs could not tell which MultiTerminal name was theirs. Gets the
+            # project dir so it can check the launch resolves the name before composing the prompt.
+            @{ Name = "CaAgentIdentity.Test"
+               Sources = @("tests\CaAgentIdentity.Test.cs", "Services\CaAgentIdentity.cs")
                Refs = @("System.dll")
                Args = @($RepoDir) }
             @{ Name = "NpgsqlLoader.SmokeTest"
@@ -106,12 +136,27 @@ if (-not $NodeOnly -and -not $InstallerOnly) {
             @{ Name = "IdeSolutionRecord.Test"
                Sources = @("tests\IdeSolutionRecord.Test.cs", "Services\IdeSolutionRecord.cs", "Services\EncodingHelper.cs")
                Refs = @("System.dll", "System.Web.Extensions.dll") }
+            # 0ce0b5e2: a solution's Clarion version - pins, then the IDE's own choice for it (live record, then its
+            # saved preferences file, chosen by content with the name hash only as a tiebreak), then the host
+            # install. x86 like the IDE, so the hash tiebreak is checked as the IDE computes it.
+            @{ Name = "SolutionVersionResolver.Test"
+               Sources = @("tests\SolutionVersionResolver.Test.cs", "Services\SolutionVersionResolver.cs",
+                           "Services\IdeSolutionRecord.cs", "Services\EncodingHelper.cs",
+                           "Services\ClarionVersionService.cs", "Services\ClarionConfigDirectory.cs")
+               Refs = @("System.dll", "System.Xml.dll", "System.Core.dll", "System.Web.Extensions.dll")
+               Platform = "x86" }
             # GH #209: the running Clarion.exe matched the FIRST version entry on its bin folder (a
             # Clarion.NET compiler, not the IDE). Fixture = the reporter's own ClarionProperties.xml.
             @{ Name = "ClarionVersionService.ExeMatchTest"
-               Sources = @("tests\ClarionVersionService.ExeMatchTest.cs", "Services\ClarionVersionService.cs", "Services\ClarionConfigDirectory.cs")
+               Sources = @("tests\ClarionVersionService.ExeMatchTest.cs", "Services\ClarionVersionService.cs", "Services\ClarionConfigDirectory.cs", "Services\EffectiveClarionVersion.cs")
                Refs = @("System.dll", "System.Xml.dll")
                Args = @((Join-Path $TestDir "fixtures\gh209\ClarionProperties.xml")) }
+            # GH #247: the standalone server read the NEWEST settings folder's ClarionProperties.xml (its own
+            # exe is 5.9, not Clarion's 11.0). Fixtures = the reporter's 11.0 file and the 12.0 one the server read.
+            @{ Name = "ClarionVersionService.InstallDetectTest"
+               Sources = @("tests\ClarionVersionService.InstallDetectTest.cs", "Services\ClarionVersionService.cs", "Services\ClarionConfigDirectory.cs")
+               Refs = @("System.dll", "System.Xml.dll")
+               Args = @((Join-Path $TestDir "fixtures\gh247\ClarionProperties.xml"), (Join-Path $TestDir "fixtures\gh247\ClarionProperties-12.0.xml")) }
             # 16d140e9 / 286f2e57: CA's version is the IDE's Build > Set Clarion Version only (no CA
             # override, VERSION is read-only), and every selection names the tier that decided it.
             # Gets the project dir for its source scans.
@@ -124,6 +169,12 @@ if (-not $NodeOnly -and -not $InstallerOnly) {
             @{ Name = "LspStartGate.Test"
                Sources = @("tests\LspStartGate.Test.cs", "Services\LspStartGate.cs")
                Refs = @("System.dll", "System.Core.dll") }
+            # 905928c7: Build > Set Clarion Version is followed with no CA chat tab — seeded quietly at
+            # addin start, one change per switch however many sources observe it.
+            @{ Name = "IdeVersionFollower.Test"
+               Sources = @("tests\IdeVersionFollower.Test.cs", "Services\IdeVersionFollower.cs",
+                           "Services\ClarionVersionService.cs", "Services\ClarionConfigDirectory.cs")
+               Refs = @("System.dll", "System.Xml.dll", "System.Core.dll") }
             # GH #187 follow-up: the CA Embeditor's Monaco <-> LSP line mapping agrees with what
             # WrapBuffer actually prepended (0 lines for a buffer opening with MEMBER/PROGRAM).
             @{ Name = "EmbedLspContext.LineMapping"
@@ -147,6 +198,12 @@ if (-not $NodeOnly -and -not $InstallerOnly) {
                Sources = @("tests\EmbedLspContext.RedResolve.Test.cs", "tests\EmbedLspContext.RedResolve.Stubs.cs",
                            "Services\EmbedLspContext.cs", "Services\RedFileService.cs", "Services\EncodingHelper.cs")
                Refs = @("System.dll") }
+            # f3b47441: a .red that can't be loaded clears RedFileService.Active instead of leaving the
+            # previous version's file in force. Reuses the RedResolve stubs.
+            @{ Name = "RedFileService.FailClosed.Test"
+               Sources = @("tests\RedFileService.FailClosed.Test.cs", "tests\EmbedLspContext.RedResolve.Stubs.cs",
+                           "Services\EmbedLspContext.cs", "Services\RedFileService.cs", "Services\EncodingHelper.cs")
+               Refs = @("System.dll", "System.Core.dll") }
             # PR #208: a hung instance stays swept, a busy one re-registers, beats never overlap.
             # The vendored SQLite is x86-only (SQLite.Interop.dll), hence Platform and the copies.
             @{ Name = "InstanceCoordination.ReRegister.Test"
@@ -167,10 +224,42 @@ if (-not $NodeOnly -and -not $InstallerOnly) {
             @{ Name = "EmbedAdoptPolicy.Test"
                Sources = @("tests\EmbedAdoptPolicy.Test.cs", "Services\EmbedAdoptPolicy.cs")
                Refs = @("System.dll") }
+            # 73bd1f03: no embed/editor tool writes the native embed document hidden behind the CA Embeditor.
+            @{ Name = "EmbedOverlayGuard.Test"
+               Sources = @("tests\EmbedOverlayGuard.Test.cs", "Services\EmbedOverlayGuard.cs")
+               Refs = @("System.dll")
+               Args = @($RepoDir) }
+            # 73bd1f03 fix (2): the embed tools routed to the CA Embeditor's Monaco buffer — formats identical to the
+            # native tools; reads/writes in the CA Embeditor's line space; native column by NATIVE line; fail closed.
+            @{ Name = "EmbedSlotText.Test"
+               Sources = @("tests\EmbedSlotText.Test.cs", "Services\EmbedSlotText.cs")
+               Refs = @("System.dll") }
+            @{ Name = "EmbedToolRouter.Test"
+               Sources = @("tests\EmbedToolRouter.Test.cs", "Services\EmbedToolRouter.cs", "Services\EmbedSlotText.cs",
+                           "Services\EditorToolRouter.cs", "Services\HostRequestBroker.cs", "Services\EditorTextOps.cs",
+                           "Services\IUiDispatcher.cs")
+               Refs = @("System.dll", "System.Core.dll", "System.Web.Extensions.dll") }
             # PR #198 pipeline round: apply_embed_edits' write/commit/save half - an abandoned call rolls
             # back instead of saving; a failed save or unconfirmed close discards our writes.
             @{ Name = "EmbedApplyFlow.Test"
                Sources = @("tests\EmbedApplyFlow.Test.cs", "Services\EmbedApplyFlow.cs", "Services\McpCallContext.cs")
+               Refs = @("System.dll", "System.Core.dll") }
+            # 1565ef7b: a CA Embeditor save that can't go through never loses the developer's text - slots are
+            # matched by read-only skeleton (a drift elsewhere re-maps), the save decides BEFORE the overlay
+            # detaches and never cancels, recovery files are BOM-free and atomic, the stash restores per slot.
+            @{ Name = "EmbedSaveFlow.Test"
+               Sources = @("tests\EmbedSaveFlow.Test.cs", "Services\EmbedSaveFlow.cs", "Services\EmbedRecovery.cs",
+                           "Services\TextLines.cs")
+               Refs = @("System.dll", "System.Core.dll") }
+            # ... and the ordering in the IDE-coupled callers that the harness above can't reach (red on 3904549).
+            @{ Name = "EmbedSaveOrder.SourceScan"
+               Sources = @("tests\EmbedSaveOrder.SourceScan.cs")
+               Refs = @("System.dll")
+               Args = @($RepoDir) }
+            # a964cde3: open_procedure_embed / select_procedure refuse rather than guess - loading and exact-name
+            # gates, app tree brought forward first, no click on a wrong selection, a wrong open cancelled unsaved.
+            @{ Name = "ProcedureOpenFlow.Test"
+               Sources = @("tests\ProcedureOpenFlow.Test.cs", "Services\ProcedureOpenFlow.cs")
                Refs = @("System.dll", "System.Core.dll") }
             # 16d140e9: the Monaco buffer crosses to the host once per content version - the per-surface
             # cache/accessor MonacoEditorControl uses, the sync-message parser, and the newest-wins lane.
@@ -181,8 +270,30 @@ if (-not $NodeOnly -and -not $InstallerOnly) {
             # 1c685f2e item 8: the bundled LspClient stops claiming to run when node crashes (exit line with
             # code + stderr tail) or its reader loop ends with the process still alive. The harness plays
             # the language server itself (copied to <temp>\node.exe), so it needs no node.
+            # LSP incremental sync: the ranged change LspClient sends instead of the whole buffer must reproduce
+            # the new text exactly under the LSP's line/UTF-16 rules, never split a CRLF or surrogate pair, and leave
+            # the server's incrementally patched line table (a port of TextDocument.update) equal to a fresh one.
+            @{ Name = "LspTextDiff.Test"
+               Sources = @("tests\LspTextDiff.Test.cs", "Services\LspTextDiff.cs")
+               Refs = @("System.dll", "System.Core.dll") }
+            # ... and LspClient wired to it, against a stand-in server that applies changes as the real server does
+            # (TextDocument.update, incremental line table checked against a fresh document after every change):
+            # ranges only when the server advertises incremental sync (bare or { change: N }), its copy exact after
+            # many edits, a disk resync re-based (an unchanged one still sent, as an empty range), the retained texts
+            # bounded, and Stop/Start forgetting every document. Needs node.exe where LspClient looks for it.
+            @{ Name = "LspClient.IncrementalSync.Test"
+               Sources = @("tests\LspClient.IncrementalSync.Test.cs", "Services\LspClient.cs", "Services\LspTextDiff.cs",
+                           "Services\JsonTextStream.cs", "Services\LspTrace.cs", "Services\EncodingHelper.cs")
+               Refs = @("System.dll", "System.Core.dll", "System.Web.Extensions.dll")
+               Args = @((Join-Path $TestDir "fixtures\incremental-sync\fake-lsp.js")) }
+            # fc420c30: the MCP editor tools against the CA Editor (Monaco) — reads and writes hit its text, never the
+            # native document under it; save keeps the edit; a dirty close is refused; fail closed; native unchanged.
+            @{ Name = "EditorToolRouter.Test"
+               Sources = @("tests\EditorToolRouter.Test.cs", "Services\EditorToolRouter.cs", "Services\HostRequestBroker.cs",
+                           "Services\EditorTextOps.cs", "Services\IUiDispatcher.cs")
+               Refs = @("System.dll", "System.Core.dll", "System.Web.Extensions.dll") }
             @{ Name = "LspClient.Robustness.Test"
-               Sources = @("tests\LspClient.Robustness.Test.cs", "Services\LspClient.cs", "Services\LspTrace.cs", "Services\EncodingHelper.cs")
+               Sources = @("tests\LspClient.Robustness.Test.cs", "Services\LspClient.cs", "Services\LspTextDiff.cs", "Services\JsonTextStream.cs", "Services\LspTrace.cs", "Services\EncodingHelper.cs")
                Refs = @("System.dll", "System.Core.dll", "System.Web.Extensions.dll") }
             # 1c685f2e item 4: LocalLayerHandlers, the one class both hosts route the local layer to, over the
             # REAL local indexes (LocalScopeIndex, LiveDictionaryIndex, SymbolIndex on synthetic x86 SQLite DBs).
@@ -198,7 +309,7 @@ if (-not $NodeOnly -and -not $InstallerOnly) {
                            "CodeGraph\Parsing\Models\ClarionSymbol.cs", "CodeGraph\Parsing\Models\ClarionRelationship.cs",
                            "CodeGraph\Parsing\Models\SolutionProject.cs", "CodeGraph\Parsing\Models\ParseResult.cs",
                            "CodeGraph\Parsing\ClarionBuiltins.cs",
-                           "Services\LspClient.cs", "Services\LspTrace.cs", "Services\EncodingHelper.cs")
+                           "Services\LspClient.cs", "Services\LspTextDiff.cs", "Services\JsonTextStream.cs", "Services\LspTrace.cs", "Services\EncodingHelper.cs")
                Refs = @("System.dll", "System.Core.dll", "System.Xml.dll", "System.Data.dll", "System.Web.Extensions.dll")
                RepoRefs = @("lib\sqlite-fts5\System.Data.SQLite.dll")
                Copy = @("lib\sqlite-fts5\System.Data.SQLite.dll", "lib\sqlite-fts5\SQLite.Interop.dll")
@@ -216,14 +327,14 @@ if (-not $NodeOnly -and -not $InstallerOnly) {
             # 1c685f2e: instant buffer-local completion/hover - scope, parameters, the local-class owner
             # rule, encodings, and R3 (never Split the whole 3.2 MB buffer; allocation + scaling budgets).
             @{ Name = "LocalScopeIndex.Test"
-               Sources = @("tests\LocalScopeIndex.Test.cs", "Services\LocalScopeIndex.cs", "Services\LspClient.cs",
+               Sources = @("tests\LocalScopeIndex.Test.cs", "Services\LocalScopeIndex.cs", "Services\LspClient.cs", "Services\LspTextDiff.cs", "Services\JsonTextStream.cs",
                            "Services\LspTrace.cs", "Services\EncodingHelper.cs", "CodeGraph\Parsing\ClarionBuiltins.cs")
                Refs = @("System.dll", "System.Core.dll", "System.Web.Extensions.dll")
                Args = @((Join-Path $TestDir "fixtures\local-scope"), (Join-Path $RepoDir "Services\LocalScopeIndex.cs")) }
             # 1c685f2e R11: the slice overloads (header + owner DATA + caret span, from the span map)
             # answer exactly what the full-buffer overloads answer, at every caret of the fixture.
             @{ Name = "LocalScopeIndex.SliceParity"
-               Sources = @("tests\LocalScopeIndex.SliceParity.cs", "Services\LocalScopeIndex.cs", "Services\LspClient.cs",
+               Sources = @("tests\LocalScopeIndex.SliceParity.cs", "Services\LocalScopeIndex.cs", "Services\LspClient.cs", "Services\LspTextDiff.cs", "Services\JsonTextStream.cs",
                            "Services\LspTrace.cs", "Services\EncodingHelper.cs", "CodeGraph\Parsing\ClarionBuiltins.cs")
                Refs = @("System.dll", "System.Core.dll", "System.Web.Extensions.dll")
                Args = @((Join-Path $TestDir "fixtures\local-scope")) }
@@ -231,10 +342,16 @@ if (-not $NodeOnly -and -not $InstallerOnly) {
             # (SchemaGraph only as the no-snapshot fallback), plus keyword/built-in names + categories.
             @{ Name = "LiveDictionaryIndex.Test"
                Sources = @("tests\LiveDictionaryIndex.Test.cs", "Services\LiveDictionaryIndex.cs", "Services\ClarionAppDataReader.Model.cs",
-                           "Services\LocalScopeIndex.cs", "Services\LspClient.cs", "Services\LspTrace.cs", "Services\EncodingHelper.cs",
+                           "Services\LocalScopeIndex.cs", "Services\LspClient.cs", "Services\LspTextDiff.cs", "Services\JsonTextStream.cs", "Services\LspTrace.cs", "Services\EncodingHelper.cs",
                            "CodeGraph\Parsing\ClarionBuiltins.cs")
                Refs = @("System.dll", "System.Core.dll", "System.Web.Extensions.dll")
                Args = @((Join-Path $TestDir "fixtures\keyword-data")) }
+            # Colon-qualified completion ("Glob:S"): the server's bare-labelled qualifier items survive the
+            # host's qualifier scoping once CodeGraph has supplied a match of its own.
+            @{ Name = "ColonQualifierScope.Test"
+               Sources = @("tests\ColonQualifierScope.Test.cs", "Services\ColonQualifierScope.cs", "Services\LspClient.cs", "Services\LspTextDiff.cs",
+                           "Services\JsonTextStream.cs", "Services\LspTrace.cs", "Services\EncodingHelper.cs")
+               Refs = @("System.dll", "System.Core.dll", "System.Web.Extensions.dll") }
             # 1c685f2e: held-open NOCASE symbol lookups - range queries and their plans, the parameter
             # leak, inherited members across both DBs, the old-schema fallback, and the connection
             # lifecycle (a held handle must never block the reindex delete). Synthetic x86 SQLite DBs.
@@ -243,12 +360,45 @@ if (-not $NodeOnly -and -not $InstallerOnly) {
                            "CodeGraph\Graph\CodeGraphProvider.cs", "CodeGraph\Graph\CodeGraphDatabase.cs",
                            "CodeGraph\Parsing\Models\ClarionSymbol.cs", "CodeGraph\Parsing\Models\ClarionRelationship.cs",
                            "CodeGraph\Parsing\Models\SolutionProject.cs", "CodeGraph\Parsing\Models\ParseResult.cs",
-                           "Services\LspClient.cs", "Services\LspTrace.cs", "Services\EncodingHelper.cs")
+                           "Services\LspClient.cs", "Services\LspTextDiff.cs", "Services\JsonTextStream.cs", "Services\LspTrace.cs", "Services\EncodingHelper.cs")
                Refs = @("System.dll", "System.Core.dll", "System.Data.dll", "System.Web.Extensions.dll")
                RepoRefs = @("lib\sqlite-fts5\System.Data.SQLite.dll")
                Copy = @("lib\sqlite-fts5\System.Data.SQLite.dll", "lib\sqlite-fts5\SQLite.Interop.dll")
                Platform = "x86"
                Args = @($RepoDir) }
+            # PR #237: the active tab re-selected on solution reopen - a view opening before the reopen loop
+            # (the .app tab from Recent Applications) neither gives up the restore nor lets the loop record
+            # over the saved choice; the store's temp file is per process and never left behind. IDE stubbed.
+            @{ Name = "ActiveDocumentRestore.Test"
+               Sources = @("tests\ActiveDocumentRestore.Test.cs", "tests\ActiveDocumentRestore.Stubs.cs", "ActiveDocumentRestoreCommand.cs")
+               Refs = @("System.dll", "System.Windows.Forms.dll") }
+            # File-level EQUATEs in a .inc (outside any CLASS body) must become CodeGraph symbols.
+            @{ Name = "ClarionParser.IncEquates.Test"
+               Sources = @("tests\ClarionParser.IncEquates.Test.cs", "CodeGraph\Parsing\ClarionParser.cs", "CodeGraph\Parsing\ClarionBuiltins.cs",
+                           "CodeGraph\Parsing\Models\ClarionSymbol.cs", "CodeGraph\Parsing\Models\ClarionRelationship.cs",
+                           "CodeGraph\Parsing\Models\ParseResult.cs", "Services\EncodingHelper.cs")
+               Refs = @("System.dll", "System.Core.dll") }
+            # ITEMIZE members are indexed as Prefix:Name (PRE / empty PRE / no PRE), value-less members
+            # included, across ParseIncFile, ParseMemberFile DATA and the library .EQU scan (x86 SQLite).
+            @{ Name = "ClarionParser.Itemize.Test"
+               Sources = @("tests\ClarionParser.Itemize.Test.cs", "CodeGraph\Parsing\ClarionParser.cs", "CodeGraph\Parsing\ClarionBuiltins.cs",
+                           "CodeGraph\Parsing\Models\ClarionSymbol.cs", "CodeGraph\Parsing\Models\ClarionRelationship.cs",
+                           "CodeGraph\Parsing\Models\ParseResult.cs", "CodeGraph\Parsing\Models\SolutionProject.cs",
+                           "CodeGraph\Graph\CodeGraphDatabase.cs", "CodeGraph\Graph\CodeGraphProvider.cs",
+                           "Services\ClarionGraphService.cs", "Services\LibraryIndexer.cs", "Services\SymbolIndex.cs", "Services\IndexRunGate.cs",
+                           "Services\ClarionVersionService.cs", "Services\ClarionConfigDirectory.cs", "Services\EffectiveClarionVersion.cs",
+                           "Services\LspClient.cs", "Services\LspTextDiff.cs", "Services\JsonTextStream.cs", "Services\LspTrace.cs", "Services\EncodingHelper.cs")
+               Refs = @("System.dll", "System.Core.dll", "System.Xml.dll", "System.Data.dll", "System.Web.Extensions.dll")
+               RepoRefs = @("lib\sqlite-fts5\System.Data.SQLite.dll")
+               Copy = @("lib\sqlite-fts5\System.Data.SQLite.dll", "lib\sqlite-fts5\SQLite.Interop.dll")
+               Platform = "x86" }
+            # A CLASS / INTERFACE whose label contains a colon must be indexed, with its methods and
+            # the instances/references typed by it (GH #246).
+            @{ Name = "ClarionParser.ColonClass.Test"
+               Sources = @("tests\ClarionParser.ColonClass.Test.cs", "CodeGraph\Parsing\ClarionParser.cs", "CodeGraph\Parsing\ClarionBuiltins.cs",
+                           "CodeGraph\Parsing\Models\ClarionSymbol.cs", "CodeGraph\Parsing\Models\ClarionRelationship.cs",
+                           "CodeGraph\Parsing\Models\ParseResult.cs", "Services\EncodingHelper.cs")
+               Refs = @("System.dll", "System.Core.dll") }
         )
         if ($Probe) {
             $harnesses += @{ Name = "VsCodeSettingsImporter.LiveProbe"

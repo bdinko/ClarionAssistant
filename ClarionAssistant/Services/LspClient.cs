@@ -174,11 +174,23 @@ namespace ClarionAssistant.Services
             if (_running) return true;
             LastSpawnError = null;
             _stopRequested = false;
-            // A new server session: status support is re-detected from its own traffic (see Stop).
+            // A new server session: status support is re-detected from its script below, else its traffic (see Stop).
             _serverSendsDiagnosticsStatus = false;
+            // ... and it holds no documents yet. Stop clears these too, but a thread that passed IsRunning before Stop
+            // can still record a document after Stop cleared them; the new server never received it.
+            ForgetDocuments();
 
             if (!File.Exists(serverJsPath))
                 return false;
+
+            // c7878eba: waiting for the server's first status on the wire is too late on a big module. Its
+            // sync-pass publish lands seconds before any status, so the first lsp_diagnostics of a session
+            // settled on that partial publish as complete. The script tells us up front instead.
+            if (ServerScriptSendsDiagnosticsStatus(serverJsPath))
+            {
+                _serverSendsDiagnosticsStatus = true;
+                LspTrace.Write("[LSP] server.js sends clarion/diagnosticsStatus - status mode from the first call");
+            }
 
             try
             {
@@ -312,7 +324,9 @@ namespace ClarionAssistant.Services
                     return false;
                 }
 
-                LspTrace.Write("[LSP] Initialize succeeded");
+                _serverSyncKind = ReadSyncKind(initResult);
+                LspTrace.Write("[LSP] Initialize succeeded (textDocumentSync=" + _serverSyncKind
+                    + (UsesIncrementalSync ? ", incremental changes" : ", full-text changes") + ")");
 
                 // Send initialized notification
                 SendNotification("initialized", new Dictionary<string, object>());
@@ -537,6 +551,23 @@ namespace ClarionAssistant.Services
             // happens onto a server that does not send the status, a stale true here would turn every
             // lsp_diagnostics call into a full-budget pending:true. Start resets it too.
             _serverSendsDiagnosticsStatus = false;
+
+            // The same guard for document sync: a reused instance must not believe a fresh server already holds its
+            // documents. With incremental sync it matters more than it did: a ranged change against a text the new
+            // server never received does not fail, it corrupts the server's copy. Start clears them again.
+            ForgetDocuments();
+        }
+
+        /// <summary>Forget every document the server was sent, and its sync kind (Start and Stop).</summary>
+        private void ForgetDocuments()
+        {
+            lock (_docSyncLock)
+            {
+                _openDocuments.Clear();
+                _lastSyncedHash.Clear();
+                ForgetServerTexts_NoLock();
+            }
+            _serverSyncKind = 1;
         }
 
         #region LSP Requests
@@ -897,6 +928,22 @@ namespace ClarionAssistant.Services
         /// </summary>
         public DiagnosticWaitResult GetDiagnostics(string filePath, int timeoutMs = 3000)
         {
+            return GetDiagnosticsCore(filePath, null, timeoutMs);
+        }
+
+        /// <summary>
+        /// 44a1b10c: as GetDiagnostics, but for <paramref name="text"/> (an open editor's buffer) instead of the disk
+        /// file. The disk is never read or re-sent, so an editor's synced text is not replaced by the file. Sent only
+        /// when it differs from what the server holds (the same hash gate as EnsureBufferSynced); when it doesn't,
+        /// the wait is for the held version and a `complete` already recorded for it answers (as in GetDiagnostics).
+        /// </summary>
+        public DiagnosticWaitResult GetDiagnosticsForText(string filePath, string text, int timeoutMs = 3000)
+        {
+            return GetDiagnosticsCore(filePath, text, timeoutMs);   // null text = the disk path
+        }
+
+        private DiagnosticWaitResult GetDiagnosticsCore(string filePath, string text, int timeoutMs)
+        {
             var result = new DiagnosticWaitResult { Entries = new List<DiagnosticEntry>(), Pending = true };
             if (!IsRunning || string.IsNullOrEmpty(filePath)) return result;
             TrackRequest("diagnostics", filePath);
@@ -907,13 +954,20 @@ namespace ClarionAssistant.Services
             int statusBaseline = GetStatusSeq(filePath);
             int sentVersion = -1;
 
-            // Trigger server analysis before waiting. We always force a new publish
-            // so Claude sees the state of the file as of this call — stale cached
-            // diagnostics from before the last edit are not good enough.
+            // Bring the server to the file's disk text before waiting, so the answer describes the file as of
+            // this call. When the server ALREADY holds that text, nothing is sent (92d06c29): the server skips an
+            // identical-content change (#359 ContentChangeGuard: "Skipping identical-content change event"),
+            // so a re-sent version is never analysed, published or given a status, and waiting for its
+            // `complete` hung for the whole budget (John's second call on PRM002023: 60 s, nothing). Instead
+            // the wait is for the version the server holds, and a `complete` already recorded for it answers
+            // at once (the baseline below drops to 0); one still being analysed is waited for.
+            bool sentNewVersion = true;
             try
             {
-                if (_openDocuments.ContainsKey(filePath))
-                    SendDidChangeFromDisk(filePath);
+                if (text != null)
+                    sentNewVersion = EnsureDocumentOpenWithText(filePath, text);   // 44a1b10c: the editor's text
+                else if (_openDocuments.ContainsKey(filePath))
+                    sentNewVersion = SendDidChangeFromDisk(filePath);
                 else
                     EnsureDocumentOpen(filePath);
 
@@ -929,6 +983,11 @@ namespace ClarionAssistant.Services
                 return result;
             }
 
+            // Nothing sent: a `complete` recorded before this call is still the answer, as long as it names a
+            // version (IsCompleteFor then requires it to be the held version or newer). An unversioned one could
+            // be about an older text, so for those the baseline stays and only a fresh status counts.
+            if (!sentNewVersion && CompleteStatusCarriesVersion(filePath)) statusBaseline = 0;
+
             // waitForSemanticPass: this is the one-shot tool answer (lsp_diagnostics). It gets no
             // second frame in which to correct itself, so it must not settle for the server's
             // partial first publish — see ticket b7505691 and the overload's remarks.
@@ -936,12 +995,50 @@ namespace ClarionAssistant.Services
                                           expectedVersion: sentVersion, statusBaseline: statusBaseline);
         }
 
-        // True once THIS server session has sent ANY clarion/diagnosticsStatus notification (GH #216).
+        // True once THIS server session has sent ANY clarion/diagnosticsStatus notification (GH #216),
+        // or from Start when its server.js contains the sender (c7878eba: on a big module the first
+        // status comes seconds after the partial publish, too late for the first call).
         // Server 1.0.4+ sends one after its final publish for every analysis; older servers never do.
-        // Detected from the wire rather than from a version string because the version the server
-        // reports is not something every build fills in, and "has it ever said it" is the exact
-        // property the wait depends on. Reset in Start and Stop; surfaced by GetDebugStatus.
+        // Not from a version string: the version the server reports is not something every build
+        // fills in. Reset in Start and Stop; surfaced by GetDebugStatus.
         private volatile bool _serverSendsDiagnosticsStatus;
+
+        // The sender as the server writes it (server.js: `connection.sendNotification('clarion/diagnosticsStatus', ...)`).
+        // Matches the tsc output CA bundles and the esbuild bundle of the VS Code extension (1.0.5: one hit;
+        // 1.0.3, which predates the status, none).
+        private static readonly System.Text.RegularExpressions.Regex DiagnosticsStatusSender =
+            new System.Text.RegularExpressions.Regex(@"sendNotification\s*\(\s*['""]clarion/diagnosticsStatus['""]");
+
+        /// <summary>
+        /// c7878eba: true when the server script itself sends clarion/diagnosticsStatus, so status mode can be on
+        /// before the first status arrives. The server does not advertise it in initialize. False when the script
+        /// cannot be read: wire detection then switches it on as before.
+        ///
+        /// Deliberately NOT a version gate (do not "simplify" it into one): the server's initialize result carries
+        /// no serverInfo (v1.0.8 returns capabilities only), and only the bundled server has a pinned version
+        /// (lsp-snapshot.json). The other two paths LspService starts, Lsp.ServerPath (manual) and the VS Code
+        /// extension fallback, have no version, or only a folder name. The scan tests the exact property on
+        /// whichever script actually runs.
+        /// </summary>
+        internal static bool ServerScriptSendsDiagnosticsStatus(string serverJsPath)
+        {
+            try { return DiagnosticsStatusSender.IsMatch(File.ReadAllText(serverJsPath)); }
+            catch (Exception ex)
+            {
+                LspTrace.Write("[LSP] could not read server.js for the diagnosticsStatus probe: " + ex.Message);
+                return false;
+            }
+        }
+
+        private bool CompleteStatusCarriesVersion(string filePath)
+        {
+            string key = FilePathToUri(filePath);
+            lock (_diagnosticsLock)
+            {
+                DiagnosticSet set;
+                return _diagnostics.TryGetValue(key, out set) && set.LastCompleteStatusSeq > 0 && set.LastCompleteVersion >= 0;
+            }
+        }
 
         private int GetStatusSeq(string filePath)
         {
@@ -1267,6 +1364,7 @@ namespace ClarionAssistant.Services
             //   none           -> the budget expired mid-analysis. NOT complete, and saying "clean"
             //                     here is the defect this method exists to prevent.
             string lastState = null;
+            bool currentPublish = false;
             lock (_diagnosticsLock)
             {
                 if (_diagnostics.TryGetValue(key, out set))
@@ -1276,17 +1374,29 @@ namespace ClarionAssistant.Services
                     if (!statusMode)
                         sawSemantic = sawSemantic || set.SemanticPassPublished;
                     lastState = set.LastStatusState;
+                    currentPublish = set.WasPublished && !IsStale_NoLock(set, key);
                 }
             }
             result.Pending = !(sawComplete || (!statusMode && (sawSemantic || streamSettled)));
 
+            // 92d06c29: on a pending answer, entries go back only as a flagged partial, and only when they
+            // describe the text we sent. A publish for an older text (or one a status has not yet confirmed,
+            // from a server whose publishes carry no version) would put its problems on the wrong lines.
             if (result.Pending)
+            {
+                if (!currentPublish) result.Entries = new List<DiagnosticEntry>();
+                // Partial only with something in it: pending with no entries already says "nothing yet" (Charlie,
+                // 2026-10-04), so partial:true with count 0 is never sent.
+                result.Partial = currentPublish && result.Entries.Count > 0;
+
                 LspTrace.Write("[LSP] WaitForDiagnostics: " + timeoutMs + "ms budget expired for " + key
                     + (statusMode
                         ? " without diagnosticsStatus 'complete' for version " + expectedVersion
                           + " (last state: " + (lastState ?? "none") + ")"
                         : " with only the partial (pre-semantic) publish")
-                    + " — reporting pending, NOT clean.");
+                    + " — reporting pending, NOT clean"
+                    + (currentPublish ? "; " + result.Entries.Count + " entries so far as partial." : "; nothing current to show."));
+            }
 
             return result;
         }
@@ -1377,20 +1487,21 @@ namespace ClarionAssistant.Services
                 string ext = Path.GetExtension(filePath).ToLower();
                 string languageId = ext == ".inc" || ext == ".clw" || ext == ".equ" ? "clarion" : "plaintext";
 
-                var parms = new Dictionary<string, object>
+                var doc = new Dictionary<string, object>
                 {
-                    { "textDocument", new Dictionary<string, object>
-                        {
-                            { "uri", uri },
-                            { "languageId", languageId },
-                            { "version", 1 },
-                            { "text", content }
-                        }
-                    }
+                    { "uri", uri },
+                    { "languageId", languageId },
+                    { "version", 1 },
+                    { "text", content }
                 };
+                var parms = new Dictionary<string, object> { { "textDocument", doc } };
 
-                SendNotification("textDocument/didOpen", parms);
+                SendNotificationWithText("textDocument/didOpen", parms, doc, "text", content);   // 1d8d1c49: streamed when large
                 _openDocuments[filePath] = 1; NoteSentVersion(filePath, 1);
+                // The server holds the DISK text: record it for the next ranged change, and as the "unchanged" hash,
+                // as SendDidChangeFromDisk does, so a buffer equal to the file is not re-sent for nothing.
+                _lastSyncedHash[filePath] = TextHash(content);
+                RecordServerText_NoLock(filePath, content);
             }
         }
 
@@ -1405,50 +1516,188 @@ namespace ClarionAssistant.Services
         private readonly Dictionary<string, int> _lastSyncedHash =
             new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
 
-        private void EnsureDocumentOpenWithText(string filePath, string text)
+        /// <summary>The value _lastSyncedHash holds for a text: one formula for every path that records it.</summary>
+        private static int TextHash(string text)
+        {
+            return text == null ? 0 : text.Length ^ text.GetHashCode();
+        }
+
+        // ---- Incremental sync ----
+        // The text the SERVER holds per file, as of the last didOpen/didChange we sent (a reference to the caller's
+        // string, not a copy). With it, a change is sent as the one small range LspTextDiff finds instead of the whole
+        // buffer: on a 2.5 MB generated module the full-text didChange was most of the post-edit hover cost (HoverBench).
+        // Only when the server advertises TextDocumentSyncKind.Incremental (2), and only while IncrementalSyncEnabled.
+        // Every path that changes the server's copy must record it here (RecordServerText_NoLock), or the next range
+        // lands on the wrong text.
+        //
+        // BOUNDED. Nothing ever closes a document (there is no didClose), so without a bound every module the session
+        // ever synced would stay referenced here, in a 32-bit IDE where a generated module is 5 MB of UTF-16. Past
+        // MaxRetainedServerChars the least recently synced texts are dropped. A dropped document is still open on the
+        // server with the right version; its next change simply goes as full text (SendDidChange_NoLock finds no base),
+        // which records it again. The most recently synced text is always kept, however large: it is the one being
+        // edited, and a single module over the cap is exactly where ranges matter most.
+        private readonly Dictionary<string, string> _lastSyncedText =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, long> _lastSyncedTextUse =
+            new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+        private long _lastSyncedTextTick;
+        private long _lastSyncedTextChars;
+
+        /// <summary>Upper bound, in UTF-16 chars, on the server texts kept as bases for ranged changes (all documents
+        /// together; 8M chars = 16 MB). Static so a harness can shrink it.</summary>
+        public static long MaxRetainedServerChars = 8L * 1024 * 1024;
+
+        /// <summary>Number of documents whose server text is currently kept (diagnostics and tests).</summary>
+        public int RetainedServerTextCount { get { lock (_docSyncLock) return _lastSyncedText.Count; } }
+
+        /// <summary>Record the text the server now holds for <paramref name="filePath"/>, evicting the least recently
+        /// synced others while the total is over MaxRetainedServerChars. Call under _docSyncLock.</summary>
+        private void RecordServerText_NoLock(string filePath, string text)
+        {
+            string old;
+            if (_lastSyncedText.TryGetValue(filePath, out old) && old != null) _lastSyncedTextChars -= old.Length;
+            _lastSyncedText[filePath] = text;
+            _lastSyncedTextUse[filePath] = ++_lastSyncedTextTick;
+            if (text != null) _lastSyncedTextChars += text.Length;
+
+            while (_lastSyncedTextChars > MaxRetainedServerChars && _lastSyncedText.Count > 1)
+            {
+                string oldest = null; long oldestUse = long.MaxValue;
+                foreach (var kv in _lastSyncedTextUse)
+                    if (kv.Value < oldestUse && !string.Equals(kv.Key, filePath, StringComparison.OrdinalIgnoreCase)) { oldest = kv.Key; oldestUse = kv.Value; }
+                if (oldest == null) break;
+                string dropped;
+                if (_lastSyncedText.TryGetValue(oldest, out dropped) && dropped != null) _lastSyncedTextChars -= dropped.Length;
+                _lastSyncedText.Remove(oldest);
+                _lastSyncedTextUse.Remove(oldest);
+            }
+        }
+
+        private void ForgetServerTexts_NoLock()
+        {
+            _lastSyncedText.Clear();
+            _lastSyncedTextUse.Clear();
+            _lastSyncedTextChars = 0;
+        }
+
+        /// <summary>Process-wide switch for ranged (incremental) didChange. On by default; a host can turn it off
+        /// (kill switch) and HoverBench turns it off to measure full-text sync on the same server.</summary>
+        public static bool IncrementalSyncEnabled = true;
+
+        // TextDocumentSyncKind the server advertised in its initialize reply: 0 none, 1 full, 2 incremental.
+        private int _serverSyncKind = 1;
+
+        /// <summary>True when changes go to the server as ranges (the server supports it and it is enabled).</summary>
+        public bool UsesIncrementalSync { get { return _serverSyncKind == 2 && IncrementalSyncEnabled; } }
+
+        /// <summary>didChange counts by kind since start (diagnostics, and HoverBench's sanity line).</summary>
+        public int IncrementalChangesSent { get; private set; }
+        public int FullChangesSent { get; private set; }
+
+        private static int ReadSyncKind(Dictionary<string, object> initResponse)
+        {
+            try
+            {
+                object result, caps, sync;
+                var res = initResponse != null && initResponse.TryGetValue("result", out result) ? result as Dictionary<string, object> : null;
+                var c = res != null && res.TryGetValue("capabilities", out caps) ? caps as Dictionary<string, object> : null;
+                if (c == null || !c.TryGetValue("textDocumentSync", out sync) || sync == null) return 1;
+                var options = sync as Dictionary<string, object>;
+                if (options == null) return Convert.ToInt32(sync);
+                object change;
+                return options.TryGetValue("change", out change) && change != null ? Convert.ToInt32(change) : 1;
+            }
+            catch { return 1; }
+        }
+
+        /// <summary>
+        /// Send a didChange taking the server's copy of <paramref name="filePath"/> to <paramref name="text"/>: one
+        /// ranged change when incremental sync is in use and the server's current text is known, else the whole text.
+        /// Call under _docSyncLock, with the document already open.
+        /// </summary>
+        private void SendDidChange_NoLock(string filePath, string uri, int nextVersion, string text)
+        {
+            string serverText = null;
+            LspTextChange delta = null;
+            bool baseKnown = UsesIncrementalSync && _lastSyncedText.TryGetValue(filePath, out serverText) && serverText != null;
+            if (baseKnown)
+            {
+                delta = LspTextDiff.Compute(serverText, text);
+                // The server already holds exactly this text: send an EMPTY change (nothing replaced at 0:0) rather
+                // than the whole text, so every call still bumps the version by one at no full-text cost.
+                // Note (92d06c29): this does NOT make the server re-analyse. It skips identical content (#359
+                // ContentChangeGuard), so the new version gets no publish and no status. That is why
+                // SendDidChangeFromDisk no longer gets here with unchanged text, and why no caller may wait for an
+                // answer to a change that changed nothing.
+                if (delta == null)
+                    delta = new LspTextChange { Text = "" };   // StartLine = StartCharacter = EndLine = EndCharacter = 0
+            }
+
+            Dictionary<string, object> change;
+            if (delta != null)
+            {
+                change = new Dictionary<string, object>
+                {
+                    { "range", new Dictionary<string, object>
+                        {
+                            { "start", new Dictionary<string, object> { { "line", delta.StartLine }, { "character", delta.StartCharacter } } },
+                            { "end", new Dictionary<string, object> { { "line", delta.EndLine }, { "character", delta.EndCharacter } } }
+                        }
+                    },
+                    { "text", delta.Text }
+                };
+                IncrementalChangesSent++;
+            }
+            else
+            {
+                change = new Dictionary<string, object> { { "text", text } };   // no range = full replacement
+                FullChangesSent++;
+            }
+            var changeParms = new Dictionary<string, object>
+            {
+                { "textDocument", new Dictionary<string, object> { { "uri", uri }, { "version", nextVersion } } },
+                { "contentChanges", new System.Collections.ArrayList { change } }
+            };
+            SendNotificationWithText("textDocument/didChange", changeParms, change, "text", (string)change["text"]);   // 1d8d1c49
+            _openDocuments[filePath] = nextVersion; NoteSentVersion(filePath, nextVersion);
+            RecordServerText_NoLock(filePath, text);
+        }
+
+        /// <returns>True when a new version went to the server (a didOpen or a change); false when the server
+        /// already holds exactly <paramref name="text"/> and nothing was sent.</returns>
+        private bool EnsureDocumentOpenWithText(string filePath, string text)
         {
             lock (_docSyncLock)
             {
                 string uri = FilePathToUri(filePath);
-                int hash = (text != null ? text.Length : 0) ^ (text != null ? text.GetHashCode() : 0);
+                int hash = TextHash(text);
                 int currentVersion;
                 if (_openDocuments.TryGetValue(filePath, out currentVersion))
                 {
-                    // Unchanged since last sync → nothing to send (avoids needless re-tokenize).
+                    // Unchanged since last sync → nothing to send (avoids needless re-tokenize; the server would skip
+                    // an identical-content change anyway, #359).
                     int lastHash;
                     if (_lastSyncedHash.TryGetValue(filePath, out lastHash) && lastHash == hash)
-                        return;
+                        return false;
 
-                    int nextVersion = currentVersion + 1;
-                    var changes = new System.Collections.ArrayList
-                    {
-                        new Dictionary<string, object> { { "text", text } }
-                    };
-                    var changeParms = new Dictionary<string, object>
-                    {
-                        { "textDocument", new Dictionary<string, object> { { "uri", uri }, { "version", nextVersion } } },
-                        { "contentChanges", changes }
-                    };
-                    SendNotification("textDocument/didChange", changeParms);
-                    _openDocuments[filePath] = nextVersion; NoteSentVersion(filePath, nextVersion);
+                    SendDidChange_NoLock(filePath, uri, currentVersion + 1, text);   // ranged when the server allows
                     _lastSyncedHash[filePath] = hash;
-                    return;
+                    return true;
                 }
 
-                var openParms = new Dictionary<string, object>
+                var openDoc = new Dictionary<string, object>
                 {
-                    { "textDocument", new Dictionary<string, object>
-                        {
-                            { "uri", uri },
-                            { "languageId", "clarion" },
-                            { "version", 1 },
-                            { "text", text }
-                        }
-                    }
+                    { "uri", uri },
+                    { "languageId", "clarion" },
+                    { "version", 1 },
+                    { "text", text }
                 };
-                SendNotification("textDocument/didOpen", openParms);
+                var openParms = new Dictionary<string, object> { { "textDocument", openDoc } };
+                SendNotificationWithText("textDocument/didOpen", openParms, openDoc, "text", text);   // 1d8d1c49
                 _openDocuments[filePath] = 1; NoteSentVersion(filePath, 1);
                 _lastSyncedHash[filePath] = hash;
+                RecordServerText_NoLock(filePath, text);
+                return true;
             }
         }
 
@@ -1464,14 +1713,17 @@ namespace ClarionAssistant.Services
         }
 
         /// <summary>
-        /// Send a full-document textDocument/didChange with the current file contents
+        /// Send a textDocument/didChange taking the server to the current file contents
         /// from disk. Used to force the server to re-analyze a file that's already open
         /// after it may have changed (e.g., after write_embed_content or an external edit).
         /// If the file hasn't been opened yet, falls through to EnsureDocumentOpen instead.
         /// </summary>
-        private void SendDidChangeFromDisk(string filePath)
+        /// <returns>True when a new version went to the server (a didOpen or a real change). False when the
+        /// server already holds exactly the disk text: nothing is sent, because the server skips an
+        /// identical-content change without analysing it (#359), so the new version would never be answered.</returns>
+        private bool SendDidChangeFromDisk(string filePath)
         {
-            if (!File.Exists(filePath)) return;
+            if (!File.Exists(filePath)) return false;
 
             lock (_docSyncLock) // reentrant: EnsureDocumentOpen also takes _docSyncLock
             {
@@ -1479,32 +1731,20 @@ namespace ClarionAssistant.Services
                 if (!_openDocuments.TryGetValue(filePath, out currentVersion))
                 {
                     EnsureDocumentOpen(filePath);
-                    return;
+                    return true;
                 }
 
                 string uri = FilePathToUri(filePath);
                 string content = EncodingHelper.ReadAllText(filePath, out _);
-                int nextVersion = currentVersion + 1;
+                int hash = TextHash(content);
+                int held;
+                if (_lastSyncedHash.TryGetValue(filePath, out held) && held == hash) return false;
 
-                // LSP TextDocumentContentChangeEvent without `range` = full document replacement.
-                var changes = new System.Collections.ArrayList
-                {
-                    new Dictionary<string, object> { { "text", content } }
-                };
-
-                var parms = new Dictionary<string, object>
-                {
-                    { "textDocument", new Dictionary<string, object>
-                        {
-                            { "uri", uri },
-                            { "version", nextVersion }
-                        }
-                    },
-                    { "contentChanges", changes }
-                };
-
-                SendNotification("textDocument/didChange", parms);
-                _openDocuments[filePath] = nextVersion; NoteSentVersion(filePath, nextVersion);
+                SendDidChange_NoLock(filePath, uri, currentVersion + 1, content);
+                // The server now holds the DISK text, so the buffer hash must say so too. It used to keep the last
+                // buffer's hash: a buffer matching it afterwards was skipped as "unchanged" while the server held disk.
+                _lastSyncedHash[filePath] = hash;
+                return true;
             }
         }
 
@@ -1584,7 +1824,73 @@ namespace ClarionAssistant.Services
             WriteMessage(_serializer.Serialize(notification));
         }
 
+        // 1d8d1c49: a whole embeditor buffer in didOpen/didChange cost 31 MB of large-object heap per push
+        // through Serialize + UTF8.GetBytes (5.1x a 3.2M-char text), on every open and every idle sync. Above
+        // this size the text is streamed instead (JsonTextStream); below it nothing changes.
+        internal const int StreamTextAboveChars = 65536;
+        private const string LargeTextSentinel = "\u0001CA_LARGE_TEXT_1d8d1c49\u0001";
+
+        /// <summary>
+        /// SendNotification for a message carrying one large string: <paramref name="holder"/>[<paramref name="key"/>]
+        /// is where the text goes inside <paramref name="parms"/>. Small texts take the normal path. Large ones are
+        /// serialized with a sentinel in their place, so every other field is written by the same serializer as
+        /// before, and the text itself is streamed between the two halves.
+        /// </summary>
+        private void SendNotificationWithText(string method, Dictionary<string, object> parms,
+            Dictionary<string, object> holder, string key, string text)
+        {
+            if (text == null || text.Length < StreamTextAboveChars)
+            {
+                holder[key] = text;
+                SendNotification(method, parms);
+                return;
+            }
+            if (!_running || _process == null || _process.HasExited) return;
+
+            holder[key] = LargeTextSentinel;
+            var notification = new Dictionary<string, object> { { "jsonrpc", "2.0" }, { "method", method }, { "params", parms } };
+            string json = _serializer.Serialize(notification);
+            string marker = _serializer.Serialize(LargeTextSentinel);     // the sentinel as the serializer writes it, quotes included
+            string prefix, suffix;
+            if (!JsonTextStream.SplitAroundMarker(json, marker, out prefix, out suffix))
+            {
+                LspTrace.Write("[LSP] large-text sentinel not found once in " + method + " - falling back to Serialize");
+                holder[key] = text;
+                SendNotification(method, parms);
+                return;
+            }
+            lock (_writeLock)
+            {
+                try
+                {
+                    var stream = _process.StandardInput.BaseStream;
+                    byte[] header = JsonTextStream.WriteLspMessage(stream, prefix, text, suffix);
+                    LogFirstWrite(header);
+                    stream.Flush();
+                }
+                catch (Exception ex)
+                {
+                    LspTrace.Write("[LSP] WriteMessage (streamed) failed: " + ex.Message);
+                }
+            }
+        }
+
         private bool _loggedFirstWrite;
+
+        private void LogFirstWrite(byte[] headerBytes)
+        {
+            if (_loggedFirstWrite) return;
+            _loggedFirstWrite = true;
+            var hex = new StringBuilder();
+            for (int i = 0; i < Math.Min(headerBytes.Length, 24); i++)
+                hex.Append(headerBytes[i].ToString("X2")).Append(' ');
+            string header = Encoding.ASCII.GetString(headerBytes);
+            LspTrace.Write("[LSP] first header bytes: " + hex
+                + " | as text: " + header.Replace("\r", "\\r").Replace("\n", "\\n"));
+            LspTrace.Write("[LSP] stdin encoding: "
+                + _process.StandardInput.Encoding.WebName
+                + ", preamble length: " + _process.StandardInput.Encoding.GetPreamble().Length);
+        }
 
         private void WriteMessage(string json)
         {
@@ -1600,18 +1906,7 @@ namespace ClarionAssistant.Services
                     // ("Header must provide a Content-Length property") looks identical whether we
                     // sent the wrong header, sent it in the wrong encoding, or had something
                     // prepended to the stream ahead of it — and only the bytes tell those apart.
-                    if (!_loggedFirstWrite)
-                    {
-                        _loggedFirstWrite = true;
-                        var hex = new StringBuilder();
-                        for (int i = 0; i < Math.Min(headerBytes.Length, 24); i++)
-                            hex.Append(headerBytes[i].ToString("X2")).Append(' ');
-                        LspTrace.Write("[LSP] first header bytes: " + hex
-                            + " | as text: " + header.Replace("\r", "\\r").Replace("\n", "\\n"));
-                        LspTrace.Write("[LSP] stdin encoding: "
-                            + _process.StandardInput.Encoding.WebName
-                            + ", preamble length: " + _process.StandardInput.Encoding.GetPreamble().Length);
-                    }
+                    LogFirstWrite(headerBytes);
 
                     _process.StandardInput.BaseStream.Write(headerBytes, 0, headerBytes.Length);
                     _process.StandardInput.BaseStream.Write(content, 0, content.Length);
@@ -2190,6 +2485,11 @@ namespace ClarionAssistant.Services
         {
             public List<DiagnosticEntry> Entries;
             public bool Pending;
+            /// <summary>92d06c29: Pending, but Entries are a publish for the text CA sent, received before the
+            /// analysis finished (a 62k-line module's sync pass lands ~2 s in, the complete answer ~17 s). What
+            /// the server has found so far, never "all there is". Always false when Pending is false, and when Entries
+            /// is empty (pending with nothing = "nothing yet").</summary>
+            public bool Partial;
         }
 
         #endregion

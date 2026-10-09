@@ -499,7 +499,8 @@ namespace ClarionAssistant.Services
                     {
                         { "name", (GetProp(proc, "Name") ?? GetProp(proc, "ProcedureName") ?? "").ToString() },
                         { "prototype", (GetProp(proc, "Prototype") ?? "").ToString() },
-                        { "module", (GetProp(proc, "Module") ?? "").ToString() },
+                        // Module is a Clarion.GEN.Module OBJECT: its name, never its ToString() (= the type name).
+                        { "module", ProcedureOpenFlow.ModuleNameOf(GetProp(proc, "Module")) ?? "" },
                         { "parent", (GetProp(proc, "Parent") ?? "").ToString() },
                         { "from", (GetProp(proc, "From") ?? "").ToString() }
                     };
@@ -675,6 +676,25 @@ namespace ClarionAssistant.Services
 
                 // Fallback: validated col-0 regex over the live (raw) buffer.
                 return ModernEmbeditorLauncher.ProcNameFromSource(new EditorService().GetActiveDocumentContent(), known);
+            }
+            catch { return null; }
+        }
+
+        /// <summary>44a1b10c: as GetFocusedNativeEmbeditorProcName but for the OPEN embeditor, focused or not (the tool
+        /// asking is in a terminal, so the embeditor never has focus then). The header title first, else the procedure
+        /// line in the embeditor's own document. UI thread only.</summary>
+        public string GetOpenNativeEmbeditorProcName()
+        {
+            try
+            {
+                var editor = GetClaGenEditor();
+                if (editor == null || GetOpenPweeDetails() == null) return null;
+                var known = GetProcedureNames();
+                string fromHeader = ProcFromHeaderTitle(
+                    (GetProp(editor, "HeaderTitle") ?? GetProp(editor, "TitleName") ?? GetProp(editor, "TabPageText")) as string);
+                if (!string.IsNullOrEmpty(fromHeader) && (known.Count == 0 || ContainsIgnoreCase(known, fromHeader)))
+                    return fromHeader;
+                return ModernEmbeditorLauncher.ProcNameFromSource(GetEmbeditorDocumentText(), known);
             }
             catch { return null; }
         }
@@ -882,214 +902,292 @@ namespace ClarionAssistant.Services
             return sb.ToString();
         }
 
-        /// <summary>
-        /// Open the embeditor for a specific procedure.
-        /// Iteration 14: PostMessage WM_KEYDOWN/WM_CHAR directly to ClaList handle
-        /// + AttachThreadInput for cross-thread focus.
-        /// </summary>
-        public string OpenProcedureEmbed(string procedureName) { return OpenProcedureEmbed(procedureName, 100); }
+        // Locator speeds for the direct tools: each retry after a missed selection or a wrong open types slower,
+        // because ClaList drops keystrokes typed too fast (ticket a964cde3).
+        private static readonly int[] ToolCharDelaysMs = { 100, 150 };
 
         /// <summary>
-        /// Opens the embeditor for a procedure by driving the native app tree. The procedure name is typed
-        /// into the ClaList incremental-search locator one char at a time with <paramref name="charDelayMs"/>
-        /// between keys — ClaList drops keystrokes that arrive too fast, so this can't be rushed. (A Ctrl+V
-        /// paste would be instant but only works when the locator FIELD has focus, which we can't set
-        /// programmatically; WM_CHAR drives the search without focus.) Callers needing certainty should verify
-        /// the opened procedure and retry slower if it mismatched.
+        /// Open the embeditor for a procedure, verified (ticket a964cde3): see <see cref="ProcedureOpenFlow"/>.
+        /// Returns "Embeditor opened for '...'." on success, else an "Error:"-prefixed reason; on a wrong open
+        /// the embeditor has been cancelled without saving. Waits for the open itself. UI thread only.
         /// </summary>
+        public string OpenProcedureEmbed(string procedureName) { return OpenProcedureEmbedChecked(procedureName, ToolCharDelaysMs).Message; }
+
+        /// <summary>As <see cref="OpenProcedureEmbed(string)"/>, one attempt at the given locator speed.</summary>
         public string OpenProcedureEmbed(string procedureName, int charDelayMs)
+        {
+            return OpenProcedureEmbedChecked(procedureName, new[] { charDelayMs }).Message;
+        }
+
+        /// <summary>The verified open with its outcome, for callers that branch on success (OpenAndMirror).</summary>
+        internal ProcedureOpenResult OpenProcedureEmbedChecked(string procedureName, int[] charDelaysMs)
+        {
+            // Busy for the whole flow (pipeline run 1): the flow pumps messages while the open settles, and without
+            // this the CA overlay monitor attaches Monaco to whatever opened - a WRONG procedure included - and the
+            // cancel then runs under a live WebView2 (the re-entrant hang / TryClose deadlock). The monitor attaches
+            // after a verified open instead. Re-entrant counter, so OpenAndMirror's own busy section nests safely.
+            ModernEmbeditorLauncher.EnterBusy();
+            try { return ProcedureOpenFlow.Open(new ProcedureOpenOps(this), procedureName, charDelaysMs); }
+            finally { ModernEmbeditorLauncher.LeaveBusy(); }
+        }
+
+        /// <summary>
+        /// Select a procedure in the app tree without opening the embeditor, verified the same way as the open
+        /// up to the click (ticket a964cde3). UI thread only.
+        /// </summary>
+        public string SelectProcedure(string procedureName)
+        {
+            ModernEmbeditorLauncher.EnterBusy();   // as OpenProcedureEmbedChecked: no pad/overlay activity mid-flow
+            try { return ProcedureOpenFlow.Select(new ProcedureOpenOps(this), procedureName, ToolCharDelaysMs).Message; }
+            finally { ModernEmbeditorLauncher.LeaveBusy(); }
+        }
+
+        /// <summary>The open embeditor's procedure name, focused or not, for get_embed_info. Null when none is open
+        /// or the name can't be read. UI thread only.</summary>
+        public string GetOpenEmbeditorProcedureName()
+        {
+            return GetEmbedInfo() == null ? null : GetOpenNativeEmbeditorProcName();
+        }
+
+        /// <summary>AppTreeService as the IDE side of <see cref="ProcedureOpenFlow"/>.</summary>
+        private sealed class ProcedureOpenOps : IProcedureOpenOps
+        {
+            private readonly AppTreeService _t;
+            public ProcedureOpenOps(AppTreeService t) { _t = t; }
+
+            public string OpenEmbeditorFile()
+            {
+                var info = _t.GetEmbedInfo();
+                if (info == null) return null;
+                string f = (info["fileName"] ?? "").ToString();
+                return f.Length > 0 ? f : (info["appName"] ?? "").ToString();
+            }
+
+            public bool HasApp() { return _t.GetAppObject() != null; }
+
+            public bool? IsAppLoaded()
+            {
+                try { return GetProp(_t.GetAppObject(), "IsLoaded") as bool?; }
+                catch { return null; }
+            }
+
+            public IList<string> ProcedureNames() { return _t.GetProcedureNames(); }
+            public bool ActivateAppTree() { return _t.ActivateAppTree(); }
+
+            public bool WaitForClaList(int timeoutMs)
+            {
+                return ModernEmbeditorLauncher.PumpUntil(() => _t.FindVisibleClaList() != IntPtr.Zero, timeoutMs);
+            }
+
+            public string TypeLocator(string name, int charDelayMs) { return _t.TypeLocator(name, charDelayMs); }
+
+            public string WaitForSelected(string name, int timeoutMs)
+            {
+                string last = null;
+                ModernEmbeditorLauncher.PumpUntil(() =>
+                {
+                    last = _t.ReadTreeSelectedProcedure();
+                    return last != null && string.Equals(last, name, StringComparison.OrdinalIgnoreCase);
+                }, timeoutMs);
+                return last;
+            }
+
+            public string ClickEmbeditor()
+            {
+                var mainCtrl = _t.GetAppMainControl();
+                if (mainCtrl == null || !mainCtrl.IsHandleCreated) return "the app window is not available";
+                var log = new StringBuilder();
+                if (_t.ClickEmbeditorButton(_t.GetChildWindows(mainCtrl.Handle), log)) return null;
+                // Keep the button scan (which ClaButtons, which captions): it is the one clue to why it failed.
+                return "the app tree's Embeditor button was not found (" + log.ToString().Trim().Replace("\r\n", "; ").Replace("\n", "; ") + ")";
+            }
+
+            public bool WaitForOpen(int timeoutMs) { return ModernEmbeditorLauncher.WaitForEmbedOpen(_t, timeoutMs); }
+
+            // Read the open's identity until it settles (ProcedureOpenFlow.DecideOpenedName): the same settled answer on
+            // two consecutive readings, or the last reading once IdentitySettleMs runs out.
+            public string OpenProcedureName(string requested)
+            {
+                string expectedModule = _t.GetProcedureModule(requested);
+                string previous = null, answer = null;
+                bool done = ModernEmbeditorLauncher.PumpUntil(() =>
+                {
+                    bool settled;
+                    string now = ProcedureOpenFlow.DecideOpenedName(_t.ReadEmbeditorHeaderProcName(), _t.ReadEmbeditorDocumentProcName(),
+                        _t.ReadOpenEmbedModule(), expectedModule, false, out settled);
+                    if (!settled) { previous = null; return false; }
+                    if (previous != null && string.Equals(previous, now, StringComparison.Ordinal)) { answer = now; return true; }
+                    previous = now;
+                    return false;
+                }, ProcedureOpenFlow.IdentitySettleMs);
+                if (done) return answer;
+                bool last;
+                return ProcedureOpenFlow.DecideOpenedName(_t.ReadEmbeditorHeaderProcName(), _t.ReadEmbeditorDocumentProcName(),
+                    _t.ReadOpenEmbedModule(), expectedModule, true, out last);
+            }
+
+            public string CancelAndWaitClosed()
+            {
+                string r = _t.CancelEmbeditor();
+                if (r != null && r.StartsWith("Error", StringComparison.OrdinalIgnoreCase)) return r;
+                return ModernEmbeditorLauncher.WaitForEmbedClosed(_t, 5000) ? null : "it was still open 5s after the cancel";
+            }
+        }
+
+        /// <summary>
+        /// Bring the app's window forward ON ITS APP-TREE VIEW (ticket a964cde3). SelectWindow raises the document
+        /// only, showing whichever inner view was last active; when that isn't the primary (tree) view,
+        /// SwitchView(0) raises the tree, gated on "not already" so the working path is untouched. Only for the
+        /// open/select flow, which runs with no embeditor open: <see cref="ActivateAppView"/> stays as it is,
+        /// because the save/cancel paths call it while the embeditor (a secondary view) must stay in front.
+        /// </summary>
+        public bool ActivateAppTree()
+        {
+            if (!ActivateAppView()) return false;
+            try
+            {
+                var vc = FindAppViewContent();
+                var window = GetProp(vc, "WorkbenchWindow");
+                var active = window == null ? null : GetProp(window, "ActiveViewContent");
+                if (active != null && !ReferenceEquals(active, vc))
+                {
+                    var switchView = window.GetType().GetMethod("SwitchView", new[] { typeof(int) });
+                    if (switchView != null)
+                    {
+                        switchView.Invoke(window, new object[] { 0 });
+                        Application.DoEvents();
+                    }
+                }
+            }
+            catch { }
+            return true;
+        }
+
+        // The app tree's procedure list: the first VISIBLE ClaList in the app window, or zero (hidden when another
+        // tab is in front, so the open flow brings the app forward first).
+        private IntPtr FindVisibleClaList()
+        {
+            var mainCtrl = GetAppMainControl();
+            if (mainCtrl == null || !mainCtrl.IsHandleCreated) return IntPtr.Zero;
+            foreach (var (hwnd, cls, vis) in GetChildWindows(mainCtrl.Handle))
+                if (cls.Contains("ClaList") && vis) return hwnd;
+            return IntPtr.Zero;
+        }
+
+        // The procedure the app tree has selected, from the app view's FileSchema (repopulated on tree selection,
+        // see GetAppFileSchema), or null when it can't be read.
+        private string ReadTreeSelectedProcedure()
+        {
+            try
+            {
+                var name = GetProp(GetAppFileSchema(), "ProcedureName") as string;
+                return string.IsNullOrWhiteSpace(name) ? null : name.Trim();
+            }
+            catch { return null; }
+        }
+
+        // --- The open embeditor's identity, piece by piece, for ProcedureOpenFlow.DecideOpenedName (pipeline run 1).
+        // Kept apart (rather than GetOpenNativeEmbeditorProcName's header-else-document answer) so the flow can require
+        // the pieces to AGREE: the ClaGenEditor is reused, and any one of them can still describe the previous open.
+
+        // The procedure named by the open embeditor's header ("Proc - Embeditor - (module.clw)"), or null.
+        private string ReadEmbeditorHeaderProcName()
+        {
+            try
+            {
+                var editor = GetClaGenEditor();
+                if (editor == null || GetOpenPweeDetails() == null) return null;
+                return ProcFromHeaderTitle(
+                    (GetProp(editor, "HeaderTitle") ?? GetProp(editor, "TitleName") ?? GetProp(editor, "TabPageText")) as string);
+            }
+            catch { return null; }
+        }
+
+        // The procedure declared at column 0 of the open embeditor's document (validated against the app's procedures), or null.
+        private string ReadEmbeditorDocumentProcName()
+        {
+            try
+            {
+                if (GetOpenPweeDetails() == null) return null;
+                return ModernEmbeditorLauncher.ProcNameFromSource(GetEmbeditorDocumentText(), GetProcedureNames());
+            }
+            catch { return null; }
+        }
+
+        // The generated module of the embed that is open NOW (PweeEditorDetails.Module: the details object exists only
+        // while an embed is open, so it belongs to this open, not a previous one), or null.
+        private string ReadOpenEmbedModule()
+        {
+            try { return ProcedureOpenFlow.ModuleNameOf(GetProp(GetOpenPweeDetails(), "Module")); }
+            catch { return null; }
+        }
+
+        // The module the app assigns to procedure <paramref name="name"/>, or null when unknown.
+        private string GetProcedureModule(string name)
+        {
+            try
+            {
+                foreach (var d in GetProcedureDetails())
+                    if (string.Equals((d["name"] ?? "").ToString(), name, StringComparison.OrdinalIgnoreCase))
+                    {
+                        string m = (d["module"] ?? "").ToString().Trim();
+                        return m.Length > 0 ? m : null;
+                    }
+            }
+            catch { }
+            return null;
+        }
+
+        /// <summary>
+        /// Type <paramref name="procedureName"/> into the ClaList incremental-search locator one char at a time
+        /// with <paramref name="charDelayMs"/> between keys, then Down+Up to commit the highlight as the selection.
+        /// ClaList drops keystrokes that arrive too fast, so this can't be rushed. (A Ctrl+V paste would be instant
+        /// but only works when the locator FIELD has focus, which we can't set programmatically; WM_CHAR drives the
+        /// search without focus.) Selects only: whether it selected the right row is the caller's check. Null on
+        /// success, else why not.
+        /// </summary>
+        private string TypeLocator(string procedureName, int charDelayMs)
         {
             bool attached = false;
             uint curThreadId = 0, listThreadId = 0;
             try
             {
-                // Check if an embeditor is already open
-                var embedInfo = GetEmbedInfo();
-                if (embedInfo != null)
-                {
-                    var openFile = (embedInfo["fileName"] ?? "").ToString();
-                    return "Error: An embeditor is already open (" + openFile + "). Please close it before opening another procedure.";
-                }
-
-                var log = new StringBuilder();
-                log.AppendLine("=== Iteration 14: PostMessage + AttachThreadInput ===");
-                log.AppendLine("Target: " + procedureName);
-
-                // --- Get the ApplicationMainWindowControl (searches all windows) ---
-                var viewContent = FindAppViewContent();
-                if (viewContent == null) return "Error: no ViewContent — is an .app file open?";
-
-                var container = GetProp(viewContent, "_Container")
-                             ?? GetProp(viewContent, "ApplicationContainer");
-                if (!(container is Control containerCtrl) || containerCtrl.Controls.Count == 0)
-                    return "Error: cannot access ApplicationContainer";
-
-                var mainCtrl = containerCtrl.Controls[0] as Control;
-                if (mainCtrl == null || !mainCtrl.IsHandleCreated)
-                    return "Error: ApplicationMainWindowControl has no handle";
-
-                // --- Find native controls ---
-                var children = GetChildWindows(mainCtrl.Handle);
-                IntPtr listHwnd = IntPtr.Zero;
-                foreach (var (hwnd, cls, vis) in children)
-                {
-                    if (cls.Contains("ClaList") && vis && listHwnd == IntPtr.Zero)
-                        listHwnd = hwnd;
-                }
-
-                log.AppendLine("ClaList: " + (listHwnd != IntPtr.Zero ? "0x" + listHwnd.ToString("X") : "NOT FOUND"));
-                if (listHwnd == IntPtr.Zero)
-                    return log + "\nCannot proceed — ClaList not found";
-
-                // ================================================================
-                // PHASE 1: AttachThreadInput + SetFocus on ClaList
-                // ================================================================
-                log.AppendLine("\n--- Phase 1: AttachThreadInput + Focus ---");
+                IntPtr listHwnd = FindVisibleClaList();
+                if (listHwnd == IntPtr.Zero) return "the app tree's procedure list (ClaList) was not found";
 
                 listThreadId = GetWindowThreadProcessId(listHwnd, out _);
                 curThreadId = GetCurrentThreadId();
-
                 if (listThreadId != curThreadId)
-                {
                     attached = AttachThreadInput(curThreadId, listThreadId, true);
-                    log.AppendLine("AttachThreadInput: " + (attached ? "OK" : "FAILED") +
-                                   " (cur=" + curThreadId + " list=" + listThreadId + ")");
-                }
-                else
-                {
-                    log.AppendLine("Same thread — no attach needed");
-                }
 
                 SetFocus(listHwnd);
                 Application.DoEvents();
                 System.Threading.Thread.Sleep(100);
 
-                IntPtr focusWnd = GetFocus();
-                log.AppendLine("Focused: 0x" + focusWnd.ToString("X") +
-                               (focusWnd == listHwnd ? " (ClaList!)" : " (not ClaList)"));
-
-                // ================================================================
-                // PHASE 2: Select procedure in ClaList
-                // ================================================================
-                log.AppendLine("\n--- Phase 2: Select procedure in ClaList ---");
-
-                bool selected = false;
-
-                // Probe: check if ClaList actually supports LB_ messages
-                // LB_GETCOUNT returns item count for real listboxes, but ClaList returns 0
-                const uint LB_GETCOUNT = 0x018B;
-                int lbCount = (int)SendMessage(listHwnd, LB_GETCOUNT, IntPtr.Zero, IntPtr.Zero);
-                log.AppendLine("LB_GETCOUNT probe: " + lbCount);
-                bool claListSupportsLB = (lbCount > 0);
-
-                if (claListSupportsLB)
+                foreach (char c in procedureName)
                 {
-                    // Approach 1: LB_FINDSTRINGEXACT + LB_SETCURSEL (direct listbox selection)
-                    IntPtr foundIndex = SendMessage(listHwnd, LB_FINDSTRINGEXACT, new IntPtr(-1), procedureName);
-                    log.AppendLine("LB_FINDSTRINGEXACT('" + procedureName + "'): index=" + foundIndex.ToInt32());
-
-                    if (foundIndex.ToInt32() >= 0)
-                    {
-                        SendMessage(listHwnd, LB_SETCURSEL, foundIndex, IntPtr.Zero);
-
-                        // Notify parent of selection change (LBN_SELCHANGE = 1)
-                        IntPtr listParent = GetParent(listHwnd);
-                        int controlId = GetWindowLong(listHwnd, GWL_ID);
-                        int wParamNotify = (controlId & 0xFFFF) | (1 << 16);
-                        SendMessage(listParent, WM_COMMAND, (IntPtr)wParamNotify, listHwnd);
-
-                        Application.DoEvents();
-                        System.Threading.Thread.Sleep(200);
-                        Application.DoEvents();
-
-                        log.AppendLine("Selected via LB_SETCURSEL at index " + foundIndex.ToInt32());
-                        selected = true;
-                    }
-
-                    if (!selected)
-                    {
-                        // Approach 2: LB_FINDSTRING (prefix match)
-                        IntPtr foundIndex2 = SendMessage(listHwnd, LB_FINDSTRING, new IntPtr(-1), procedureName);
-                        log.AppendLine("LB_FINDSTRING('" + procedureName + "'): index=" + foundIndex2.ToInt32());
-
-                        if (foundIndex2.ToInt32() >= 0)
-                        {
-                            SendMessage(listHwnd, LB_SETCURSEL, foundIndex2, IntPtr.Zero);
-
-                            IntPtr listParent = GetParent(listHwnd);
-                            int controlId = GetWindowLong(listHwnd, GWL_ID);
-                            int wParamNotify = (controlId & 0xFFFF) | (1 << 16);
-                            SendMessage(listParent, WM_COMMAND, (IntPtr)wParamNotify, listHwnd);
-
-                            Application.DoEvents();
-                            System.Threading.Thread.Sleep(200);
-                            Application.DoEvents();
-
-                            log.AppendLine("Selected via LB_FINDSTRING + LB_SETCURSEL at index " + foundIndex2.ToInt32());
-                            selected = true;
-                        }
-                    }
-                }
-
-                if (!selected)
-                {
-                    log.AppendLine("ClaList does not support LB_ messages (count=" + lbCount + "), using locator");
-
-                    log.AppendLine("Typing name via WM_CHAR (" + charDelayMs + "ms/char)");
-                    foreach (char c in procedureName)
-                    {
-                        PostMessage(listHwnd, WM_CHAR, (IntPtr)c, IntPtr.Zero);
-                        Application.DoEvents();
-                        System.Threading.Thread.Sleep(charDelayMs < 1 ? 1 : charDelayMs);
-                    }
+                    PostMessage(listHwnd, WM_CHAR, (IntPtr)c, IntPtr.Zero);
                     Application.DoEvents();
-                    System.Threading.Thread.Sleep(250);
-                    Application.DoEvents();
-
-                    // Down+Up commits the incremental-search highlight as the real selection.
-                    PostMessage(listHwnd, WM_KEYDOWN, (IntPtr)0x28, IntPtr.Zero); // VK_DOWN
-                    PostMessage(listHwnd, WM_KEYUP, (IntPtr)0x28, IntPtr.Zero);
-                    System.Threading.Thread.Sleep(80);
-                    Application.DoEvents();
-                    PostMessage(listHwnd, WM_KEYDOWN, (IntPtr)0x26, IntPtr.Zero); // VK_UP
-                    PostMessage(listHwnd, WM_KEYUP, (IntPtr)0x26, IntPtr.Zero);
-                    System.Threading.Thread.Sleep(200);
-                    Application.DoEvents();
+                    System.Threading.Thread.Sleep(charDelayMs < 1 ? 1 : charDelayMs);
                 }
+                Application.DoEvents();
+                System.Threading.Thread.Sleep(250);
+                Application.DoEvents();
 
-                // Verify: read back current selection
-                int verifyIdx = (int)SendMessage(listHwnd, LB_GETCURSEL, IntPtr.Zero, IntPtr.Zero);
-                if (verifyIdx >= 0)
-                {
-                    int textLen = (int)SendMessage(listHwnd, LB_GETTEXTLEN, (IntPtr)verifyIdx, IntPtr.Zero);
-                    if (textLen > 0)
-                    {
-                        var selBuf = new StringBuilder(textLen + 1);
-                        SendMessage(listHwnd, LB_GETTEXT, (IntPtr)verifyIdx, selBuf);
-                        log.AppendLine("Verify — selected item: '" + selBuf.ToString() + "' at index " + verifyIdx);
-                    }
-                    else
-                    {
-                        log.AppendLine("Verify — LB_GETTEXTLEN returned " + textLen + " (ClaList may not support LB_ read)");
-                    }
-                }
-                else
-                {
-                    log.AppendLine("Verify — LB_GETCURSEL returned " + verifyIdx + " (no selection or not a standard listbox)");
-                }
-
-                // ================================================================
-                // PHASE 3: Open embeditor — find and click the Embeditor button (shared helper)
-                // ================================================================
-                if (!ClickEmbeditorButton(children, log))
-                    return log.ToString();
-
-                log.AppendLine("\nEmbeditor opened for " + procedureName);
-                return log.ToString();
+                // Down+Up commits the incremental-search highlight as the real selection.
+                PostMessage(listHwnd, WM_KEYDOWN, (IntPtr)0x28, IntPtr.Zero); // VK_DOWN
+                PostMessage(listHwnd, WM_KEYUP, (IntPtr)0x28, IntPtr.Zero);
+                System.Threading.Thread.Sleep(80);
+                Application.DoEvents();
+                PostMessage(listHwnd, WM_KEYDOWN, (IntPtr)0x26, IntPtr.Zero); // VK_UP
+                PostMessage(listHwnd, WM_KEYUP, (IntPtr)0x26, IntPtr.Zero);
+                System.Threading.Thread.Sleep(200);
+                Application.DoEvents();
+                return null;
             }
             catch (Exception ex)
             {
-                return "Error: " + (ex.InnerException?.Message ?? ex.Message) + "\n" + ex.StackTrace;
+                return "typing into the app tree locator failed: " + (ex.InnerException?.Message ?? ex.Message);
             }
             finally
             {
@@ -1100,11 +1198,10 @@ namespace ClarionAssistant.Services
         }
 
         /// <summary>
-        /// <summary>
-        /// PHASE 3 (shared) — locate the Embeditor button among the app-window ClaButtons (matched by
-        /// "beditor" in its caption) and BM_CLICK it to open the embeditor for the CURRENTLY selected
-        /// procedure. Called by both <see cref="OpenProcedureEmbed(string,int)"/> (after type-to-select)
-        /// and <see cref="OpenProcedureEmbedCurrentSelection"/> (selection already committed by right-click).
+        /// Locate the Embeditor button among the app-window ClaButtons (matched by "beditor" in its caption)
+        /// and BM_CLICK it to open the embeditor for the CURRENTLY selected procedure. Only ProcedureOpenFlow
+        /// calls it (via ProcedureOpenOps.ClickEmbeditor), after its pre-click selection check; the flow then
+        /// verifies which procedure opened (ticket a964cde3).
         /// Returns true if the click was sent; false (with diagnostics appended to <paramref name="log"/>)
         /// when the button isn't found.
         /// </summary>
@@ -1151,7 +1248,7 @@ namespace ClarionAssistant.Services
             }
 
             // Send BM_CLICK to the Embeditor button. One DoEvents dispatches the posted click; we do NOT
-            // sleep here — the caller (OpenAndMirror) immediately runs WaitForEmbedOpen, which polls
+            // sleep here — the caller (ProcedureOpenFlow, via ops.WaitForOpen) immediately runs WaitForEmbedOpen, which polls
             // GetEmbedInfo() while pumping DoEvents until the embed actually opens. The old fixed
             // Sleep(500) was therefore pure dead latency the poll already covers (~500ms off every open). [perf]
             SendMessage(embeditorBtn, BM_CLICK, IntPtr.Zero, IntPtr.Zero);
@@ -1159,113 +1256,6 @@ namespace ClarionAssistant.Services
 
             log.AppendLine("BM_CLICK sent to Embeditor button");
             return true;
-        }
-
-        /// <summary>
-        /// Select a procedure in the ClaList without opening the embeditor. For testing.
-        /// </summary>
-        public string SelectProcedure(string procedureName)
-        {
-            bool attached = false;
-            uint curThreadId = 0, listThreadId = 0;
-            try
-            {
-                // Check if an embeditor is already open
-                var embedInfo = GetEmbedInfo();
-                if (embedInfo != null)
-                {
-                    var openFile = (embedInfo["fileName"] ?? "").ToString();
-                    return "Error: An embeditor is already open (" + openFile + "). Please close it before selecting a procedure.";
-                }
-
-                var log = new StringBuilder();
-                log.AppendLine("=== SelectProcedure: " + procedureName + " ===");
-
-                // --- Get the ApplicationMainWindowControl (searches all windows) ---
-                var viewContent = FindAppViewContent();
-                if (viewContent == null) return "Error: no ViewContent — is an .app file open?";
-
-                var container = GetProp(viewContent, "_Container")
-                             ?? GetProp(viewContent, "ApplicationContainer");
-                if (!(container is Control containerCtrl) || containerCtrl.Controls.Count == 0)
-                    return "Error: cannot access ApplicationContainer";
-
-                var mainCtrl = containerCtrl.Controls[0] as Control;
-                if (mainCtrl == null || !mainCtrl.IsHandleCreated)
-                    return "Error: ApplicationMainWindowControl has no handle";
-
-                // --- Find ClaList ---
-                var children = GetChildWindows(mainCtrl.Handle);
-                IntPtr listHwnd = IntPtr.Zero;
-                foreach (var (hwnd, cls, vis) in children)
-                {
-                    if (cls.Contains("ClaList") && vis && listHwnd == IntPtr.Zero)
-                        listHwnd = hwnd;
-                }
-
-                if (listHwnd == IntPtr.Zero)
-                    return "Error: ClaList not found";
-
-                log.AppendLine("ClaList: 0x" + listHwnd.ToString("X"));
-
-                // --- AttachThreadInput + Focus ---
-                listThreadId = GetWindowThreadProcessId(listHwnd, out _);
-                curThreadId = GetCurrentThreadId();
-
-                if (listThreadId != curThreadId)
-                {
-                    attached = AttachThreadInput(curThreadId, listThreadId, true);
-                    log.AppendLine("AttachThreadInput: " + (attached ? "OK" : "FAILED"));
-                }
-
-                SetFocus(listHwnd);
-                Application.DoEvents();
-                System.Threading.Thread.Sleep(100);
-
-                IntPtr focusWnd = GetFocus();
-                log.AppendLine("Focused: 0x" + focusWnd.ToString("X") +
-                               (focusWnd == listHwnd ? " (ClaList)" : " (not ClaList)"));
-
-                // --- Keystroke selection using PostMessage + WM_CHAR only ---
-                // Type each character via PostMessage (async, natural queue)
-                // 100ms delay + DoEvents between each char so ClaList locator processes them
-                foreach (char c in procedureName)
-                {
-                    PostMessage(listHwnd, WM_CHAR, (IntPtr)c, IntPtr.Zero);
-                    Application.DoEvents();
-                    System.Threading.Thread.Sleep(100);
-                }
-                Application.DoEvents();
-                System.Threading.Thread.Sleep(500);
-                Application.DoEvents();
-
-                log.AppendLine("Posted " + procedureName.Length + " WM_CHAR messages");
-
-                // Down+Up clears the locator's incremental search buffer
-                // without changing the selected item
-                PostMessage(listHwnd, WM_KEYDOWN, (IntPtr)0x28, IntPtr.Zero); // VK_DOWN
-                PostMessage(listHwnd, WM_KEYUP, (IntPtr)0x28, IntPtr.Zero);
-                System.Threading.Thread.Sleep(100);
-                Application.DoEvents();
-                PostMessage(listHwnd, WM_KEYDOWN, (IntPtr)0x26, IntPtr.Zero); // VK_UP
-                PostMessage(listHwnd, WM_KEYUP, (IntPtr)0x26, IntPtr.Zero);
-                System.Threading.Thread.Sleep(300);
-                Application.DoEvents();
-
-                log.AppendLine("Done — check ClaList visually for selected procedure");
-                return log.ToString();
-            }
-            catch (Exception ex)
-            {
-                return "Error: " + (ex.InnerException?.Message ?? ex.Message);
-            }
-            finally
-            {
-                // Always release the merged input queue. A leaked AttachThreadInput (e.g. an exception
-                // between attach and the manual detach) poisons the NEXT Modern open's WebView2 init and
-                // can hang the IDE. Mirrors the OpenProcedureEmbed try/finally guard.
-                if (attached) AttachThreadInput(curThreadId, listThreadId, false);
-            }
         }
 
         /// <summary>
@@ -1576,25 +1566,50 @@ namespace ClarionAssistant.Services
         /// Metadata noise (! Start of, ! End of, ! [Priority N], !!!) is stripped.
         /// Returns null if no active PWEE editor is open.
         /// </summary>
-        public string GetEmbeditorSource()
+        /// <summary>44a1b10c: the open native embeditor's whole document text, unsaved edits (write_embed_content
+        /// included), or null when no embed is open. Its line N is the «E:N» of GetEmbeditorSource. UI thread only.</summary>
+        public string GetEmbeditorDocumentText()
         {
             var editor = GetClaGenEditor();
             if (editor == null) return null;
+            var textControl = GetProp(editor, "TextEditorControl");
+            var document = textControl != null ? GetProp(textControl, "Document") : null;
+            return document != null ? GetProp(document, "TextContent") as string : null;
+        }
+
+        public string GetEmbeditorSource()
+        {
+            string text;
+            List<int[]> ranges;
+            if (!TryGetNativeEmbedSlots(out text, out ranges)) return null;
+            // 73bd1f03: one builder for both editors (the CA Embeditor route uses it too), so the «E:N» annotation and
+            // its per-line buffer numbers cannot drift between them.
+            return EmbedSlotText.Annotate(text, ranges);
+        }
+
+        /// <summary>73bd1f03: the open native embeditor's text and its editable embed-point slots (1-based inclusive
+        /// [start,end], document order): the CustomLines that are not ReadOnly and are IPweeEmbedPoint parts. False when
+        /// no PWEE embeditor is open. UI thread only.</summary>
+        private bool TryGetNativeEmbedSlots(out string text, out List<int[]> ranges)
+        {
+            text = null; ranges = null;
+            var editor = GetClaGenEditor();
+            if (editor == null) return false;
 
             var textControl = GetProp(editor, "TextEditorControl");
-            if (textControl == null) return null;
+            if (textControl == null) return false;
 
             var document = GetProp(textControl, "Document");
-            if (document == null) return null;
+            if (document == null) return false;
 
             var lineManager = GetProp(document, "CustomLineManager");
-            if (lineManager == null || !lineManager.GetType().Name.Contains("Pwee")) return null;
+            if (lineManager == null || !lineManager.GetType().Name.Contains("Pwee")) return false;
 
             var customLines = GetProp(lineManager, "CustomLines") as System.Collections.IEnumerable;
-            if (customLines == null) return null;
+            if (customLines == null) return false;
 
-            // Build startLine0 → endLine0 map for editable embed points only
-            var lineMap = new Dictionary<int, int>();
+            // Editable embed points only: startLine0 -> endLine0
+            var lineMap = new SortedDictionary<int, int>();
             foreach (var cl in customLines)
             {
                 if (cl == null) continue;
@@ -1610,75 +1625,12 @@ namespace ClarionAssistant.Services
                 lineMap[(int)startNr] = (int)endNr;
             }
 
-            var totalLinesObj = GetProp(document, "TotalNumberOfLines");
-            if (totalLinesObj == null) return null;
-            int total = (int)totalLinesObj;
-
-            var getSegMethod  = document.GetType().GetMethod("GetLineSegment", AllInstance);
-            var getTextMethod = document.GetType().GetMethod("GetText", AllInstance, null,
-                new[] { typeof(int), typeof(int) }, null);
-            if (getSegMethod == null || getTextMethod == null) return null;
-
-            var sb = new StringBuilder();
-            int lineIdx = 0;
-            while (lineIdx < total)
-            {
-                if (lineMap.TryGetValue(lineIdx, out int endLine))
-                {
-                    // Decide empty vs filled from the actual buffer content rather than
-                    // from (endLine > lineIdx): PWEE does not refresh CustomLine metadata
-                    // after our Document.Insert calls, so a freshly written 1-line slot
-                    // still reports endLine == lineIdx even though the buffer has text.
-                    int embedEnd = Math.Max(endLine, lineIdx);
-                    var embedLines = new List<string>();
-                    bool hasContent = false;
-                    for (int j = lineIdx; j <= embedEnd && j < total; j++)
-                    {
-                        var seg    = getSegMethod.Invoke(document, new object[] { j });
-                        int offset = (int)GetProp(seg, "Offset");
-                        int length = (int)GetProp(seg, "Length");
-                        string line = (string)getTextMethod.Invoke(document, new object[] { offset, length });
-                        embedLines.Add(line);
-                        if (line.Trim().Length > 0) hasContent = true;
-                    }
-
-                    if (hasContent)
-                    {
-                        sb.AppendLine("\u00ABE:" + (lineIdx + 1) + "\u00BB");
-                        foreach (var line in embedLines)
-                            sb.AppendLine(line);
-                        sb.AppendLine("\u00AB/E:" + (lineIdx + 1) + "\u00BB");
-                    }
-                    else
-                    {
-                        sb.AppendLine("\u00ABE:" + (lineIdx + 1) + "/\u00BB");
-                    }
-                    lineIdx = embedEnd + 1;
-                }
-                else
-                {
-                    var seg    = getSegMethod.Invoke(document, new object[] { lineIdx });
-                    int offset = (int)GetProp(seg, "Offset");
-                    int length = (int)GetProp(seg, "Length");
-                    string text = (string)getTextMethod.Invoke(document, new object[] { offset, length });
-                    string trimmed = text.Trim();
-
-                    if (trimmed.Length == 0                 ||
-                        trimmed.StartsWith("! Start of ")  ||
-                        trimmed.StartsWith("! End of ")    ||
-                        trimmed.StartsWith("! [Priority ") ||
-                        trimmed.StartsWith("!!!"))
-                    {
-                        lineIdx++;
-                        continue;
-                    }
-
-                    sb.AppendLine(text);
-                    lineIdx++;
-                }
-            }
-
-            return sb.ToString();
+            text = GetProp(document, "TextContent") as string;
+            if (text == null) return false;
+            ranges = new List<int[]>();
+            foreach (var kv in lineMap)
+                ranges.Add(new[] { kv.Key + 1, Math.Max(kv.Key, kv.Value) + 1 });
+            return true;
         }
 
         /// <summary>
@@ -1867,59 +1819,40 @@ namespace ClarionAssistant.Services
         /// </summary>
         public string SearchEmbeditorSource(string pattern, int contextLines = 5)
         {
-            var source = GetEmbeditorSource();
-            if (source == null) return null;
+            string text;
+            List<int[]> ranges;
+            if (!TryGetNativeEmbedSlots(out text, out ranges)) return null;
+            // 73bd1f03: shared with the CA Embeditor route, so both answer in the same shape.
+            return EmbedSlotText.Search(text, ranges, pattern, contextLines);
+        }
 
-            var lines = source.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
-            Regex rx;
-            try { rx = new Regex(pattern, RegexOptions.IgnoreCase); }
-            catch (Exception ex) { return "Error: invalid pattern — " + ex.Message; }
-
-            // Collect [start, end] ranges for each match (with context), then merge overlaps
-            var ranges = new List<int[]>();
-            for (int i = 0; i < lines.Length; i++)
+        /// <summary>73bd1f03 fix (2): the column of the embed point whose slot starts at 1-based
+        /// <paramref name="lineNumber"/> of the native embeditor document (what WriteEmbedContentByLine indents
+        /// to), or 0 when no embed point starts there. UI thread only.</summary>
+        public int GetEmbedColumn(int lineNumber)
+        {
+            try
             {
-                if (rx.IsMatch(lines[i]))
+                var editor = GetClaGenEditor();
+                var textControl = editor != null ? GetProp(editor, "TextEditorControl") : null;
+                var document = textControl != null ? GetProp(textControl, "Document") : null;
+                var lineManager = document != null ? GetProp(document, "CustomLineManager") : null;
+                var customLines = lineManager != null ? GetProp(lineManager, "CustomLines") as System.Collections.IEnumerable : null;
+                if (customLines == null) return 0;
+                foreach (var cl in customLines)
                 {
-                    int from = Math.Max(0, i - contextLines);
-                    int to   = Math.Min(lines.Length - 1, i + contextLines);
-                    ranges.Add(new[] { from, to });
+                    if (cl == null) continue;
+                    var startNr = GetProp(cl, "StartLineNr");
+                    if (startNr == null || (int)startNr != lineNumber - 1) continue;
+                    var pweePart = GetProp(cl, "PweePart");
+                    if (pweePart == null || pweePart.GetType().GetInterface("SoftVelocity.Generator.PWEE.IPweeEmbedPoint") == null)
+                        return 0;
+                    var textSection = GetProp(pweePart, "Text");
+                    return textSection != null ? Convert.ToInt32(GetProp(textSection, "Column") ?? 1) : 1;
                 }
             }
-
-            if (ranges.Count == 0)
-                return "No matches for: " + pattern;
-
-            // Merge overlapping/adjacent ranges
-            var merged = new List<int[]> { ranges[0] };
-            foreach (var r in ranges)
-            {
-                var last = merged[merged.Count - 1];
-                if (r[0] <= last[1] + 1) last[1] = Math.Max(last[1], r[1]);
-                else merged.Add(new[] { r[0], r[1] });
-            }
-
-            const int MaxOutputChars = 6000;
-            var sb = new StringBuilder();
-            sb.AppendLine("Matches for: " + pattern);
-            int blocksEmitted = 0;
-            foreach (var m in merged)
-            {
-                var block = new StringBuilder();
-                block.AppendLine("--- lines " + (m[0] + 1) + "–" + (m[1] + 1) + " ---");
-                for (int i = m[0]; i <= m[1]; i++)
-                    block.AppendLine(lines[i]);
-
-                if (sb.Length + block.Length > MaxOutputChars)
-                {
-                    int remaining = merged.Count - blocksEmitted;
-                    sb.AppendLine("... [" + remaining + " more block(s) truncated — use a more specific pattern]");
-                    break;
-                }
-                sb.Append(block);
-                blocksEmitted++;
-            }
-            return sb.ToString().TrimEnd();
+            catch { }
+            return 0;
         }
 
         /// <summary>

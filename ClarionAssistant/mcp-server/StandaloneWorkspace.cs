@@ -20,7 +20,7 @@ namespace ClarionAssistant.McpServer
     /// state that the tools already report properly, and killing the process over it would take
     /// the other 46 tools down with it.
     /// </summary>
-    internal sealed class StandaloneWorkspace : IWorkspaceContext
+    internal sealed class StandaloneWorkspace : IWorkspaceContext, IVersionNoteSource
     {
         private readonly object _lock = new object();
         private readonly string _solutionPath;
@@ -28,7 +28,6 @@ namespace ClarionAssistant.McpServer
         /// <summary>Version name from --clarion-version, or null. Outranks every other tier.</summary>
         private readonly string _versionOverride;
 
-        private bool _versionResolved;
         private ClarionVersionConfig _versionConfig;
         private string _versionNote;
 
@@ -182,211 +181,114 @@ namespace ClarionAssistant.McpServer
         {
             get
             {
-                lock (_lock)
-                {
-                    if (!_versionResolved)
-                    {
-                        _versionResolved = true;
-                        try
-                        {
-                            var info = ClarionVersionService.Detect();
-                            if (info == null)
-                            {
-                                _versionNote = "no Clarion version: ClarionProperties.xml could not be "
-                                    + "found or parsed, so redirection, library paths and the build root "
-                                    + "are unavailable.";
-                            }
-                            if (info != null)
-                            {
-                                // ---- TIER 1: --clarion-version. Explicit beats everything. ----
-                                if (_versionOverride != null)
-                                {
-                                    _versionConfig = FindByName(info, _versionOverride);
-                                    if (_versionConfig != null)
-                                    {
-                                        _versionNote = "Clarion version " + _versionConfig.Name
-                                            + " [chosen by: --clarion-version]";
-                                        return _versionConfig;
-                                    }
-                                    // Named and not found. Say so and STOP rather than falling
-                                    // through: the user stated an intent, and quietly serving a
-                                    // different Clarion is the failure this tier exists to prevent.
-                                    _versionNote = "no Clarion version: --clarion-version '" + _versionOverride
-                                        + "' matches nothing installed. " + InstalledList(info);
-                                    return null;
-                                }
-
-                                // ---- TIER 2: the solution's own committed clarion-assistant.json ----
-                                // Above both machine-shaped tiers below, because it is the only one
-                                // that is a property of the PROJECT rather than of this machine.
-                                string fileNote;
-                                string wanted = SolutionClarionVersion.Read(_solutionPath, out fileNote);
-                                if (wanted != null)
-                                {
-                                    _versionConfig = FindByName(info, wanted);
-                                    if (_versionConfig != null)
-                                    {
-                                        _versionNote = "Clarion version " + _versionConfig.Name + " [chosen by: "
-                                            + SolutionClarionVersion.FileName + " next to the solution]";
-                                        return _versionConfig;
-                                    }
-                                    _versionNote = "no Clarion version: " + SolutionClarionVersion.FileName
-                                        + " asks for '" + wanted + "', which matches nothing installed. "
-                                        + InstalledList(info);
-                                    return null;
-                                }
-                                if (fileNote != null)
-                                {
-                                    // The file was there and unusable. Carried into whatever the
-                                    // lower tiers decide, so a broken config never passes for absent.
-                                    fileNote = "ignoring " + fileNote + " ";
-                                }
-
-                                // PREFER THE CLARION THIS SERVER IS INSTALLED UNDER, over the one
-                                // the machine calls "current".
-                                //
-                                // The installer places a copy in EVERY selected Clarion's addin
-                                // folder, so there can be four of these, and Detect() answers the
-                                // same machine-global question for all of them. A copy under
-                                // C:\Clarion12 was reporting a Clarion 10 root and a POSitive .red
-                                // - which then drives redirection, library paths and the root used
-                                // for builds, all against the wrong Clarion. Spotted by CC, who
-                                // noticed the version profile did not match the addin serving it
-                                // and asked rather than assuming it was an app association.
-                                //
-                                // Its own location is the better signal and cannot drift: the exe
-                                // sits at <ClarionRoot>\accessory\addins\ClarionAssistant\.
-                                string ownRoot = DeriveClarionRootFromLocation();
-                                if (ownRoot != null && info.Versions != null)
-                                {
-                                    _versionConfig = info.Versions.Find(v =>
-                                        v != null && !string.IsNullOrEmpty(v.RootPath) &&
-                                        string.Equals(v.RootPath.TrimEnd('\\'), ownRoot.TrimEnd('\\'),
-                                                      StringComparison.OrdinalIgnoreCase));
-                                }
-                                if (_versionConfig != null)
-                                {
-                                    _versionNote = fileNote + "Clarion version " + _versionConfig.Name
-                                        + " [chosen by: the Clarion tree this server is installed under]"
-                                        + Ambiguity(info);
-                                    return _versionConfig;
-                                }
-
-                                // ---- TIER 4: the machine's "current". The weakest signal there is. ----
-                                // Not installed under a Clarion tree (a dev build, or a copy the
-                                // user put elsewhere), or that root has no configured version:
-                                // fall back to the machine's current, which is all there is to go on.
-                                _versionConfig = info.GetCurrentConfig();
-                                _versionNote = _versionConfig == null
-                                    ? fileNote + "no Clarion version: none of the tiers resolved one. " + InstalledList(info)
-                                    : fileNote + "Clarion version " + _versionConfig.Name
-                                        + " [chosen by: the machine's current version, no project setting]"
-                                        + Ambiguity(info);
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            _versionConfig = null;
-                            _versionNote = "no Clarion version: resolution failed - " + ex.Message;
-                        }
-                    }
-                    return _versionConfig;
-                }
+                string note;
+                var cfg = VersionConfigFor(_solutionPath, out note);
+                lock (_lock) { _versionConfig = cfg; _versionNote = note; }
+                return cfg;
             }
         }
 
         /// <summary>
-        /// Exact-then-case-insensitive match on the version NAME as ClarionProperties.xml records
-        /// it. Nothing fuzzier: "Clarion11" and "Clarion11.1" are different installs, and a
-        /// helpful prefix match between them would pick the wrong compiler with no way to tell.
-        /// </summary>
-        private static ClarionVersionConfig FindByName(ClarionVersionInfo info, string name)
-        {
-            if (info == null || info.Versions == null || string.IsNullOrEmpty(name)) return null;
-            return info.Versions.Find(v => v != null && v.Name == name)
-                ?? info.Versions.Find(v => v != null &&
-                       string.Equals(v.Name, name, StringComparison.OrdinalIgnoreCase));
-        }
-
-        /// <summary>
-        /// Version names as configured, newest-looking first and CAPPED.
+        /// The Clarion version for <paramref name="solutionPath"/> and the sentence saying which source chose it
+        /// (0ce0b5e2): SolutionVersionResolver's order - --clarion-version, clarion-assistant.json, the IDE's own
+        /// choice for this solution (live from the record the launching IDE publishes, else its saved
+        /// preferences), then the Clarion tree this server is installed under.
         ///
-        /// The cap is not cosmetic. This was written expecting a handful and measured against a
-        /// real machine carrying 27 — Clarion 10 and 11 point releases, Clarion.NET entries and
-        /// several per-product profiles. Printing all of them buried the sentence that mattered
-        /// under a paragraph of names, which is how a diagnostic stops being read. Showing the
-        /// most likely few and counting the rest keeps the message actionable.
+        /// PER SOLUTION and RE-ASKED, not latched once: the language server can follow a solution other than
+        /// --solution (the IDE's, 77aceec5), and the IDE's choice can change while this server runs (Build > Set
+        /// Clarion Version, or a solution switch). The answer is cached per solution against the IDE record it was
+        /// decided from, so an unchanged record costs one file stat (IdeSolutionRecord.ReadDetailsCached).
         /// </summary>
-        private static string Names(ClarionVersionInfo info, int max)
+        public ClarionVersionConfig VersionConfigFor(string solutionPath, out string note)
         {
-            var names = new List<string>();
-            if (info != null && info.Versions != null)
-                foreach (var v in info.Versions)
-                    if (v != null && !string.IsNullOrEmpty(v.Name)) names.Add(v.Name);
-
-            // REAL COMPILER NAMES FIRST, newest-looking first within them.
-            //
-            // A plain descending sort was tried and was worse than no sort: on the measured
-            // machine it led with "ScriptManager", "POSitive v8 c11", "POSitive v8 C10" and
-            // pushed "Clarion 12.0.14000" past the cap entirely — so the one name a reader was
-            // most likely to want was the one the truncation hid. The list mixes actual Clarion
-            // installs with free-form per-product profiles, and only the former answer "which
-            // compiler?", so they sort first. Descending is ordinal, not natural-numeric: it is
-            // close enough among "Clarion 10/11.0/11.1/12.0" and cannot throw on a profile name
-            // that no version parser would accept anyway.
-            names.Sort(delegate(string a, string b)
+            lock (_lock)
             {
-                bool ca = a.StartsWith("Clarion ", StringComparison.OrdinalIgnoreCase);
-                bool cb = b.StartsWith("Clarion ", StringComparison.OrdinalIgnoreCase);
-                if (ca != cb) return ca ? -1 : 1;
-                return string.Compare(b, a, StringComparison.OrdinalIgnoreCase);
-            });
+                if (!_hostResolved)
+                {
+                    _hostResolved = true;
+                    try
+                    {
+                        // Detects for the Clarion tree this server is installed under (GH #247). NULL when this
+                        // server is not inside a Clarion tree: only a NAMED version then resolves.
+                        _hostInfo = ClarionVersionService.Detect();
+                        _hostRoot = ClarionVersionService.InstalledClarionRoot();
+                    }
+                    catch (Exception ex) { _hostError = ex.Message; }
+                }
+                if (_hostError != null)
+                {
+                    note = "no Clarion version: resolution failed - " + _hostError;
+                    return null;
+                }
 
-            if (names.Count <= max) return string.Join(", ", names.ToArray());
-            return string.Join(", ", names.GetRange(0, max).ToArray())
-                + ", and " + (names.Count - max) + " more";
+                IdeSolutionRecord.Details rec = null;
+                int? idePid = McpToolRegistry.IdeProcessId;
+                if (idePid.HasValue)
+                {
+                    string recNote;
+                    rec = IdeSolutionRecord.ReadDetailsCached(idePid.Value, out recNote);
+                }
+                string recordKey = rec == null ? "-" : (rec.Solution + "|" + rec.VersionChoice + "|" + rec.ConfigDir);
+                string cacheKey = (solutionPath ?? "").ToLowerInvariant();
+
+                CachedVersion cached;
+                if (_versionCache.TryGetValue(cacheKey, out cached) && cached.RecordKey == recordKey)
+                {
+                    note = cached.Note;
+                    return cached.Config;
+                }
+
+                SolutionVersionChoice choice;
+                try
+                {
+                    string pinNote;
+                    string pinned = SolutionClarionVersion.Read(solutionPath, out pinNote);
+                    var info = _hostInfo;
+                    choice = SolutionVersionResolver.Resolve(new SolutionVersionInputs
+                    {
+                        SolutionPath = solutionPath,
+                        CommandLineVersion = _versionOverride,
+                        PinnedVersion = pinned,
+                        PinNote = pinNote,
+                        IdeRecord = rec,
+                        PreferencesDir = info != null ? IdeSolutionPreferences.PreferencesDirFor(info.PropertiesXmlPath) : null,
+                        HostInfo = info,
+                        HostRoot = _hostRoot,
+                        // Every settings folder is searched, since a NAMED version needs no host Clarion to pick
+                        // the folder (#247); the copy in that entry's OWN folder beats this Clarion's (#244).
+                        FindNamed = name => ClarionVersionService.FindNamedVersion(info, name)
+                    });
+                }
+                catch (Exception ex)
+                {
+                    note = "no Clarion version: resolution failed - " + ex.Message;
+                    _versionCache[cacheKey] = new CachedVersion { RecordKey = recordKey, Config = null, Note = note };
+                    return null;
+                }
+
+                note = (choice.Note ?? "").Replace("\r\n", " ").Replace("\r", " ").Replace("\n", " ");
+                string was = cached != null && cached.Config != null ? cached.Config.Name : null;
+                string now = choice.Config != null ? choice.Config.Name : null;
+                if (cached != null && !string.Equals(was, now, StringComparison.Ordinal))
+                    LspTrace.Write("[StandaloneWorkspace] Clarion version for " + (solutionPath ?? "(no solution)")
+                        + " changed: " + note);
+                _versionCache[cacheKey] = new CachedVersion { RecordKey = recordKey, Config = choice.Config, Note = note };
+                return choice.Config;
+            }
         }
 
-        private static int NameCount(ClarionVersionInfo info)
+        private sealed class CachedVersion
         {
-            int n = 0;
-            if (info != null && info.Versions != null)
-                foreach (var v in info.Versions) if (v != null && !string.IsNullOrEmpty(v.Name)) n++;
-            return n;
+            public string RecordKey;
+            public ClarionVersionConfig Config;
+            public string Note;
         }
 
-        /// <summary>The installed version names, for an error the reader can act on immediately.</summary>
-        private static string InstalledList(ClarionVersionInfo info)
-        {
-            if (NameCount(info) == 0) return "No Clarion versions are configured on this machine.";
-
-            return "Installed (" + NameCount(info) + "): " + Names(info, 8)
-                + ". Name one EXACTLY in " + SolutionClarionVersion.FileName
-                + " next to the solution - the name must match what Clarion records, and no"
-                + " prefix matching is done, because \"Clarion 11.0\" and \"Clarion 11.1\" are"
-                + " different compilers.";
-        }
-
-        /// <summary>
-        /// Appended when a MACHINE-shaped tier decided while more than one Clarion is installed.
-        ///
-        /// This is the whole point of the item. With one install every tier agrees and the
-        /// provenance is a curiosity. With four or more they routinely disagree, and the choice
-        /// silently sets the redirection file, the library search paths and the build root — so a
-        /// guess that is right today breaks the moment the server is launched from elsewhere.
-        /// Saying which alternatives existed, and naming the file that would settle it, turns an
-        /// invisible guess into a decision the developer can make once and commit.
-        /// </summary>
-        private static string Ambiguity(ClarionVersionInfo info)
-        {
-            int n = NameCount(info);
-            if (n < 2) return "";
-
-            return " - GUESSED, from " + n + " configured (" + Names(info, 5)
-                + "). This is a property of THIS MACHINE, not of the project, and will change if the"
-                + " server is launched from elsewhere. Commit " + SolutionClarionVersion.FileName
-                + " next to the solution to settle it.";
-        }
+        private bool _hostResolved;
+        private ClarionVersionInfo _hostInfo;
+        private string _hostRoot;
+        private string _hostError;
+        private readonly Dictionary<string, CachedVersion> _versionCache = new Dictionary<string, CachedVersion>();
 
         /// <summary>
         /// Root of the Clarion installation, from the detected version config.
@@ -402,56 +304,28 @@ namespace ClarionAssistant.McpServer
             return cfg != null ? cfg.RootPath : null;
         }
 
-        /// <summary>
-        /// The Clarion root this executable is installed under, or null when it is not inside one.
-        ///
-        /// The installer places the server at &lt;ClarionRoot&gt;\accessory\addins\ClarionAssistant\,
-        /// so the root is three levels up. VERIFIED rather than assumed: the folder names must
-        /// actually be accessory\addins\ClarionAssistant, and the result must contain a bin
-        /// directory. A path-arithmetic guess with no check would happily return "H:\DevLaptop"
-        /// for a development build and then hand every redirection lookup a fabricated root -
-        /// worse than admitting it does not know, because it would look like an answer.
-        /// </summary>
-        private static string DeriveClarionRootFromLocation()
-        {
-            try
-            {
-                string dir = Path.GetDirectoryName(
-                    System.Reflection.Assembly.GetExecutingAssembly().Location);
-                if (string.IsNullOrEmpty(dir)) return null;
-
-                var expected = new[] { "ClarionAssistant", "addins", "accessory" };
-                string cursor = dir;
-                foreach (var name in expected)
-                {
-                    if (cursor == null) return null;
-                    if (!string.Equals(Path.GetFileName(cursor.TrimEnd('\\')), name,
-                                       StringComparison.OrdinalIgnoreCase))
-                        return null;
-                    cursor = Path.GetDirectoryName(cursor.TrimEnd('\\'));
-                }
-
-                if (string.IsNullOrEmpty(cursor)) return null;
-                return Directory.Exists(Path.Combine(cursor, "bin")) ? cursor : null;
-            }
-            catch { return null; }
-        }
-
         public RedFileService RedFile
         {
             get
             {
+                // Re-loaded when the version moves (0ce0b5e2): the IDE's choice for the solution can change
+                // while this server runs, and the .red is that version's.
+                var cfg = CurrentVersionConfig;
+                string name = cfg != null ? cfg.Name : null;
                 lock (_lock)
                 {
-                    if (!_redResolved)
+                    if (!_redResolved || !string.Equals(name, _redVersionName, StringComparison.Ordinal))
                     {
                         _redResolved = true;
-                        _redFile = LoadRedFile();
+                        _redVersionName = name;
+                        _redFile = LoadRedFile(cfg);
                     }
                     return _redFile;
                 }
             }
         }
+
+        private string _redVersionName;
 
         /// <summary>
         /// The addin distinguishes these because it resolves one per ACTIVE PROJECT, which can
@@ -462,9 +336,8 @@ namespace ClarionAssistant.McpServer
         /// </summary>
         public RedFileService ActiveRedFileService { get { return RedFile; } }
 
-        private RedFileService LoadRedFile()
+        private RedFileService LoadRedFile(ClarionVersionConfig cfg)
         {
-            var cfg = CurrentVersionConfig;
             if (cfg == null) return null;
 
             var svc = new RedFileService();

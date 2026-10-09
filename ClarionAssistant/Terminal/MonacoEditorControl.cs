@@ -247,6 +247,16 @@ namespace ClarionAssistant.Terminal
         // changed; requests carry `v`. ONE cached copy per surface, replaced on every sync. See
         // MonacoBufferSync.cs for why (a 3.2 MB buffer per request crashed a 32-bit Clarion.exe).
         private readonly MonacoBufferCache _bufferCache = new MonacoBufferCache();
+
+        // fc420c30: host -> page requests that wait for the page's answer (the MCP editor tools routed to the CA Editor).
+        private readonly Services.HostRequestBroker _hostRequests;
+
+        /// <summary>fc420c30: ask the page and wait for its answer. NEVER on the UI thread (the answer arrives there);
+        /// see HostRequestBroker for the wire shape and the exceptions.</summary>
+        public Dictionary<string, object> Request(string action, Dictionary<string, object> args, int timeoutMs)
+        {
+            return _hostRequests.Request(action, args, timeoutMs);
+        }
         private readonly LaneSet _lanes = new LaneSet();   // RunLatest lanes, see MonacoBufferSync.cs
         private readonly Debouncer _fileStateSpanMap = new Debouncer(400);   // F7: one span map per pause in file mode
 
@@ -423,6 +433,11 @@ namespace ClarionAssistant.Terminal
                                    string virtualHost = "clarion-embeditor-data")
         {
             _host = host;
+            // fc420c30: the control is built on the UI thread; the page's replies arrive there, so the broker refuses
+            // to wait on it.
+            int uiThreadId = System.Threading.Thread.CurrentThread.ManagedThreadId;
+            _hostRequests = new Services.HostRequestBroker(PostJson,
+                () => System.Threading.Thread.CurrentThread.ManagedThreadId == uiThreadId);
             _htmlFileName = string.IsNullOrEmpty(htmlFileName) ? "monaco-embeditor.html" : htmlFileName;
             _virtualHost = string.IsNullOrEmpty(virtualHost) ? "clarion-embeditor-data" : virtualHost;
 
@@ -446,11 +461,18 @@ namespace ClarionAssistant.Terminal
         {
             if (_isInitializing || _isInitialized) return;
             _isInitializing = true;
+            // 7116020b: a failed init used to go to Debug.WriteLine only (nowhere in a deployed build), so the
+            // overlay silently left the native embeditor showing. Log start/fail/navigated with a memory snapshot.
+            _initSw = System.Diagnostics.Stopwatch.StartNew();
+            string phase = "environment";
+            MonacoSpikeLog.WriteWithMemAsync("[webview-init] start host=" + HostName);
 
             try
             {
                 var environment = await WebView2EnvironmentCache.GetEnvironmentAsync();
+                phase = "ensureCore";
                 await _webView.EnsureCoreWebView2Async(environment);
+                phase = "configure";
 
                 _tempDir = Path.Combine(Path.GetTempPath(), "ClarionEmbeditor_" + Guid.NewGuid().ToString("N").Substring(0, 8));
                 Directory.CreateDirectory(_tempDir);
@@ -472,22 +494,89 @@ namespace ClarionAssistant.Terminal
 
                 _webView.CoreWebView2.WebMessageReceived += OnWebMessageReceived;
                 _webView.CoreWebView2.NavigationCompleted += OnNavigationCompleted;
+                _webView.CoreWebView2.ProcessFailed += OnProcessFailed;   // 7116020b: a renderer OOM/crash was invisible
+                phase = "navigate";
 
                 string htmlPath = GetHtmlPath();
                 if (File.Exists(htmlPath))
                     _webView.CoreWebView2.Navigate(new Uri(htmlPath).AbsoluteUri + "?v=" + File.GetLastWriteTimeUtc(htmlPath).Ticks);
                 else
+                {
                     System.Diagnostics.Debug.WriteLine("[MonacoEditorControl] HTML missing: " + htmlPath);
+                    MonacoSpikeLog.Write("[webview-init] FAILED host=" + HostName + " phase=navigate reason=html-missing path=" + htmlPath);
+                    RaiseInitFailed("its page file is missing (" + Path.GetFileName(htmlPath) + ")");
+                }
             }
             catch (Exception ex)
             {
                 _isInitializing = false; // allow retry
                 System.Diagnostics.Debug.WriteLine("[MonacoEditorControl] Init error: " + ex.Message);
+                MonacoSpikeLog.Write("[webview-init] FAILED host=" + HostName + " phase=" + phase
+                    + " ms=" + (_initSw != null ? _initSw.ElapsedMilliseconds : -1)
+                    + " ex=" + ex.GetType().Name + " hr=0x" + ex.HResult.ToString("x8")
+                    + " msg=" + (ex.Message ?? "").Replace("\r", " ").Replace("\n", " ")
+                    + (ex.InnerException != null ? " inner=" + ex.InnerException.GetType().Name + ":" + ex.InnerException.Message : "")
+                    + " " + MonacoSpikeLog.MemSummary());
+                string reason = ex is OutOfMemoryException || ex.HResult == unchecked((int)0x8007000E)
+                    ? "Clarion is out of memory"
+                    : "the browser component failed to start (" + ex.GetType().Name + ")";
+                // b9d70104: closing a solution can show a never-displayed CA Editor tab for a moment, which starts
+                // WebView2, and the close then destroys its window mid-start: E_ABORT. That is not a failure to
+                // report. The exception can arrive before the dispose has run, so decide a moment later.
+                if (ex.HResult == E_ABORT) { RaiseInitFailedUnlessClosed(reason); return; }
+                RaiseInitFailed(reason);
             }
         }
 
+        private const int E_ABORT = unchecked((int)0x80004004);
+        private const int AbortSettleMs = 750;
+
+        private bool IsClosedForInit
+        {
+            get { return _disposedControl || IsDisposed || Disposing || _webView == null || _webView.IsDisposed || !IsHandleCreated; }
+        }
+
+        private void RaiseInitFailedUnlessClosed(string reason)
+        {
+            if (IsClosedForInit) { MonacoSpikeLog.Write("[webview-init] aborted host=" + HostName + ": the editor closed while starting (no notice)"); return; }
+            var settle = new Timer { Interval = AbortSettleMs };
+            settle.Tick += (s, e) =>
+            {
+                settle.Stop(); settle.Dispose();
+                if (IsClosedForInit) { MonacoSpikeLog.Write("[webview-init] aborted host=" + HostName + ": the editor closed while starting (no notice)"); return; }
+                MonacoSpikeLog.Write("[webview-init] E_ABORT but the editor is still open after " + AbortSettleMs + " ms -> reporting it");
+                RaiseInitFailed(reason);
+            };
+            settle.Start();
+        }
+
+        private void OnProcessFailed(object sender, CoreWebView2ProcessFailedEventArgs e)
+        {
+            string detail = "";
+            try { detail = " reason=" + e.Reason + " exit=" + e.ExitCode + " desc=" + e.ProcessDescription; } catch { }
+            MonacoSpikeLog.Write("[webview-init] PROCESS FAILED host=" + HostName + " kind=" + e.ProcessFailedKind
+                + detail + " " + MonacoSpikeLog.MemSummary());
+        }
+
+        /// <summary>7116020b: WebView2 could not start (or the page is missing), so this surface will never
+        /// load. Raised on the UI thread with a short human-readable reason. Hosts use it to put the native
+        /// editor back and say so, instead of leaving a blank or silently native surface.</summary>
+        public event Action<MonacoEditorControl, string> InitFailed;
+
+        private void RaiseInitFailed(string reason)
+        {
+            try { var h = InitFailed; if (h != null) h(this, reason); }
+            catch (Exception ex) { MonacoSpikeLog.Write("[webview-init] InitFailed handler error: " + ex.Message); }
+        }
+
+        private System.Diagnostics.Stopwatch _initSw;
+        private string HostName { get { return _host != null ? _host.GetType().Name : "none"; } }
+
         private void OnNavigationCompleted(object sender, CoreWebView2NavigationCompletedEventArgs e)
         {
+            MonacoSpikeLog.Write("[webview-init] navigated host=" + HostName + " ok=" + e.IsSuccess
+                + (e.IsSuccess ? "" : " status=" + e.WebErrorStatus)
+                + " ms=" + (_initSw != null ? _initSw.ElapsedMilliseconds : -1));
             _isInitialized = e.IsSuccess;
             _isInitializing = false;
             // Source push is triggered by the JS "ready" message (OnReady), not here — avoids a double-send.
@@ -539,6 +628,11 @@ namespace ClarionAssistant.Terminal
                                 ? Convert.ToString(hh, System.Globalization.CultureInfo.InvariantCulture) : null;
                             Services.LocalLayerHandlers.AcceptHeader(hash, htext, MonacoSpikeLog.Write);
                         }
+                        return;
+                    case "hostReply":
+                        // fc420c30: the page's answer to a host request (HostRequestBroker). Host-agnostic: the waiter
+                        // is on another thread, and a late answer (its waiter gave up) is dropped.
+                        _hostRequests.Complete(json);
                         return;
                     case "log":
                         // 1c685f2e item 0: a line the page wrote ([local-rt] ...), cleaned + capped, else verbatim.
@@ -604,6 +698,8 @@ namespace ClarionAssistant.Terminal
                         // A (re)loaded page restarts its sync versions at 1: drop the previous load's copy so a
                         // stale v can never match it. The page always syncs before its first request anyway.
                         _bufferCache.Clear();
+                        MonacoSpikeLog.Write("[webview-init] ready host=" + HostName
+                            + " ms=" + (_initSw != null ? _initSw.ElapsedMilliseconds : -1));
                         h.OnReady(this);
                         break;
                     case "save":              h.OnSave(this, json); break;

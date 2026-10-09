@@ -30,6 +30,12 @@
 #
 # Run:  powershell -ExecutionPolicy Bypass -File ClarionAssistant\tests\LspDiagnostics.SemanticPassTest.ps1
 # Exit: 0 pass, 1 fail, 2 could-not-run (suite counts 2 as a failure, never as green).
+#
+# -NoVersion (06632787) runs the same assertions with NO Clarion version: --clarion-version is not
+# passed and the fixture names none, so the server resolves none. It must STILL send clarion/updatePaths
+# (solution and project paths only); before 06632787 it sent nothing, the language server never loaded the
+# solution, and second.clw stayed pending. LspDiagnostics.NoVersionTest.ps1 runs this mode in the suite.
+param([switch]$NoVersion)
 
 $ErrorActionPreference = 'Stop'
 $failures = New-Object System.Collections.Generic.List[string]
@@ -79,6 +85,51 @@ Copy-Item (Join-Path $fixtureSrc '*') $work -Force
 $sln    = Join-Path $work 'ctrl.sln'
 $second = Join-Path $work 'second.clw'   # two undeclared names + four cross-file globals
 $clean  = Join-Path $work 'ctrl.clw'     # the clean control
+
+# ---------------------------------------------------------------- the Clarion version, NAMED
+# Until 06632787, without a Clarion version the server sent the language server no clarion/updatePaths, so
+# it was never told the solution: no solutionReady, no index build, and the async semantic pass second.clw
+# needs stayed `deferred` (the server reschedules its no-solution drain for up to 60s while a solution looks
+# to be on its way). The budget then expired and the answer was pending:true. 06632787 sends the solution
+# without a version; -NoVersion guards that. The default mode still names a version, so it also covers the
+# full updatePaths shape (redirection file, macros, libsrc).
+#
+# This used to work by accident. The fixture named 'Clarion 12.0.14000' in clarion-assistant.json, which
+# exists on almost no machine, and the server silently fell back to the newest settings folder's current
+# version. GH #247 (PR #248, 3edcc85) removed that guess on purpose - a server outside a Clarion tree now
+# reports NO version unless one is named - and from that merge on this test failed on every machine
+# without that exact build. So the harness NAMES one with --clarion-version (tier 1, outranks everything),
+# picked from what this machine actually has registered: a stock Win32 'Clarion N.N.NNNNN' entry, newest
+# first. Clarion.NET entries are excluded (#247: never hand a Win32 project the .NET .red).
+$clarionVersion = $null
+if (-not $NoVersion) {
+try {
+    $settingsRoot = Join-Path $env:APPDATA 'SoftVelocity\Clarion'
+    $names = @()
+    if (Test-Path $settingsRoot) {
+        foreach ($f in Get-ChildItem $settingsRoot -Directory | ForEach-Object { Join-Path $_.FullName 'ClarionProperties.xml' } | Where-Object { Test-Path $_ }) {
+            try {
+                $x = [xml](Get-Content $f -Raw)
+                $names += @($x.SelectNodes("//Properties[@name='Clarion.Versions']/Properties") | ForEach-Object { $_.GetAttribute('name') })
+            } catch { }
+        }
+    }
+    $clarionVersion = $names | Select-Object -Unique |
+        Where-Object { $_ -match '^Clarion (\d+\.\d+\.\d+)$' } |
+        Sort-Object { [version]($_ -replace '^Clarion ', '') } -Descending |
+        Select-Object -First 1
+}
+catch { }
+if (-not $clarionVersion) {
+    Write-Host "COULD NOT RUN: no Win32 Clarion version is registered under %APPDATA%\SoftVelocity\Clarion." -ForegroundColor Red
+    Write-Host "  The language server needs one (clarion/updatePaths) to load the solution and finish the semantic pass." -ForegroundColor Red
+    exit 2
+}
+Write-Host "  clarion: $clarionVersion (named with --clarion-version)"
+}
+else {
+    Write-Host "  clarion: none (-NoVersion) - updatePaths must still carry the solution"
+}
 
 # ---------------------------------------------------------------- the server to test against
 # GH #216. The PINNED bundled server (lsp-server-sync\lsp-snapshot.json currentPin) is what the addin
@@ -139,6 +190,7 @@ try {
     # --debug routes the LSP trace to stderr, which is how the preflight below can tell
     # "the server said the file is clean" apart from "the language server never started".
     $psi.Arguments = '--stdio --debug --solution "' + $sln + '"'
+    if ($clarionVersion) { $psi.Arguments += ' --clarion-version "' + $clarionVersion + '"' }
     $psi.UseShellExecute        = $false
     $psi.RedirectStandardInput  = $true
     $psi.RedirectStandardOutput = $true
@@ -174,6 +226,23 @@ try {
         Write-Host "  Needs node on PATH and msarson's Clarion extension installed." -ForegroundColor Yellow
         Write-Host "  --- server stderr ---" -ForegroundColor DarkGray
         ($stderr -split "`n" | Select-Object -Last 25) | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+        exit 2
+    }
+    # In -NoVersion mode a version must really NOT have resolved, or the run proves nothing about that path.
+    if ($NoVersion -and $stderr -match 'version from host: Clarion|Clarion version: Clarion') {
+        Write-Host "COULD NOT RUN: -NoVersion, but a Clarion version still resolved on this machine." -ForegroundColor Yellow
+        exit 2
+    }
+    # Likewise if the named version did not resolve: no updatePaths means no solution, so the semantic pass
+    # stays deferred and second.clw reads pending:true - which would otherwise be misreported as b7505691.
+    # In -NoVersion mode that is the defect itself (06632787), so it FAILS rather than could-not-run.
+    if ($NoVersion) {
+        Assert-That ($stderr -match 'Sending clarion/updatePaths') `
+            "no Clarion version and clarion/updatePaths was never sent - the language server cannot load the solution (06632787 has regressed)"
+    }
+    elseif ($stderr -notmatch 'Sending clarion/updatePaths') {
+        Write-Host "COULD NOT RUN: the language server was never sent clarion/updatePaths ('$clarionVersion' did not resolve)." -ForegroundColor Yellow
+        ($stderr -split "`n" | Where-Object { $_ -match 'Clarion version|version from host' }) | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
         exit 2
     }
 

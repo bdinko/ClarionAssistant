@@ -57,6 +57,11 @@ namespace ClarionAssistant
         // initializing); if that becomes an issue, move consumption into the
         // synchronous per-handler tab-creation paths.
         private string _pendingLaunchBackend;
+        // The dashboard dropdown's current value (d4e941e3). The COM Controls / IDE Addins tabs open project
+        // terminals but have no dropdown of their own, so they launch with whatever the dashboard shows.
+        private string _dashboardBackend;
+        // What the header's SOLUTION field last showed: open in the IDE, or CA's last solution kept on (d4e941e3).
+        private bool _solutionShownOpen;
         private ClarionVersionInfo _versionInfo;
         private ClarionVersionConfig _currentVersionConfig;
         private RedFileService _redFileService;
@@ -64,10 +69,6 @@ namespace ClarionAssistant
         private string _redFileDisplay = "(not loaded)";
         private string _redFileCss = "warning";
         private DiffService _diffService;
-
-        // Counter used when a tab's display name is empty, to give the
-        // multiterminal-channel plugin a unique agent name.
-        private int _caTabCounter;
 
         // LSP UI state: bottom status bar + stay-on-top diagnostics form
         private System.Windows.Forms.Timer _lspUiTimer;
@@ -129,6 +130,7 @@ namespace ClarionAssistant
             {
                 if (!SchemaViewAlive) return;
                 _schemaView.ZoomFactor = _header.ZoomFactor;
+                _schemaView.ScaleCorrection = _header.ScaleCorrection;
                 _schemaView.PaneHeight = _header.PanePixelHeight;
             };
 
@@ -138,7 +140,7 @@ namespace ClarionAssistant
                 Dock = DockStyle.Top,
                 Height = 28,
                 BackColor = _isDarkTheme ? Color.FromArgb(24, 24, 37) : Color.FromArgb(210, 214, 222),
-                Visible = false  // hidden until 2+ tabs
+                Visible = false  // TabManager shows it once the Home tab exists
             };
 
             // === Content area (tab pages shown/hidden via Visible) ===
@@ -162,12 +164,7 @@ namespace ClarionAssistant
             // === Tab manager ===
             _tabManager = new TabManager(_tabStrip, _contentArea);
             _tabManager.ActiveTabChanged += OnActiveTabChanged;
-            // TabRemoved fires from CloseTab with the tab still intact and its AgentName still set,
-            // BEFORE tab.Dispose() (ticket 9a0ce0de). That ordering is the point: CloseTab drops the
-            // tab from _tabs first, so by the time anything downstream sweeps the tab list this tab
-            // is already unreachable and its roster entry would be stranded for good.
             _tabManager.TabRemoved += OnTabRemoved;
-
             // Add in correct order (Fill first, then Top items from bottom to top)
             Controls.Add(_contentArea);
             Controls.Add(_tabStrip);
@@ -196,37 +193,40 @@ namespace ClarionAssistant
         private void OnHomeReady(object sender, EventArgs e)
         {
             _homeView.SetTheme(_isDarkTheme);
-            _homeView.SetBackend(_settings.Get("Assistant.Backend") ?? "Claude");
+            string savedBackend = _settings.Get("Assistant.Backend") ?? "Claude";
+            _homeView.SetBackend(savedBackend);
+            _dashboardBackend = savedBackend;   // the page resets its dropdown to the saved default on setBackend
             LoadProjects();
-            SendProjectsToHome();
-            SendGitHubAccountsToHome();
-            SendDefaultProjectFolderToHome();
+            SendProjectsToViews();
         }
 
-        private void SendDefaultProjectFolderToHome()
+        private void SendDefaultProjectFolderToProjectViews()
         {
-            if (!_homeView.IsReady) return;
             try
             {
                 string folder = _settings.Get("COM.ProjectsFolder") ?? "";
-                _homeView.SetDefaultProjectFolder(folder);
+                foreach (var view in OpenProjectViews())
+                    view.SetDefaultProjectFolder(folder);
             }
             catch (Exception ex)
             {
-                System.Diagnostics.Debug.WriteLine("[AssistantChatControl] SendDefaultProjectFolderToHome error: " + ex.Message);
+                System.Diagnostics.Debug.WriteLine("[AssistantChatControl] SendDefaultProjectFolderToProjectViews error: " + ex.Message);
             }
         }
 
-        private void SendGitHubAccountsToHome()
+        private void SendGitHubAccountsToProjectViews()
         {
-            if (!_homeView.IsReady) return;
             try
             {
-                _homeView.SetGitHubAccounts(BuildGitHubAccountsJson());
+                var views = OpenProjectViews();
+                if (views.Count == 0) return;
+                string json = BuildGitHubAccountsJson();
+                foreach (var view in views)
+                    view.SetGitHubAccounts(json);
             }
             catch (Exception ex)
             {
-                System.Diagnostics.Debug.WriteLine("[AssistantChatControl] SendGitHubAccountsToHome error: " + ex.Message);
+                System.Diagnostics.Debug.WriteLine("[AssistantChatControl] SendGitHubAccountsToProjectViews error: " + ex.Message);
             }
         }
 
@@ -257,15 +257,17 @@ namespace ClarionAssistant
             {
                 _pendingLaunchBackend = e.Backend;
             }
+            // Every dashboard message carries the dropdown's value; the COM / Addin tabs launch with it.
+            // Not homeReady: the page posts it before setBackend arrives, so it carries the page's initial
+            // 'Claude', and it can be handled after OnHomeReady has set the saved default.
+            if (!string.IsNullOrEmpty(e.Backend) && e.Action != "homeReady")
+                _dashboardBackend = e.Backend;
 
             switch (e.Action)
             {
-                case "openFolder": OpenFolder(e.Data); break;
-                case "addProject": OnAddProject(e.Data); break;
-                case "editProject": OnEditProject(e.Data); break;
-                case "deleteProject": OnDeleteProject(e.Data); break;
-                case "openProject": OnOpenProject(e.Data); break;
-                case "browseProjectFolder": OnBrowseProjectFolder(e.Data); break;
+                case "backendChanged": break;   // captured into _dashboardBackend above
+                case "openComProjects": OpenProjectsTab(Terminal.ProjectsWebView.KindCom); break;
+                case "openAddinProjects": OpenProjectsTab(Terminal.ProjectsWebView.KindAddin); break;
                 case "workWithSolution": OnWorkWithSolution(); break;
                 case "newChat": OnNewChat(sender, EventArgs.Empty); break;
                 case "evaluateCode": OnEvaluateCode(sender, EventArgs.Empty); break;
@@ -280,8 +282,7 @@ namespace ClarionAssistant
             return action == "newChat"
                 || action == "workWithSolution"
                 || action == "evaluateCode"
-                || action == "createClass"
-                || action == "openProject";
+                || action == "createClass";
         }
 
         /// <summary>
@@ -336,12 +337,12 @@ namespace ClarionAssistant
                 case "evaluateCode": OnEvaluateCode(sender, EventArgs.Empty); break;
                 case "refresh":
                     // Re-read the IDE's Build > Set Clarion Version now (the change hook and 10 s poll do it too).
-                    DetectFromIde();   // also restarts the LSP if the version moved
+                    // Through FollowIdeSolution, not DetectFromIde: if the IDE opened another solution since the
+                    // last poll, the switch must still release the symbol DBs and auto-index it (d4e941e3).
+                    FollowIdeSolution(EditorService.GetOpenSolutionPath());   // also restarts the LSP if the version moved
                     break;
-                case "browse": OnBrowseSolution(sender, EventArgs.Empty); break;
                 case "fullIndex": RunIndex(false); break;
                 case "updateIndex": RunIndex(true); break;
-                case "solutionChanged": OnSolutionChanged(e.Data); break;
                 case "themeChanged": OnThemeChanged(e.Data); break;
                 case "headerTab": OnHeaderTab(e.Data); break;
                 case "copySolutionPath": OnCopySolutionPath(); break;
@@ -446,20 +447,145 @@ namespace ClarionAssistant
             catch { }
         }
 
-        private void SendProjectsToHome()
+        /// <summary>
+        /// A project a COM / Addin tab may see and act on: its own kind, or a legacy "Other" (no longer created,
+        /// shown in both tabs so it stays reachable). The host enforces this; the page's own filter is cosmetic.
+        /// </summary>
+        private static bool ProjectBelongsToKind(ProjectEntry p, string kind)
         {
-            if (!_homeView.IsReady) return;
+            return p != null && (p.Type == kind || p.Type == "Other");
+        }
+
+        /// <summary>The tab's own project by id, or null when the id is unknown or belongs to the other kind.</summary>
+        private ProjectEntry FindProjectForKind(string id, string kind)
+        {
+            if (string.IsNullOrEmpty(id)) return null;
+            var entry = _projects.Find(p => p.Id == id);
+            return ProjectBelongsToKind(entry, kind) ? entry : null;
+        }
+
+        private string BuildProjectsJson(string kind)
+        {
             var sb = new StringBuilder("[");
-            for (int i = 0; i < _projects.Count; i++)
+            bool first = true;
+            foreach (var p in _projects)
             {
-                var p = _projects[i];
-                if (i > 0) sb.Append(",");
+                if (!ProjectBelongsToKind(p, kind)) continue;
+                if (!first) sb.Append(",");
+                first = false;
                 sb.AppendFormat("{{\"id\":\"{0}\",\"name\":\"{1}\",\"type\":\"{2}\",\"folder\":\"{3}\",\"lastAccessed\":{4},\"githubAccountId\":\"{5}\",\"repoName\":\"{6}\"}}",
                     EscJson(p.Id), EscJson(p.Name), EscJson(p.Type), EscJson(p.Folder), p.LastAccessed,
                     EscJson(p.GitHubAccountId ?? ""), EscJson(p.RepoName ?? ""));
             }
             sb.Append("]");
-            _homeView.SetProjectsJson(sb.ToString());
+            return sb.ToString();
+        }
+
+        /// <summary>
+        /// After any project change: the dashboard's card counts, and each open COM / Addin tab its own list (its
+        /// kind plus "Other"). An "Other" project is shown in both tabs, so an edit in one tab must reach the other.
+        /// A card's count is the number of rows its tab shows, so "Other" counts toward both.
+        /// </summary>
+        private void SendProjectsToViews()
+        {
+            if (_homeView.IsReady)
+            {
+                int com = 0, addin = 0;
+                foreach (var p in _projects)
+                {
+                    if (ProjectBelongsToKind(p, Terminal.ProjectsWebView.KindCom)) com++;
+                    if (ProjectBelongsToKind(p, Terminal.ProjectsWebView.KindAddin)) addin++;
+                }
+                _homeView.SetProjectCounts(com, addin);
+            }
+
+            foreach (var view in OpenProjectViews())
+                view.SetProjectsJson(BuildProjectsJson(view.Kind));
+        }
+
+        /// <summary>The open COM Controls / IDE Addins tabs whose page has loaded.</summary>
+        private List<Terminal.ProjectsWebView> OpenProjectViews()
+        {
+            var views = new List<Terminal.ProjectsWebView>();
+            foreach (var tab in _tabManager.Tabs)
+            {
+                var view = tab.ContentControl as Terminal.ProjectsWebView;
+                if (view != null && view.IsReady) views.Add(view);
+            }
+            return views;
+        }
+
+        /// <summary>
+        /// Dashboard COM / Addin card (d4e941e3): bring that kind's tab forward, or open it. One tab per kind,
+        /// so a second click never stacks a duplicate list.
+        /// </summary>
+        private void OpenProjectsTab(string kind)
+        {
+            foreach (var existing in _tabManager.Tabs)
+            {
+                var open = existing.ContentControl as Terminal.ProjectsWebView;
+                if (open != null && open.Kind == kind)
+                {
+                    _tabManager.ActivateTab(existing.Id);
+                    return;
+                }
+            }
+
+            var view = new Terminal.ProjectsWebView(kind) { Dock = DockStyle.Fill };
+            view.SetTheme(_isDarkTheme);
+            var tab = _tabManager.CreateContentTab(kind == Terminal.ProjectsWebView.KindAddin ? "IDE Addins" : "COM Controls", view);
+
+            view.ActionReceived += (s, e) => OnProjectsAction(view, e);
+            view.Initialized += (s, ev) =>
+            {
+                view.SetTheme(_isDarkTheme);   // the theme may have changed while the page loaded
+                try { view.SetGitHubAccounts(BuildGitHubAccountsJson()); }
+                catch (Exception ex) { System.Diagnostics.Debug.WriteLine("[AssistantChatControl] projects tab accounts: " + ex.Message); }
+                view.SetDefaultProjectFolder(_settings.Get("COM.ProjectsFolder") ?? "");
+                view.SetProjectsJson(BuildProjectsJson(view.Kind));
+            };
+
+            _tabManager.ActivateTab(tab.Id);
+        }
+
+        /// <summary>
+        /// A COM / Addin tab's request. The page names projects by id only; the host resolves the id in its own
+        /// list and acts only on the tab's kind (or "Other"), and paths such as the folder to open come from that
+        /// entry, never from the page (pipeline run 1, security).
+        /// </summary>
+        private void OnProjectsAction(Terminal.ProjectsWebView view, Terminal.ProjectsActionEventArgs e)
+        {
+            switch (e.Action)
+            {
+                case "addProject": OnAddProject(e.Data, view.Kind); break;
+                case "browseProjectFolder": OnBrowseProjectFolder(view, e.Data); break;
+                case "openFolder":
+                {
+                    var entry = FindProjectForKind(e.Data, view.Kind);
+                    if (entry != null) OpenFolder(entry.Folder);
+                    break;
+                }
+                case "editProject":
+                    if (FindProjectForKind(ExtractJsonString(e.Data ?? "", "id"), view.Kind) != null) OnEditProject(e.Data);
+                    break;
+                case "deleteProject":
+                    if (FindProjectForKind(e.Data, view.Kind) != null) OnDeleteProject(e.Data);
+                    break;
+                case "openProject":
+                    if (FindProjectForKind(e.Data, view.Kind) != null) OnOpenProject(e.Data);
+                    break;
+            }
+        }
+
+        /// <summary>
+        /// A closed COM / Addin tab: dispose its WebView2. TabManager.CloseTab only detaches content and
+        /// TerminalTab.Dispose drops the reference, so without this every reopen left another live WebView2
+        /// (pipeline run 1, debugger). TabRemoved fires before the reference is dropped.
+        /// </summary>
+        private void OnTabRemoved(object sender, TerminalTab tab)
+        {
+            var view = tab != null ? tab.ContentControl as Terminal.ProjectsWebView : null;
+            if (view != null) view.Dispose();
         }
 
         private static readonly DateTime UnixEpoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
@@ -538,10 +664,9 @@ namespace ClarionAssistant
             return -1; // malformed JSON
         }
 
-        private void OnAddProject(string json)
+        private void OnAddProject(string json, string kind)
         {
             string name = ExtractJsonString(json, "name");
-            string type = ExtractJsonString(json, "type");
             string folder = ExtractJsonString(json, "folder");
             if (string.IsNullOrEmpty(name) || string.IsNullOrEmpty(folder)) return;
 
@@ -549,7 +674,7 @@ namespace ClarionAssistant
             {
                 Id = Guid.NewGuid().ToString("N").Substring(0, 8),
                 Name = name,
-                Type = type ?? "Other",
+                Type = kind,   // the tab's kind, not the page's say-so; "Other" is no longer created
                 Folder = folder,
                 LastAccessed = NowUnixMs(),
                 GitHubAccountId = ExtractJsonString(json, "githubAccountId"),
@@ -557,7 +682,7 @@ namespace ClarionAssistant
             };
             _projects.Add(entry);
             SaveProjects();
-            SendProjectsToHome();
+            SendProjectsToViews();
         }
 
         private void OnEditProject(string json)
@@ -575,7 +700,7 @@ namespace ClarionAssistant
             entry.GitHubAccountId = ExtractJsonString(json, "githubAccountId");
             entry.RepoName = ExtractJsonString(json, "repoName");
             SaveProjects();
-            SendProjectsToHome();
+            SendProjectsToViews();
         }
 
         private void OnDeleteProject(string id)
@@ -583,7 +708,7 @@ namespace ClarionAssistant
             if (string.IsNullOrEmpty(id)) return;
             _projects.RemoveAll(p => p.Id == id);
             SaveProjects();
-            SendProjectsToHome();
+            SendProjectsToViews();
         }
 
         private void OnOpenProject(string id)
@@ -595,12 +720,12 @@ namespace ClarionAssistant
             // Update lastAccessed
             entry.LastAccessed = NowUnixMs();
             SaveProjects();
-            SendProjectsToHome();
+            SendProjectsToViews();
 
             OpenProjectInNewTab(entry);
         }
 
-        private void OnBrowseProjectFolder(string editId)
+        private void OnBrowseProjectFolder(Terminal.ProjectsWebView view, string editId)
         {
             using (var dlg = new FolderBrowserDialog())
             {
@@ -608,7 +733,7 @@ namespace ClarionAssistant
                 dlg.ShowNewFolderButton = true;
                 if (dlg.ShowDialog() == DialogResult.OK)
                 {
-                    _homeView.SendBrowseResult(dlg.SelectedPath, editId ?? "");
+                    view.SendBrowseResult(dlg.SelectedPath, editId ?? "");
                 }
             }
         }
@@ -619,10 +744,25 @@ namespace ClarionAssistant
             string folder = project.Folder;
             if (string.IsNullOrEmpty(folder) || !Directory.Exists(folder))
             {
-                System.Diagnostics.Debug.WriteLine("[AssistantChatControl] OpenProjectInNewTab ABORTED: folder empty or not found");
-                MessageBox.Show("Project folder not found:\n" + (folder ?? "(empty)"),
-                    "Open Project", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return;
+                // A project is usually listed before anything is on disk: offer to create its folder (d4e941e3).
+                using (var ask = new Dialogs.CreateProjectFolderDialog(project.Name, folder))
+                {
+                    if (ask.ShowDialog(this) != DialogResult.OK)
+                    {
+                        System.Diagnostics.Debug.WriteLine("[AssistantChatControl] OpenProjectInNewTab: folder missing, create declined");
+                        return;
+                    }
+                }
+                try
+                {
+                    Directory.CreateDirectory(folder);
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show("Could not create the project folder:\n" + folder + "\n\n" + ex.Message,
+                        "Open Project", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
             }
 
             string name = project.Name;
@@ -630,6 +770,9 @@ namespace ClarionAssistant
             var tab = _tabManager.CreateTerminalTab(name, renderer);
             tab.WorkingDirectory = folder;
             tab.VersionConfig = _currentVersionConfig;
+            // Opened from a COM / Addin tab, which has no backend dropdown: use the dashboard's (d4e941e3).
+            if (!string.IsNullOrEmpty(_dashboardBackend))
+                tab.RequestedBackend = _dashboardBackend;
 
             // Set startup command based on project type
             switch (project.Type)
@@ -666,6 +809,7 @@ namespace ClarionAssistant
                 string live;
                 if (ClarionVersionService.TryGetLiveIdeVersionName(out live))
                     _lastIdeVersionChoice = ClarionVersionSelector.NormalizeIdeChoice(live);
+                _versionGenerationSeen = EffectiveClarionVersion.Generation;
                 _header.SetVersion("(not detected)", "No Clarion version found in ClarionProperties.xml");
                 return;
             }
@@ -684,9 +828,18 @@ namespace ClarionAssistant
                 // Data pad's environment watcher keys on (its Explorer header shows VERSION too).
                 LspTrace.Write("[AssistantChatControl] " + describe);
                 System.Diagnostics.Debug.WriteLine("[AssistantChatControl] " + describe);
-                ClarionGraphService.InvalidateVersionCache();
-                EffectiveClarionVersion.NotifyChanged();
+                // f3b47441: LspAutostartCommand's version follower announces every Build > Set Clarion Version
+                // switch, and its handler runs before this panel's. Announce only a change nobody has since this
+                // panel last resolved (e.g. the source tier moving at startup), so the Data pad reacts once.
+                // ASSUMES the follower is the only other NotifyChanged caller: a new one that bumps for some
+                // other reason would also suppress this panel's announcement.
+                if (EffectiveClarionVersion.Generation == _versionGenerationSeen)
+                {
+                    ClarionGraphService.InvalidateVersionCache();
+                    EffectiveClarionVersion.NotifyChanged();
+                }
             }
+            _versionGenerationSeen = EffectiveClarionVersion.Generation;
 
             // Say which source chose it — never resolve a version silently.
             string label = _currentVersionConfig == null ? "(not detected)"
@@ -699,6 +852,9 @@ namespace ClarionAssistant
 
         /// <summary>The last version selection, with the tier that decided it (for the index log).</summary>
         private ClarionVersionSelection _versionSelection;
+
+        /// <summary>EffectiveClarionVersion.Generation as of this panel's last LoadVersions (f3b47441).</summary>
+        private int _versionGenerationSeen;
 
         private bool _ideVersionHooked;
 
@@ -746,8 +902,9 @@ namespace ClarionAssistant
 
         /// <summary>
         /// Re-resolve when the IDE's Build &gt; Set Clarion Version moved since the last resolution: reload the
-        /// VERSION list and the .red, and restart the language server on the new version's paths. Cheap when
-        /// nothing changed (one PropertyService read). UI thread.
+        /// VERSION list and the .red for this panel's header. Cheap when nothing changed (one PropertyService
+        /// read). UI thread. The language server restart is LspAutostartCommand's (905928c7), which follows
+        /// the version with or without this panel.
         /// </summary>
         private void SyncVersionWithIde()
         {
@@ -763,7 +920,6 @@ namespace ClarionAssistant
                     + (_lastIdeVersionChoice ?? "(unknown)") + " -> " + now);
                 LoadVersions();
                 LoadRedFile();
-                LspService.RestartIfVersionChanged(_currentVersionConfig != null ? _currentVersionConfig.Name : null);
             }
             catch (Exception ex) { System.Diagnostics.Debug.WriteLine("[AssistantChatControl] SyncVersionWithIde: " + ex.Message); }
         }
@@ -773,6 +929,8 @@ namespace ClarionAssistant
             _redFileService = new RedFileService();
             if (_currentVersionConfig == null)
             {
+                // No version: nothing may stay in force from the previous one (f3b47441, fails closed).
+                RedFileService.ClearActiveUnlessFor(null);
                 ShowRedFileInHeader("(no Clarion version resolved)", "warning");
                 return;
             }
@@ -833,36 +991,21 @@ namespace ClarionAssistant
 
         private void LoadSolutionHistory()
         {
-            string history = _settings.Get("SolutionHistory") ?? "";
-            var paths = new System.Collections.Generic.List<string>();
-            foreach (string path in history.Split('|'))
-            {
-                if (!string.IsNullOrEmpty(path) && File.Exists(path))
-                    paths.Add(path);
-            }
-
+            // Restore the last solution. CA keeps using it while the IDE has none open, so CodeGraph and the
+            // MCP tools still have a solution; the header marks it "not open in the IDE" (d4e941e3).
             string last = _settings.Get("LastSolutionPath");
-            int selectedIdx = -1;
             if (!string.IsNullOrEmpty(last) && File.Exists(last))
-            {
-                selectedIdx = paths.IndexOf(last);
-                if (selectedIdx < 0)
-                {
-                    paths.Insert(0, last);
-                    selectedIdx = 0;
-                }
                 _currentSlnPath = last;
-            }
 
-            _header.SetSolutions(paths.ToArray(), selectedIdx);
+            PushSolutionToHeader();
             UpdateIndexStatus();
-            // Schema Sources / Source Control follow the solution (82938fc7). DetectFromIde, OnBrowseSolution and
+            // Schema Sources / Source Control follow the solution (82938fc7). DetectFromIde and
             // OpenSolutionInNewTab change _currentSlnPath and then call this, and so does its own restore above.
-            // Its other callers only reload the dropdown; RefreshSolutionSettings skips an unchanged solution.
+            // Its other callers only re-show the solution; RefreshSolutionSettings skips an unchanged solution.
             RefreshSolutionSettings();
 
-            // NO auto-index here (ticket 7f1c67b2). THIS METHOD HAS SEVEN CALLERS and its job
-            // is to reload the solution dropdown — it is not a "solution was opened" signal.
+            // NO auto-index here (ticket 7f1c67b2). THIS METHOD HAS SEVERAL CALLERS and its job
+            // is to re-show the current solution — it is not a "solution was opened" signal.
             // Indexing from here fired on practically any refresh: once when CA restored the
             // last-used solution at startup (an unrequested run whose window habitually
             // appeared BEHIND the Clarion IDE), and again when a solution was actually opened,
@@ -874,8 +1017,8 @@ namespace ClarionAssistant
             // reached it as well.
             //
             // Indexing now happens where a solution is deliberately opened — OpenSolutionInNewTab
-            // (browse dialog, "Work with active solution") and OnSolutionChanged (header
-            // dropdown) — silently in both cases. Do not reinstate a run here.
+            // (browse dialog, "Work with active solution") and OnSolutionChanged (the IDE opened
+            // another solution) — silently in both cases. Do not reinstate a run here.
             if (!string.IsNullOrEmpty(_currentSlnPath))
             {
                 // Eager-start the LSP on startup-restore so embeditor completion is
@@ -920,14 +1063,17 @@ namespace ClarionAssistant
                 // the solution had none (77aceec5). Writes only on change, removes on close.
                 Services.IdeSolutionRecord.Publish(slnPath);
 
-                if (!string.IsNullOrEmpty(slnPath) && File.Exists(slnPath) &&
-                    !string.Equals(slnPath, _currentSlnPath, StringComparison.OrdinalIgnoreCase))
+                if (IsIdeSolutionSwitch(slnPath))
                 {
                     System.Diagnostics.Debug.WriteLine("[AssistantChatControl] Solution changed: " + slnPath);
-                    DetectFromIde();
+                    OnSolutionChanged(slnPath);
                 }
                 else
                 {
+                    // The IDE closed its solution, or reopened CA's: re-mark the header's "not open in the IDE".
+                    if (IsSolutionOpenInIde(slnPath) != _solutionShownOpen)
+                        PushSolutionToHeader();
+
                     // Backstop for the Clarion.Version PropertyChanged hook (16d140e9): follow a
                     // Build > Set Clarion Version change within one poll even if the event was missed.
                     SyncVersionWithIde();
@@ -966,50 +1112,72 @@ namespace ClarionAssistant
 
             // Eager-start the LSP (background) when the IDE's open solution is detected,
             // so embeditor completion is fully populated without a manual LSP trigger.
-            // (This is the IDE-poll path; OnSolutionChanged covers the assistant-UI path.)
+            // (Startup, refresh and solution-switch paths all come through here.)
             if (!string.IsNullOrEmpty(_currentSlnPath))
                 _toolRegistry?.EnsureLspRunningInBackground();
         }
 
+        /// <summary>
+        /// The IDE opened a different solution (seen by PollForSolutionChange). Since d4e941e3 the header shows the
+        /// IDE's solution read-only, so this - with OpenSolutionInNewTab - is how CA's solution changes; it does
+        /// the switch work the header dropdown used to trigger.
+        /// </summary>
         private void OnSolutionChanged(string path)
         {
-            if (!string.IsNullOrEmpty(path) && File.Exists(path))
-            {
-                // Completion's held-open symbol DB connections belong to the old solution.
-                SymbolIndex.ReleaseAll();
-                _currentSlnPath = path;
-                AddToSolutionHistory(path);
-                UpdateIndexStatus();
-                LoadRedFile();
-                UpdateInstanceState();
+            if (string.IsNullOrEmpty(path) || !File.Exists(path)) return;
 
-                // Eager-start the LSP (background) so embeditor completion is fully
-                // populated without the user first invoking an LSP feature. RedFile is
-                // loaded above so cross-file paths are available; the start itself can
-                // block several seconds, hence off the UI thread.
-                _toolRegistry?.EnsureLspRunningInBackground();
+            // Completion's held-open symbol DB connections belong to the old solution.
+            SymbolIndex.ReleaseAll();
 
-                var activeTab = _tabManager.ActiveTab;
-                if (activeTab != null && !activeTab.IsHome)
-                    activeTab.SolutionPath = path;
+            // _currentSlnPath, history, the header, index status, RED, LSP, and Schema Sources / Source Control
+            // (82938fc7) - all through LoadSolutionHistory.
+            DetectFromIde();
+            if (!string.Equals(_currentSlnPath, path, StringComparison.OrdinalIgnoreCase)) return;
 
-                // Schema Sources / Source Control are keyed on the solution (82938fc7).
-                RefreshSolutionSettings();
+            // Auto-index in the background when a solution is opened (ticket 7f1c67b2).
+            // RunIndexAutomatic, not RunIndex: this run is a consequence of opening a
+            // solution rather than something the developer asked for, so it gets no
+            // window and raises no dialog if it cannot start.
+            // Reindex and Update on the header remain windowed — those ARE user actions.
+            string dbPath = Path.Combine(
+                Path.GetDirectoryName(path),
+                Path.GetFileNameWithoutExtension(path) + ".codegraph.db");
+            if (!File.Exists(dbPath))
+                RunIndexAutomatic(false); // full index
+            else
+                RunIndexAutomatic(true); // incremental update
+        }
 
-                // Auto-index in the background when a solution is opened (ticket 7f1c67b2).
-                // RunIndexAutomatic, not RunIndex: this run is a consequence of opening a
-                // solution rather than something the developer asked for, so it gets no
-                // window and raises no dialog if it cannot start. The comment here always
-                // said "in background"; until 7f1c67b2 the code still popped the window.
-                // Reindex and Update on the header remain windowed — those ARE user actions.
-                string dbPath = Path.Combine(
-                    Path.GetDirectoryName(path),
-                    Path.GetFileNameWithoutExtension(path) + ".codegraph.db");
-                if (!File.Exists(dbPath))
-                    RunIndexAutomatic(false); // full index
-                else
-                    RunIndexAutomatic(true); // incremental update
-            }
+        /// <summary>The IDE has a solution open that is not CA's: a switch OnSolutionChanged must handle.</summary>
+        private bool IsIdeSolutionSwitch(string idePath)
+        {
+            return !string.IsNullOrEmpty(idePath) && File.Exists(idePath)
+                && !string.Equals(idePath, _currentSlnPath, StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// Re-read the IDE: a solution switch goes through OnSolutionChanged (symbol DBs, auto-index), anything
+        /// else is a plain DetectFromIde. Never call this from OnSolutionChanged - that calls DetectFromIde itself.
+        /// </summary>
+        private void FollowIdeSolution(string idePath)
+        {
+            if (IsIdeSolutionSwitch(idePath)) OnSolutionChanged(idePath);
+            else DetectFromIde();
+        }
+
+        private bool IsSolutionOpenInIde(string idePath)
+        {
+            return !string.IsNullOrEmpty(_currentSlnPath) && !string.IsNullOrEmpty(idePath)
+                && string.Equals(idePath, _currentSlnPath, StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>Show CA's solution in the read-only SOLUTION field, marked when the IDE doesn't have it open.</summary>
+        private void PushSolutionToHeader()
+        {
+            string idePath = null;
+            try { idePath = EditorService.GetOpenSolutionPath(); } catch { }
+            _solutionShownOpen = IsSolutionOpenInIde(idePath);
+            _header.SetSolution(_currentSlnPath, _solutionShownOpen);
         }
 
         /// <summary>
@@ -1047,7 +1215,7 @@ namespace ClarionAssistant
                 int peerCount = _instanceCoord.GetPeers().Count;
                 if (_mcpServer != null && _mcpServer.IsRunning)
                 {
-                    string status = "MCP: port " + _mcpServer.Port + " | " + _toolRegistry.GetToolCount() + " tools";
+                    string status = "MCP: port " + _mcpServer.PortsLabel + " | " + _toolRegistry.GetToolCount() + " tools";
                     if (peerCount > 0)
                         status += " | " + peerCount + " peer" + (peerCount > 1 ? "s" : "");
                     _header?.SetStatus(status, "connected");
@@ -1331,24 +1499,6 @@ namespace ClarionAssistant
             catch { }
         }
 
-        private void OnBrowseSolution(object sender, EventArgs e)
-        {
-            using (var dlg = new OpenFileDialog())
-            {
-                dlg.Filter = "Clarion Solution (*.sln)|*.sln";
-                dlg.Title = "Select Clarion Solution";
-                if (!string.IsNullOrEmpty(_currentSlnPath))
-                    dlg.InitialDirectory = Path.GetDirectoryName(_currentSlnPath);
-
-                if (dlg.ShowDialog() == DialogResult.OK)
-                {
-                    _currentSlnPath = dlg.FileName;
-                    AddToSolutionHistory(dlg.FileName);
-                    LoadSolutionHistory();
-                }
-            }
-        }
-
         private void UpdateIndexStatus()
         {
             if (!_header.IsReady) return;
@@ -1392,7 +1542,7 @@ namespace ClarionAssistant
             histList.RemoveAll(p => string.Equals(p, path, StringComparison.OrdinalIgnoreCase));
             _settings.Set("SolutionHistory", string.Join("|", histList));
 
-            LoadSolutionHistory(); // also refresh header dropdown
+            LoadSolutionHistory(); // also re-show the solution in the header
         }
 
         private void OnBrowseSolutionForNewTab()
@@ -1432,13 +1582,14 @@ namespace ClarionAssistant
             // is exactly the moment indexing SHOULD start.
             //
             // It lives here rather than in LoadSolutionHistory, where it used to. That method
-            // has SEVEN callers and reloads the solution dropdown, so indexing from it fired on
+            // has several callers and re-shows the solution, so indexing from it fired on
             // essentially any refresh: once at startup and again on opening a solution, which is
             // how two runs ended up colliding on the same database. LoadSolutionHistory loads a
             // list; it should not start work.
             //
-            // Not a double-fire with OnSolutionChanged: that handles the header dropdown, this
-            // handles opening a solution into a tab, and neither calls the other.
+            // Not a double-fire with OnSolutionChanged: that handles the IDE opening another
+            // solution, and it only fires when the IDE's solution differs from _currentSlnPath,
+            // which this method has just set. Neither calls the other.
             string autoDbPath = Path.Combine(
                 Path.GetDirectoryName(slnPath),
                 Path.GetFileNameWithoutExtension(slnPath) + ".codegraph.db");
@@ -1512,6 +1663,7 @@ namespace ClarionAssistant
             _schemaView = new SchemaSourcesView
             {
                 Visible = false,
+                ScaleCorrection = _header.ScaleCorrection,
                 PaneHeight = _header.PanePixelHeight,
                 ZoomFactor = _header.ZoomFactor
             };
@@ -2671,6 +2823,7 @@ namespace ClarionAssistant
             {
                 if (tab.Renderer != null) tab.Renderer.SetTheme(_isDarkTheme);
                 if (tab.ContentControl is CreateClassWebView ccv) ccv.SetTheme(_isDarkTheme);
+                if (tab.ContentControl is Terminal.ProjectsWebView pv) pv.SetTheme(_isDarkTheme);
             }
             Terminal.DiffViewContent.ApplyThemeToAll(_isDarkTheme);
             Terminal.MonacoDiffViewContent.ApplyThemeToAll(_isDarkTheme);
@@ -2748,8 +2901,8 @@ namespace ClarionAssistant
             dlg.FormClosed += (s2, e2) =>
             {
                 if (parent != null) parent.Enabled = true;
-                SendGitHubAccountsToHome(); // Refresh home dropdown after settings changes
-                SendDefaultProjectFolderToHome(); // COM.ProjectsFolder may have changed
+                SendGitHubAccountsToProjectViews(); // Refresh the project modals' account list after settings changes
+                SendDefaultProjectFolderToProjectViews(); // COM.ProjectsFolder may have changed
                 dlg.Dispose();
             };
 
@@ -3097,6 +3250,10 @@ namespace ClarionAssistant
             McpToolRegistry.AppTreeFactory = () => new AppTreeService();
             McpToolRegistry.IdeProbeFactory = () => new Services.IdeProbeService();
             McpToolRegistry.DiagnosticLog = msg => MonacoSpikeLog.Write(msg);
+            // 73bd1f03: the facts EmbedOverlayGuard needs to keep the embed/editor tools from writing the
+            // native embed document hidden behind the CA Embeditor. IDE-coupled, so supplied here.
+            McpToolRegistry.CaEmbeditorLiveProbe = () => ModernEmbeditorViewContent.HasLiveOverlay;
+            McpToolRegistry.ActiveEditorCoveredProbe = () => ModernEmbeditorViewContent.ActiveEditorIsCoveredByOverlay();
 
             // LspService no longer calls EditorService.GetOpenSolutionPath() directly (that static
             // was the one thing keeping an otherwise IDE-free file out of the standalone build).
@@ -3155,7 +3312,7 @@ namespace ClarionAssistant
 
             _mcpServer.OnStatusChanged += (running, port) =>
             {
-                UpdateStatus(running ? "MCP: port " + port : "MCP stopped");
+                UpdateStatus(running ? "MCP: port " + _mcpServer.PortsLabel : "MCP stopped");
             };
 
             _mcpServer.OnError += error =>
@@ -3177,7 +3334,7 @@ namespace ClarionAssistant
             if (_mcpServer.Start())
             {
                 _mcpConfigPath = _mcpServer.WriteMcpConfigFile();
-                string status = "MCP: port " + _mcpServer.Port + " | " + _toolRegistry.GetToolCount() + " tools";
+                string status = "MCP: port " + _mcpServer.PortsLabel + " | " + _toolRegistry.GetToolCount() + " tools";
                 if (mtEnabled) status += " | MT";
                 UpdateStatus(status);
             }
@@ -3269,8 +3426,13 @@ namespace ClarionAssistant
 
             // Annotate the tab with the backend abbreviation so the tab strip
             // makes it obvious at a glance which assistant is driving each tab.
-            // Idempotent: strips any prior suffix before appending.
-            _tabManager.RenameTab(tab, ApplyBackendSuffix(tab.Name, backend));
+            // Built from the undecorated name, so a relaunch never stacks labels. A Claude
+            // tab is relabelled again with its MultiTerminal name once that is resolved, and
+            // drops the CC suffix then (every registered tab is Claude, so it says nothing).
+            // Captured as is, not stripped: nothing has decorated the name before the first
+            // launch, so stripping could only eat real text (a solution named "Billing CO").
+            if (tab.BaseName == null) tab.BaseName = tab.Name;
+            _tabManager.RenameTab(tab, ApplyBackendSuffix(tab.BaseName, backend));
 
             if (string.Equals(backend, "Copilot", StringComparison.OrdinalIgnoreCase))
                 LaunchCopilotForTab(tab);
@@ -3296,17 +3458,17 @@ namespace ClarionAssistant
             string suffix = BackendSuffix(backend);
             if (string.IsNullOrEmpty(suffix) || string.IsNullOrEmpty(currentName))
                 return currentName;
+            return StripBackendSuffix(currentName) + " " + suffix;
+        }
 
-            string stripped = currentName;
+        /// <summary>The tab name without a trailing backend suffix (" CC", " CP", " CO").</summary>
+        private static string StripBackendSuffix(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return name;
             foreach (string prior in new[] { " CC", " CP", " CO" })
-            {
-                if (stripped.EndsWith(prior, StringComparison.Ordinal))
-                {
-                    stripped = stripped.Substring(0, stripped.Length - prior.Length);
-                    break;
-                }
-            }
-            return stripped + " " + suffix;
+                if (name.EndsWith(prior, StringComparison.Ordinal))
+                    return name.Substring(0, name.Length - prior.Length);
+            return name;
         }
 
         private void LaunchClaudeForTab(TerminalTab tab)
@@ -3540,6 +3702,10 @@ namespace ClarionAssistant
         /// the prepare or builder phases.</summary>
         private void AbortLaunch(TerminalTab tab)
         {
+            // An aborted launch holds no MultiTerminal name (other tabs' uniqueness checks read
+            // it), and its tab drops the CA<n> label. Before AssistantBackend is cleared: the
+            // restored label is built from it.
+            ReleaseAgentName(tab);
             tab.AssistantLaunched = false;
             tab.AssistantBackend = null;
             try { if (tab.Terminal != null) tab.Terminal.Dispose(); } catch { }
@@ -3603,9 +3769,25 @@ namespace ClarionAssistant
                 catch { }
             }
 
+            // The numbered agent name for this tab (CA1, CA2, ...): its MultiTerminal identity.
+            // Exported as MULTITERMINAL_NAME for the MultiTerminal plugin's hooks, and passed as -n
+            // so the same string is the session's native messaging address - one name, not two
+            // that can drift. Resolved HERE, before the system-prompt file is written, because that
+            // file also tells the model the name (ticket c175492a).
+            string agentName = ResolveUniqueAgentName(tab);
+            // Remembered on the tab: it is what other tabs' uniqueness checks read.
+            tab.AgentName = agentName;
+            // The tab shows the same name the prompt box (-n) and MultiTerminal do, so what the
+            // developer sees is what they type to message it (ticket 7792e3e0).
+            _tabManager.RenameTab(tab, Services.CaAgentIdentity.TabLabel(agentName, tab.BaseName));
+
             string systemPromptExtra = BuildSystemPromptInjection(ctx.WorkDir);
             systemPromptExtra = Services.ClaudeMdDeployer.ComposeSystemPromptExtra(
                 claudeMdDelivered, claudeMdDelivered ? null : ReadClarionAssistantPrompt(), systemPromptExtra);
+            // Only when the multiterminal MCP is really in this tab's config: the section is about
+            // its tools, and that server is what registers the name with MultiTerminal.
+            if (_mcpServer != null && _mcpServer.MultiTerminalConfigured)
+                systemPromptExtra = Services.CaAgentIdentity.AppendIdentityPrompt(systemPromptExtra, agentName);
             string initialPrompt = BuildInitialPrompt(ctx.WorkDir);
             System.Diagnostics.Debug.WriteLine("[LaunchClaude] prompts built");
 
@@ -3636,10 +3818,6 @@ namespace ClarionAssistant
                 tempFiles.Add(initialPromptFile);
             }
 
-            // Resolved once, up here, because THREE things downstream must agree on it: the second
-            // --plugin-dir, the channels flag's plugin name, and the channel tools' allowlist prefix.
-            // Deriving all three from one value is what stops them drifting apart - a mismatch
-            // between any two of them fails silently rather than loudly (ticket 7913ead6).
             string mtPluginDir = Services.McpServer.GetMultiTerminalPluginPath();
 
             string allowedTools = "mcp__clarion-assistant__*,Read,Edit,Write,Bash,Glob,Grep";
@@ -3652,21 +3830,6 @@ namespace ClarionAssistant
                 allowedTools += ",mcp__clarion-tools__*";
             if (_mcpServer != null && _mcpServer.IncludeMultiTerminal)
                 allowedTools += ",mcp__multiterminal__*";
-            // The channel's own tools (send / reply). THE PREFIX CHANGED WITH THE MOVE TO THE PLUGIN
-            // FORM (ticket 7913ead6): a plugin-provided MCP server is namespaced
-            // mcp__plugin_<pluginName>_<serverName>__<tool>, not mcp__<serverName>__<tool>. The old
-            // "mcp__multiterminal-channel__*" spelling now matches nothing, so leaving it would mean
-            // every send/reply prompted for permission - the tab would receive channel pushes and
-            // then be unable to answer them.
-            //
-            // NOT A GUESS AT THE SPELLING: taken from a live session on this machine with the same
-            // plugin loaded, where the tools appear as
-            //     mcp__plugin_multiterminal_multiterminal-channel__send
-            //     mcp__plugin_multiterminal_multiterminal-channel__reply
-            // Still worth re-reading off a real tab after deploy - if the prefix differs, the symptom
-            // is a permission prompt on reply, not a dead channel.
-            if (mtPluginDir != null)
-                allowedTools += ",mcp__plugin_multiterminal_multiterminal-channel__*";
             // Auto-approve user-supplied MCP servers merged in from mcp-extra.json
             if (_mcpServer != null && _mcpServer.ExtraMcpServerNames != null)
             {
@@ -3685,10 +3848,8 @@ namespace ClarionAssistant
                 pluginArg = $" --plugin-dir '{safePluginDir}'";
             }
 
-            // A SECOND --plugin-dir, for MultiTerminal, because the channel server ships INSIDE that
-            // plugin (server\multiterminal-channel.mjs). Without it the channels flag below names a
-            // plugin this session never loaded, and the channel fails for a different reason than
-            // the one ticket 7913ead6 fixed.
+            // A SECOND --plugin-dir, for MultiTerminal: its hooks are what register this tab with the
+            // broker and hand over the session's native messaging credentials (ticket b24bcaf4).
             //
             // --plugin-dir IS REPEATABLE BUT NOT VARIADIC. From `claude --help` on 2.1.265:
             //     --plugin-dir <path>  ... (repeatable: --plugin-dir A --plugin-dir B.zip)
@@ -3740,54 +3901,14 @@ namespace ClarionAssistant
             // Set CA tab ID so the statusline script can write per-tab status
             string tabEnv = $"$env:CLARIONASSISTANT_TAB='{tab.Id}'";
 
-            // Compute the CA-prefixed agent name + stable docId for this tab and export
-            // them so the multiterminal-channel MCP server (loaded via mcp-config) registers
-            // with the MultiTerminal broker under the right identity.
-            _caTabCounter++;
-            string agentName = Services.CaAgentIdentity.NormalizeAgentName(tab.Name, _caTabCounter);
-            // Remember it: this is the name the broker will know this tab by, and the only way
-            // to disconnect it when the process exits (ticket 9a0ce0de). Recomputing later would
-            // give a different name, because the counter above has moved on.
-            tab.AgentName = agentName;
-            string docId = Services.CaAgentIdentity.ComputeStableDocId(agentName);
             string safeAgentName = Services.CaAgentIdentity.EscapeForPowerShellSingleQuote(agentName);
-            string safeDocId = Services.CaAgentIdentity.EscapeForPowerShellSingleQuote(docId);
-            string channelEnv = $"$env:MULTITERMINAL_NAME='{safeAgentName}'; $env:MULTITERMINAL_DOC_ID='{safeDocId}'";
-            System.Diagnostics.Debug.WriteLine(
-                "[LaunchClaude] Channel identity: name=" + agentName + ", docId=" + docId);
+            // NO MULTITERMINAL_DOC_ID (ticket b24bcaf4). A docId (and a launch nonce) identify a pane
+            // MultiTerminal itself launched; a CA-hosted session registers by name alone, with the
+            // claude.exe pid as its owner so the broker's reaper can retire the row when it dies.
+            string mtEnv = $"$env:MULTITERMINAL_NAME='{safeAgentName}'";
+            string nameFlag = $" -n '{safeAgentName}'";
+            System.Diagnostics.Debug.WriteLine("[LaunchClaude] MultiTerminal identity: name=" + agentName);
 
-            // Authorize the MultiTerminal channel for inbound notifications. Without this flag,
-            // mcp.notification('notifications/claude/channel') is silently ignored.
-            //
-            // PLUGIN FORM, NOT server: FORM (ticket 7913ead6). Claude Code 2.1.265 resolves a
-            // "server:<name>" entry against five PERSISTED config scopes only - enterprise, managed,
-            // user, project, local - and a server supplied via --mcp-config is in none of them, so
-            // the old spelling could never resolve and printed
-            //     server:multiterminal-channel - no MCP server configured with that name
-            // The plugin branch of that same validator reads the loaded-plugin list instead and
-            // never consults the MCP scopes, which is why --strict-mcp-config stays safe here and we
-            // keep the isolation it was added for.
-            //
-            // "@inline" IS A SENTINEL - DO NOT "CORRECT" IT TO THE MARKETPLACE NAME. Claude Code
-            // assigns @inline to any plugin loaded via --plugin-dir; it names no marketplace and
-            // resolves to nothing on disk. Changing it to @multiterminal-marketplace to match the
-            // installed registry is the obvious-looking tidy-up and it SILENTLY KILLS CHANNELS:
-            // registration matches on the marketplace BEFORE the dev-channels check runs, so the
-            // flag cannot rescue a mismatch, and no test pins the string. Established by Alice on
-            // the MultiTerminal side (ticket c9285d2a).
-            //
-            // The name before the '@' is the plugin DIRECTORY BASENAME, derived from the path above
-            // so the two cannot drift apart.
-            //
-            // EXPECT A FALSE-POSITIVE WARNING AND DO NOT READ IT AS FAILURE: the launch prints
-            //     plugin:multiterminal@inline - plugin not installed
-            // because that validator branch checks the INSTALLED plugin registry, where a
-            // --plugin-dir plugin legitimately never appears - it is session-loaded, not installed.
-            // Every MultiTerminal terminal prints this today and their channels work.
-            string channelFlag = (mtPluginDir != null)
-                ? " --dangerously-load-development-channels plugin:"
-                    + Path.GetFileName(mtPluginDir.TrimEnd(Path.DirectorySeparatorChar)) + "@inline"
-                : "";
             // Auto-update Claude Code before launching if enabled in settings
             string updatePrefix = "";
             if ((_settings.Get("Claude.AutoUpdate") ?? "").Equals("true", StringComparison.OrdinalIgnoreCase))
@@ -3800,13 +3921,18 @@ namespace ClarionAssistant
                 updatePrefix = $"Write-Host 'Checking for Claude Code updates...' -ForegroundColor Cyan; {updateCmd} update; ";
             }
 
-            string claudeCmd = $"cd '{ctx.SafeWorkDir}'; $env:CLARION_ASSISTANT_EMBEDDED='1'; {tabEnv}; {channelEnv}; {colorfgbg}; {updatePrefix}{claudeBase}{mcpArg}{pluginArg}{claudeModelFlag} --strict-mcp-config{channelFlag} --allowedTools '{allowedTools}'{extraFlags}";
+            string claudeInvocation = $"{claudeBase}{nameFlag}{mcpArg}{pluginArg}{claudeModelFlag} --strict-mcp-config --allowedTools '{allowedTools}'{extraFlags}";
 
             if (initialPromptFile != null)
             {
                 string safeFile = initialPromptFile.Replace("'", "''");
-                claudeCmd += $" (Get-Content -Raw '{safeFile}')";
+                claudeInvocation += $" (Get-Content -Raw '{safeFile}')";
             }
+
+            // The shell outlives Claude (-NoExit), so Claude's end is signalled from the command
+            // itself rather than by the process exiting (ticket 7792e3e0).
+            string claudeCmd = $"cd '{ctx.SafeWorkDir}'; $env:CLARION_ASSISTANT_EMBEDDED='1'; {tabEnv}; {mtEnv}; {colorfgbg}; {updatePrefix}"
+                + Services.CaAgentIdentity.WrapWithExitSignal(claudeInvocation, tab.Id);
 
             return new BuiltBackendCommand { Cmd = claudeCmd, TempFiles = tempFiles };
         }
@@ -4111,34 +4237,51 @@ namespace ClarionAssistant
                 tab.Terminal.Write(data);
         }
 
-        // Matches ANSI/VT escape sequences (CSI, OSC, charset selects, etc.) so they can be stripped
-        // before substring-matching a TUI prompt whose text is interleaved with color/box-drawing codes.
-        private static readonly System.Text.RegularExpressions.Regex AnsiEscapeRegex =
-            new System.Text.RegularExpressions.Regex(
-                @"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\))",
-                System.Text.RegularExpressions.RegexOptions.Compiled);
-
         /// <summary>
-        /// Normalize terminal output for robust substring matching: strip ANSI escapes, fold every
-        /// non-alphanumeric char to a single space, lowercase, and collapse runs of spaces. This makes
-        /// a plain Contains() survive box-drawing characters, embedded color codes, and odd spacing in
-        /// CC's TUI warning prompt.
+        /// The lowest free CA1, CA2, ... (ticket 7792e3e0; uniqueness from b24bcaf4): the name is
+        /// the session's native messaging address, so two sessions sharing one could receive each
+        /// other's messages. "Taken" means held by another tab in ANY chat pad of this IDE, or by
+        /// a row on MultiTerminal's live roster (another IDE, or an MT-hosted terminal).
+        ///
+        /// A RELAUNCH IS CHECKED LIKE ANY LAUNCH - no "keep my old name" exemption. Once the
+        /// broker's reaper retires this tab's dead row, another IDE may take the name; reusing it
+        /// then would put two live sessions on one address (Codex security, pipeline run 2). The
+        /// roster exposes no owner pid, so CA cannot prove a row is its own predecessor. Cost: a
+        /// tab restarted inside the reaper's ~30s sweep comes back with a new number. Cosmetic,
+        /// and safe.
+        ///
+        /// MultiTerminal being unreachable is ordinary (it may not be installed) and leaves only
+        /// the local check. Short timeout because this runs on the launch path; 127.0.0.1 refuses
+        /// instantly when nothing is listening. Two IDEs launching the same name in the same
+        /// instant can still both pass - the broker rejecting a duplicate name is the backstop
+        /// (MT ticket 9a731cda).
         /// </summary>
-        private static string NormalizeForMatch(string s)
+        private string ResolveUniqueAgentName(TerminalTab tab)
         {
-            if (string.IsNullOrEmpty(s)) return string.Empty;
-            string noAnsi = AnsiEscapeRegex.Replace(s, string.Empty);
-            var sb = new StringBuilder(noAnsi.Length);
-            foreach (char c in noAnsi)
-                sb.Append(char.IsLetterOrDigit(c) ? char.ToLowerInvariant(c) : ' ');
-            return System.Text.RegularExpressions.Regex.Replace(sb.ToString(), " +", " ");
-        }
+            var taken = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            List<AssistantChatControl> pads;
+            lock (_instances) { pads = new List<AssistantChatControl>(_instances); }
+            foreach (var pad in pads)
+            {
+                if (pad._tabManager == null) continue;
+                foreach (var t in pad._tabManager.Tabs)
+                    if (!ReferenceEquals(t, tab) && !string.IsNullOrEmpty(t.AgentName))
+                        taken.Add(t.AgentName);
+            }
 
-        /// <summary>Escape control chars so a raw terminal buffer is readable in a single Debug trace line.</summary>
-        private static string EscapeForLog(string s)
-        {
-            if (string.IsNullOrEmpty(s)) return string.Empty;
-            return s.Replace("\x1b", "\\x1b").Replace("\r", "\\r").Replace("\n", "\\n").Replace("\t", "\\t");
+            try
+            {
+                var roster = new Services.MultiTerminalApiClient(timeoutMs: 1500).ListTerminals();
+                if (roster != null && roster.Success && roster.Data != null)
+                    foreach (var row in roster.Data)
+                        if (!string.IsNullOrEmpty(row.Name)) taken.Add(row.Name);
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine("[LaunchClaude] MT roster check skipped: " + ex.Message);
+            }
+
+            return Services.CaAgentIdentity.NextFreeName(taken.Contains);
         }
 
         private static int _dataRecvCount;
@@ -4151,56 +4294,21 @@ namespace ClarionAssistant
             if (renderer != null && !renderer.IsDisposed)
                 renderer.WriteToTerminal(data);
 
-            // ── Auto-dismiss Claude Code's --dangerously-load-development-channels warning ──
-            // CC 2.1.168 renders this warning as a colored, box-wrapped TUI. The text is interleaved
-            // with ANSI escapes and arrives split across ~16ms ConPTY flush batches, so a literal
-            // Contains() on a single chunk never matches. We therefore: accumulate every chunk into a
-            // capped per-tab buffer, strip ANSI + normalize, substring-match the prompt anchors, then
-            // inject the digit '1' (option "I am using this for local development") with NO newline —
-            // a bare Enter gets dropped before CC's raw-mode prompt is ready. Fires at most once per tab.
-            // Only relevant to Claude (Copilot/Codex never emit this), so skip those backends.
-            if (!tab.DevChannelWarningHandled
-                && tab.AssistantBackend != "Copilot" && tab.AssistantBackend != "Codex"
-                && tab.Terminal != null && tab.Terminal.IsRunning)
+            // Claude ended but the -NoExit shell lives on: the command's finally block retitles
+            // the console with this tab's exit marker (CaAgentIdentity.WrapWithExitSignal).
+            // ASCII decode: the marker is ASCII, and a multibyte character split across reads
+            // must not throw or shift it.
+            if (tab.AgentName != null)
             {
-                try
+                string carry = tab.ExitSignalCarry;
+                bool exited = Services.CaAgentIdentity.SeesExitSignal(tab.Id, Encoding.ASCII.GetString(data), ref carry);
+                tab.ExitSignalCarry = carry;
+                if (exited)
                 {
-                    tab.DevChannelBuffer.Append(Encoding.UTF8.GetString(data));
-                    if (tab.DevChannelBuffer.Length > 2000)
-                        tab.DevChannelBuffer.Remove(0, tab.DevChannelBuffer.Length - 1000);
-
-                    string normalized = NormalizeForMatch(tab.DevChannelBuffer.ToString());
-
-                    // One-time ground-truth dump: if CC changes the wording on a future version, this
-                    // trace gives the exact bytes to re-anchor against instead of guessing.
-                    if (!tab.DevChannelRawDumped && normalized.Contains("development"))
-                    {
-                        tab.DevChannelRawDumped = true;
-                        System.Diagnostics.Debug.WriteLine("[DevChannel] RAW: " + EscapeForLog(tab.DevChannelBuffer.ToString()));
-                        System.Diagnostics.Debug.WriteLine("[DevChannel] NORM: " + normalized);
-                    }
-
-                    if (normalized.Contains("for local development")
-                        || normalized.Contains("loading development channels")
-                        || normalized.Contains("development channels")
-                        || normalized.Contains("enter to confirm"))
-                    {
-                        tab.DevChannelWarningHandled = true;
-                        var devTab = tab;
-                        // ~400ms settle so the box is fully rendered + raw mode is ready, then send '1'
-                        // with no CR/LF — Write() does not append a line ending.
-                        System.Threading.Tasks.Task.Delay(400).ContinueWith(_ =>
-                        {
-                            try
-                            {
-                                if (devTab.Terminal != null && devTab.Terminal.IsRunning)
-                                    devTab.Terminal.Write("1");
-                            }
-                            catch { }
-                        });
-                    }
+                    tab.ExitSignalCarry = null;
+                    Action release = () => { ReleaseAgentName(tab); UpdateStatus("Claude Code exited"); };
+                    if (InvokeRequired) BeginInvoke(release); else release();
                 }
-                catch { }
             }
 
             // Auto-send startup command once Claude is ready for human input.
@@ -4246,101 +4354,9 @@ namespace ClarionAssistant
                 tab.Terminal.Resize(e.Columns, e.Rows);
         }
 
-        /// <summary>
-        /// Drop a tab's assistant from the MultiTerminal roster (ticket 9a0ce0de).
-        ///
-        /// MT removes its own terminals host-side from OnTerminalExited; CA never did, and the
-        /// SessionEnd hook that would have covered for it only runs when Claude Code exits
-        /// CLEANLY — CA kills the process, so it never fires. The result was terminals listed
-        /// as available with no process behind them.
-        ///
-        /// TIMEOUT IS LOAD-BEARING, not tidiness. The default client waits 10s, and these are
-        /// shutdown paths: on IDE close that would hold Clarion open for 10s PER TAB waiting on
-        /// a MultiTerminal that may not even be running. 1.5s is long enough for a localhost
-        /// call and short enough to be invisible.
-        ///
-        /// <paramref name="background"/> false runs it inline, for Dispose — a background thread
-        /// would not survive the process exiting, so the request must complete before we return.
-        /// True runs it off the UI thread, for a single tab closing while the IDE lives on.
-        /// </summary>
-        private void DisconnectTabFromMultiTerminal(TerminalTab tab, bool background, string origin)
-        {
-            if (tab == null) { Services.ShutdownLog.Log("MT disconnect skipped (" + origin + "): tab is null"); return; }
-            if (string.IsNullOrEmpty(tab.AgentName))
-            {
-                // Ordinary for the Home tab, and for a tab already disconnected by an earlier path.
-                Services.ShutdownLog.Log("MT disconnect skipped (" + origin + "): no AgentName on tab '" + tab.Name + "'");
-                return;
-            }
-            string agentName = tab.AgentName;
-            // Cleared first: whatever happens to the call, this tab's identity is spent, and a
-            // retry against a name the broker may have reassigned is worse than not retrying.
-            tab.AgentName = null;
-
-            Action disconnect = () =>
-            {
-                var sw = System.Diagnostics.Stopwatch.StartNew();
-                try
-                {
-                    var api = new Services.MultiTerminalApiClient(timeoutMs: 1500);
-                    var res = api.DisconnectTerminal(agentName);
-                    // Logged, not swallowed. The whole path used to be a bare catch{} with no
-                    // trace at all, which is exactly why two failed live tests could not be told
-                    // apart from outside the process — "never attempted" looked identical to
-                    // "attempted and failed". MultiTerminal being absent is still an ordinary
-                    // state, so a failure here is recorded, never surfaced to the developer.
-                    // Elapsed is logged too: a timeout that lands exactly on the budget is the
-                    // signature of a stall BEFORE the request goes out (proxy resolution), not of
-                    // a slow MultiTerminal — that distinction cost a whole test cycle to make.
-                    Services.ShutdownLog.Log("MT disconnect '" + agentName + "' (" + origin + ", "
-                        + (background ? "background" : "inline") + ") -> "
-                        + (res != null && res.Success ? "ok" : "FAILED: " + (res == null ? "null result" : res.Error))
-                        + " [" + sw.ElapsedMilliseconds + "ms]");
-                }
-                catch (Exception ex)
-                {
-                    Services.ShutdownLog.Log("MT disconnect '" + agentName + "' (" + origin + ") THREW after "
-                        + sw.ElapsedMilliseconds + "ms: " + ex.Message);
-                }
-            };
-
-            if (background)
-            {
-                try { System.Threading.ThreadPool.QueueUserWorkItem(_ => disconnect()); }
-                catch { disconnect(); }
-            }
-            else
-            {
-                disconnect();
-            }
-        }
-
-        /// <summary>
-        /// A tab was closed by the developer. Drop its assistant from the MultiTerminal roster
-        /// (ticket 9a0ce0de) while we still can — see the wiring comment for why this hook and
-        /// not the tab list.
-        ///
-        /// Background is safe here: only a single tab is going away, the IDE lives on, so the
-        /// request completes on its own thread and the developer never waits on it.
-        /// </summary>
-        private void OnTabRemoved(object sender, TerminalTab tab)
-        {
-            DisconnectTabFromMultiTerminal(tab, background: true, origin: "tab-removed");
-        }
-
         private void OnTabTerminalProcessExited(TerminalTab tab)
         {
             tab.AssistantLaunched = false;
-
-            // The assistant process is gone, so its broker entry should go too (ticket
-            // 9a0ce0de). Off the UI thread: the IDE is still running, so the request will
-            // complete, and a closing tab should not wait on an HTTP round-trip.
-            //
-            // Usually a no-op now: on a tab close OnTabRemoved has already disconnected this tab
-            // and nulled its AgentName. This still earns its place for the case it was written
-            // for — the assistant dying on its OWN (typed exit, or a crash) with the tab left
-            // open, which no other path sees.
-            DisconnectTabFromMultiTerminal(tab, background: true, origin: "process-exited");
 
             if (_knowledgeService != null && tab.SessionId > 0)
             {
@@ -4356,9 +4372,27 @@ namespace ClarionAssistant
             else
                 label = "Claude Code exited";
             if (InvokeRequired)
-                BeginInvoke((Action)(() => UpdateStatus(label)));
+                BeginInvoke((Action)(() => { ReleaseAgentName(tab); UpdateStatus(label); }));
             else
+            {
+                ReleaseAgentName(tab);
                 UpdateStatus(label);
+            }
+        }
+
+        /// <summary>
+        /// Give up the tab's CA&lt;n&gt; name and its label once no session holds it - an aborted
+        /// launch, or the assistant exiting (ticket 7792e3e0). Without this a dead tab keeps
+        /// showing CA2, so the developer is sent to message an address nobody answers; once the
+        /// broker reaps the row another IDE can take CA2, and two tabs show one name. UI thread
+        /// only: it renames the tab strip, and ResolveUniqueAgentName reads AgentName there.
+        /// </summary>
+        private void ReleaseAgentName(TerminalTab tab)
+        {
+            if (tab.AgentName == null) return;
+            if (tab.BaseName != null)
+                _tabManager.RenameTab(tab, ApplyBackendSuffix(tab.BaseName, tab.AssistantBackend));
+            tab.AgentName = null;
         }
 
         private void OnWorkWithSolution()
@@ -4710,51 +4744,6 @@ namespace ClarionAssistant
         /// <summary>Dispose every live AssistantChatControl on the UI thread before native IDE teardown.
         /// Called from ShutdownService.Terminate(). Disposing the control tears down its WebView2s
         /// (_header/HUD, _homeView) and tab content. Idempotent + exception-swallowing per instance.</summary>
-        /// <summary>
-        /// Drop every registered tab from the MultiTerminal roster, inline, at the very start of
-        /// IDE shutdown (ticket 9a0ce0de).
-        ///
-        /// BACKSTOP ONLY — MEASURED, NOT ASSUMED. On the ordinary File &gt; Exit path this finds
-        /// nothing: the pad's own Dispose runs during WinForms teardown about two seconds BEFORE
-        /// ApplicationExit fires Terminate(), so by the time this is called _instances is already
-        /// empty and it logs "sweep: 0 chat pad instance(s)". That is the expected reading, not a
-        /// failure. It is kept because Terminate() has two entry points (ApplicationExit and
-        /// /Workspace/Terminate) whose relative ordering against control teardown is not ours to
-        /// guarantee, and because a sweep that costs a few milliseconds and says plainly what it
-        /// saw is worth more than an assumption about that ordering — the first version of this
-        /// ticket's fix was built on exactly such an assumption, and it was backwards.
-        ///
-        /// INLINE, not queued: the process is on its way out and a ThreadPool item would be killed
-        /// before the request left the machine. The client's own 1.5s timeout bounds each call, and
-        /// the caller wraps the whole sweep in RunBounded as a second bound.
-        ///
-        /// Counts are logged even when zero — "swept 0 tabs" is the diagnostic that distinguishes
-        /// "nothing to do" from "never ran", which is precisely the distinction the silent version
-        /// could not report.
-        /// </summary>
-        public static void DisconnectAllForShutdown()
-        {
-            List<AssistantChatControl> snapshot;
-            lock (_instances) { snapshot = new List<AssistantChatControl>(_instances); }
-            Services.ShutdownLog.Log("MT disconnect sweep: " + snapshot.Count + " chat pad instance(s)");
-
-            foreach (var inst in snapshot)
-            {
-                try
-                {
-                    var tm = inst._tabManager;
-                    if (tm == null) { Services.ShutdownLog.Log("MT disconnect sweep: instance has no tab manager"); continue; }
-
-                    var tabs = new List<TerminalTab>(tm.Tabs);
-                    Services.ShutdownLog.Log("MT disconnect sweep: " + tabs.Count + " tab(s) on this instance");
-                    foreach (var t in tabs)
-                        inst.DisconnectTabFromMultiTerminal(t, background: false, origin: "shutdown-sweep");
-                }
-                catch (Exception ex) { Services.ShutdownLog.Log("MT disconnect sweep failed: " + ex.Message); }
-            }
-            Services.ShutdownLog.Log("MT disconnect sweep done");
-        }
-
         public static void DisposeAllForShutdown()
         {
             List<AssistantChatControl> snapshot;
@@ -4770,27 +4759,13 @@ namespace ClarionAssistant
             lock (_instances) { _instances.Remove(this); }
             if (disposing)
             {
-                // THIS is the path that actually does the work on a clean File > Exit (ticket
-                // 9a0ce0de) — verified in a live IDE run, where it disconnected the last open
-                // tab roughly two seconds before ApplicationExit fired. ShutdownService's own
-                // sweep is the backstop for the reverse ordering, not the primary.
-                //
-                // Idempotent against the other paths: DisconnectTabFromMultiTerminal nulls
-                // AgentName, so whichever runs second finds nothing to do and logs the skip.
-                //
-                // Still does NOT cover a kill — deploy, crash, Task Manager — which is the common
-                // way CA terminals die and needs a liveness check on the broker side; see the ticket.
-                Services.ShutdownLog.Close("pad dispose: begin (MT disconnect)");
-                try
-                {
-                    if (_tabManager != null)
-                    {
-                        foreach (var t in _tabManager.Tabs)
-                            DisconnectTabFromMultiTerminal(t, background: false, origin: "pad-dispose");
-                    }
-                }
-                catch (Exception ex) { Services.ShutdownLog.Log("MT disconnect on pad dispose failed: " + ex.Message); }
-
+                // NO MultiTerminal disconnect here, or on tab close or process exit (ticket b24bcaf4,
+                // retiring 9a0ce0de's). The broker's disconnect is keyed by NAME and takes the first
+                // row with that name, so with two IDEs holding the same CA-<slug> one tab's exit tore
+                // down the other's registration and wiped its messaging credentials. Release now
+                // belongs to MultiTerminal: the plugin's SessionEnd on a clean exit, and the ownerPid
+                // liveness reaper for a kill - the ordinary way a CA tab dies - which targets the
+                // exact row and re-checks its owner.
                 // Close timing (4d63b995): one line before each step, so the gaps show where the time goes.
                 Services.ShutdownLog.Close("pad dispose: tabs");
                 if (_tabManager != null) _tabManager.Dispose();

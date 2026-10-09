@@ -312,7 +312,7 @@ namespace ClarionAssistant.Dialogs
             // External MCP client access (issue #24)
             bool mcpExternalEnabled = _settings.GetMcpExternalAccessEnabled();
             string mcpExternalToken = _settings.GetMcpExternalToken();
-            int mcpPort = (_mcpServer != null && _mcpServer.IsRunning) ? _mcpServer.Port : 0;
+            int mcpPort = (_mcpServer != null && _mcpServer.IsRunning) ? _mcpServer.ExternalPort : 0;   // the reclaimed stable port when there is one (PR #260)
 
             string modelRegistryJson = _settings.GetModelRegistryJson();
 
@@ -1069,7 +1069,7 @@ namespace ClarionAssistant.Dialogs
                 if (!System.IO.File.Exists(path))
                 {
                     string template = "{\r\n"
-                        + "  \"_comment\": \"Add MCP servers here that should load in Clarion Assistant's IDE-pane Claude session. Format matches Claude Desktop's mcpServers schema. Restart the IDE pane (or open a new tab) for changes to take effect. Addin-supplied servers (clarion-assistant, clarion-tools, multiterminal, multiterminal-channel) cannot be overridden — those keys are reserved.\",\r\n"
+                        + "  \"_comment\": \"Add MCP servers here that should load in Clarion Assistant's IDE-pane Claude session. Format matches Claude Desktop's mcpServers schema. Restart the IDE pane (or open a new tab) for changes to take effect. Addin-supplied servers (clarion-assistant, clarion-tools, multiterminal) cannot be overridden — those keys are reserved.\",\r\n"
                         + "  \"mcpServers\": {\r\n"
                         + "    \"_example_stdio\": {\r\n"
                         + "      \"type\": \"stdio\",\r\n"

@@ -23,7 +23,7 @@ namespace ClarionAssistant.Terminal
     }
 
     /// <summary>
-    /// WebView2-based Home page showing recent solutions, Open Solution, and Create COM.
+    /// WebView2-based Home page (the Dashboard): backend picker and quick-action cards.
     /// Follows the same pattern as HeaderWebView.
     /// </summary>
     public class HomeWebView : UserControl
@@ -134,29 +134,11 @@ namespace ClarionAssistant.Terminal
             _webView.CoreWebView2.PostWebMessageAsString(json);
         }
 
-        /// <summary>Send project entries as pre-built JSON array to the home page.</summary>
-        public void SetProjectsJson(string jsonArray)
+        /// <summary>Project counts for the dashboard's COM Control / IDE Addin cards (d4e941e3). The lists
+        /// themselves live in the ProjectsWebView tabs; 0 hides a card's badge.</summary>
+        public void SetProjectCounts(int com, int addin)
         {
-            SendMessage("{\"type\":\"setProjects\",\"items\":" + jsonArray + "}");
-        }
-
-        /// <summary>Send GitHub accounts list to the home page for project linking.</summary>
-        public void SetGitHubAccounts(string jsonArray)
-        {
-            SendMessage("{\"type\":\"setGitHubAccounts\",\"accounts\":" + jsonArray + "}");
-        }
-
-        /// <summary>Send the default project base folder (from COM.ProjectsFolder setting)
-        /// so the Add Project modal can pre-fill its folder input.</summary>
-        public void SetDefaultProjectFolder(string folder)
-        {
-            SendMessage("{\"type\":\"setDefaultProjectFolder\",\"folder\":\"" + EscapeJson(folder ?? "") + "\"}");
-        }
-
-        /// <summary>Send folder browse result back to the home page JS.</summary>
-        public void SendBrowseResult(string folder, string editId)
-        {
-            SendMessage("{\"type\":\"browseResult\",\"folder\":\"" + EscapeJson(folder ?? "") + "\",\"editId\":\"" + EscapeJson(editId ?? "") + "\"}");
+            SendMessage("{\"type\":\"setProjectCounts\",\"com\":" + com + ",\"addin\":" + addin + "}");
         }
 
         /// <summary>Tell the home page which backend is saved as the default. The page

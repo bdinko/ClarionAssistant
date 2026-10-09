@@ -233,7 +233,8 @@ namespace ClarionAssistant.Services
                             {
                                 var h = HoverAt(source, line0, col0, options);
                                 items = h != null ? 1 : 0;
-                                reply = new Dictionary<string, object> { { "contents", h != null ? h.Markdown : null }, { "authoritative", h != null && h.Authoritative } };
+                                reply = new Dictionary<string, object> { { "contents", h != null ? h.Markdown : null }, { "authoritative", h != null && h.Authoritative },
+                                                                         { "fallback", h != null && h.Fallback }, { "kind", h != null ? h.Kind : null } };
                             }
                             break;
                         }
@@ -366,11 +367,14 @@ namespace ClarionAssistant.Services
             if (!m.Success || m.Length < 2) return result;
             if (m.Index > 0 && (upTo[m.Index - 1] == '.' || upTo[m.Index - 1] == ':')) return result;
             string prefix = m.Value;
-            foreach (string db in new[] { ProjectDb(options), LibraryDb() })
+            string projectDb = ProjectDb(options), libraryDb = LibraryDb();
+            // File-level equates only from .inc files this file includes (null = no filtering).
+            var includedFiles = SymbolIndex.IncludeClosure(options == null ? null : options.FileName, new[] { projectDb, libraryDb }, fastOnly: true);
+            foreach (string db in new[] { projectDb, libraryDb })
             {
                 var idx = SymbolIndex.For(db);
                 if (idx == null) continue;
-                foreach (var s in idx.ByPrefix(prefix, DbLimit, fastOnly: true))
+                foreach (var s in idx.ByPrefix(prefix, DbLimit, fastOnly: true, equateFiles: includedFiles))
                     if (s != null && !string.IsNullOrEmpty(s.Name) && seen.Add(s.Name)) result.Add(SymbolIndex.ToCompletionItem(s));
             }
             AddAll(result, seen, ClarionKeywordIndex.Complete(prefix));
@@ -391,21 +395,29 @@ namespace ClarionAssistant.Services
             string word = LocalScopeIndex.WordAt(lineText, col);
             if (string.IsNullOrEmpty(word)) return null;
 
-            // H4 (Owner decision): a card from the live dictionary, the symbol index, or a keyword with its loaded
-            // description is FINAL (authoritative), so the page skips the LSP hover and Monaco shows no
-            // "Loading..." tail under it. Still non-authoritative: a keyword card that is name + category only
-            // (its data not loaded yet), and an in-buffer local-class member (LocalScopeIndex decides that; the
-            // LSP may know inherited members).
+            // H4 (Owner decision): a card from the live dictionary or the symbol index is FINAL (authoritative),
+            // so the page skips the LSP hover and Monaco shows no "Loading..." tail under it. Keyword cards were
+            // final too until GH #250 (below). Still non-authoritative: an in-buffer local-class member
+            // (LocalScopeIndex decides that; the LSP may know inherited members).
             var dict = LiveDictionaryIndex.HoverWord(word);
             if (dict != null) { dict.Authoritative = true; return dict; }
 
-            if (word.IndexOf('.') < 0)
+            var kw = ClarionKeywordIndex.HoverWord(word);
+            // A declaration keyword in a declaration's keyword slot (a WINDOW's "TEXT,AT(...)", "Win WINDOW(...)",
+            // "w &WINDOW") is never a reference to a symbol, so no same-named index row may answer it (TEXT -> an
+            // unrelated library EQUATE "Text"). Built-ins and attributes are never slots: an attribute name can be
+            // a procedure's (PASSWORD in PRM002), and its MAP prototype has the same shape as a control line.
+            bool keywordSlot = kw != null && IsDeclarationKeywordSlot(lineText, col, word);
+            if (word.IndexOf('.') < 0 && !keywordSlot)
             {
                 // The index is asked BEFORE any keyword card: an attribute/control name can also be a procedure
                 // or variable (PASSWORD in PRM002). L3: a word followed by '(' is a call, so a procedure of that
                 // name wins over any other symbol (and, below, over the attribute card).
                 bool call = FollowedByParen(lineText, col, word);
-                foreach (string db in new[] { ProjectDb(options), LibraryDb() })
+                string projectDb = ProjectDb(options), libraryDb = LibraryDb();
+                HashSet<string> includedFiles = null;
+                bool closureBuilt = false;
+                foreach (string db in new[] { projectDb, libraryDb })
                 {
                     var idx = SymbolIndex.For(db);
                     if (idx == null) continue;
@@ -416,12 +428,141 @@ namespace ClarionAssistant.Services
                                 (string.Equals(c.Type, "procedure", StringComparison.OrdinalIgnoreCase) ||
                                  string.Equals(c.Type, "function", StringComparison.OrdinalIgnoreCase))) { s = c; break; }
                     if (s == null) s = idx.FindByName(word, fastOnly: true);
+                    // File-level equates only from include files this file includes, as completion does. The
+                    // closure is built only when an equate hit needs it (null = no filtering).
+                    if (s != null && string.Equals(s.Params, "EQUATE", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (!closureBuilt)
+                        {
+                            includedFiles = SymbolIndex.IncludeClosure(options.FileName, new[] { projectDb, libraryDb }, fastOnly: true);
+                            closureBuilt = true;
+                        }
+                        if (includedFiles != null && SymbolIndex.IsEquateOutside(s, includedFiles))
+                            s = idx.FindByName(word, true, includedFiles);
+                    }
                     if (s != null) return new LocalHoverResult { Markdown = SymbolCard(s), Authoritative = true, Kind = "index" };
                 }
             }
-            var kw = ClarionKeywordIndex.HoverWord(word);
-            if (kw != null) kw.Authoritative = ClarionKeywordIndex.IsFinalCard(word);   // L3: reserved words only
+            // GH #250: a keyword card is a FALLBACK, never final. The server's card for END / ELSE / ELSIF / OF /
+            // OROF / TO / a period terminator names the structure it closes or the branch it is, which the local
+            // layer cannot know; the page asks the server first and shows this card only when the server has
+            // nothing or misses its short deadline (FALLBACK_LSP_DEADLINE_MS), so no word list and no Loading tail.
+            // A control keyword (TEXT, ENTRY, BUTTON...) means something only at the start of a control declaration.
+            // Mid-line ("LONG(text)", "USE(?Text)", "x = text") it is an undeclared word with no symbol behind it,
+            // and a control card would be wrong. A line that starts with it keeps its card even when its shape is
+            // ambiguous ("TAB('General')" looks like the call "Button(1)").
+            if (kw != null && !keywordSlot &&
+                ClarionKeywordIndex.DeclarationKind(word) == ClarionKeywordIndex.DeclKind.Control &&
+                !IsFirstOnLine(lineText, col, word))
+                return null;
+            if (kw != null) { kw.Authoritative = false; kw.Fallback = true; }
             return kw;
+        }
+
+        /// <summary>True when the occurrence of <paramref name="word"/> under column <paramref name="col"/> is the
+        /// first token of its line (only whitespace before it).</summary>
+        internal static bool IsFirstOnLine(string lineText, int col, string word)
+        {
+            if (string.IsNullOrEmpty(lineText) || string.IsNullOrEmpty(word)) return false;
+            for (int i = lineText.IndexOf(word, StringComparison.OrdinalIgnoreCase); i >= 0;
+                 i = lineText.IndexOf(word, i + 1, StringComparison.OrdinalIgnoreCase))
+                if (col >= i && col <= i + word.Length) return lineText.Substring(0, i).Trim().Length == 0;
+            return false;
+        }
+
+        private static readonly System.Text.RegularExpressions.Regex LabelThenSpace =
+            new System.Text.RegularExpressions.Regex(@"^[A-Za-z_][A-Za-z0-9_:]*[ \t]+$");
+
+        /// <summary>True when <paramref name="word"/> is a declaration keyword (<see cref="ClarionKeywordIndex.DeclarationKind"/>)
+        /// and its occurrence under column <paramref name="col"/> sits in a declaration's keyword slot:
+        /// <list type="bullet">
+        /// <item>right after a column-1 label ("Win  WINDOW(...)", "Rtn  ROUTINE"), for a reserved type also behind
+        /// a reference marker ("w  &amp;WINDOW");</item>
+        /// <item>for a reserved type, a prototype's parameter or return type ("Proc(*WINDOW pW),LONG");</item>
+        /// <item>the first token of an unlabelled line followed by nothing, a comment, a continuation, or an
+        /// attribute list ("TEXT,AT(...)", "GROUP('x'),AT(...)") - or, for a reserved type, by a bare
+        /// "(...)" ("  STRING(20)").</item>
+        /// </list>
+        /// A code statement never takes these shapes: an assignment has '=' after its first token, and a call
+        /// "Foo(x)" has no ',' after its closing parenthesis. A control name is not reserved, so "Button(1)" stays
+        /// a call.</summary>
+        internal static bool IsDeclarationKeywordSlot(string lineText, int col, string word)
+        {
+            if (string.IsNullOrEmpty(lineText) || string.IsNullOrEmpty(word)) return false;
+            var kind = ClarionKeywordIndex.DeclarationKind(word);
+            if (kind == ClarionKeywordIndex.DeclKind.None) return false;
+            bool reserved = kind == ClarionKeywordIndex.DeclKind.Reserved;
+            for (int i = lineText.IndexOf(word, StringComparison.OrdinalIgnoreCase); i >= 0;
+                 i = lineText.IndexOf(word, i + 1, StringComparison.OrdinalIgnoreCase))
+            {
+                int end = i + word.Length;
+                if (col < i || col > end) continue;
+                if (i > 0 && IsWordChar(lineText[i - 1])) return false;          // inside a longer word
+                if (end < lineText.Length && IsWordChar(lineText[end])) return false;
+                string before = lineText.Substring(0, i);
+                if (LabelThenSpace.IsMatch(before)) return true;                 // "Label  KEYWORD..."
+
+                int p = LastNonSpace(before);
+                char prev = p >= 0 ? before[p] : '\0';
+                if (reserved && (prev == '&' || prev == '*' || prev == '<'))
+                {
+                    if (LabelThenSpace.IsMatch(before.Substring(0, p))) return true;   // "Label  &WINDOW"
+                    int q = LastNonSpace(before.Substring(0, p));
+                    prev = q >= 0 ? before[q] : '\0';
+                }
+                int j = SkipSpaces(lineText, end);
+                if (reserved && (prev == '(' || prev == ','))
+                {
+                    // A prototype's parameter or return type: "(*WINDOW pW)", "(LONG,STRING)", "),LONG".
+                    char next = j < lineText.Length ? lineText[j] : '\0';
+                    if (next == '\0' || next == ',' || next == ')' || next == '>' || next == '=' || next == '!' ||
+                        next == '|' || char.IsLetter(next) || next == '_')
+                        return true;
+                }
+                if (i == 0 || before.Trim().Length > 0) return false;             // column 1 is a label, or not first
+                if (j < lineText.Length && lineText[j] == '(')
+                {
+                    j = SkipParens(lineText, j);
+                    if (j < 0) return false;
+                    j = SkipSpaces(lineText, j);
+                    if (j < lineText.Length && lineText[j] == ',') return true;   // "KEYWORD(...),ATTR"
+                    return reserved && (j >= lineText.Length || lineText[j] == '!' || lineText[j] == '|');
+                }
+                return j >= lineText.Length || lineText[j] == ',' || lineText[j] == '!' || lineText[j] == '|';
+            }
+            return false;
+        }
+
+        private static bool IsWordChar(char c) { return char.IsLetterOrDigit(c) || c == '_' || c == ':'; }
+
+        private static int LastNonSpace(string s)
+        {
+            int k = s.Length - 1;
+            while (k >= 0 && (s[k] == ' ' || s[k] == '\t')) k--;
+            return k;
+        }
+
+        private static int SkipSpaces(string s, int j)
+        {
+            while (j < s.Length && (s[j] == ' ' || s[j] == '\t')) j++;
+            return j;
+        }
+
+        /// <summary>The index just past the ')' that closes the '(' at <paramref name="open"/>, skipping
+        /// '...' strings; -1 when it does not close on this line.</summary>
+        private static int SkipParens(string s, int open)
+        {
+            int depth = 0;
+            bool inStr = false;
+            for (int k = open; k < s.Length; k++)
+            {
+                char ch = s[k];
+                if (inStr) { if (ch == '\'') inStr = false; continue; }   // '' re-enters on the next quote
+                if (ch == '\'') inStr = true;
+                else if (ch == '(') depth++;
+                else if (ch == ')' && --depth == 0) return k + 1;
+            }
+            return -1;
         }
 
         /// <summary>True when the occurrence of <paramref name="word"/> under column <paramref name="col"/> is
@@ -444,9 +585,28 @@ namespace ClarionAssistant.Services
         {
             string sig = s.Name + (string.IsNullOrEmpty(s.Params) ? "" : " " + s.Params) +
                          (string.IsNullOrEmpty(s.ReturnType) ? "" : " : " + s.ReturnType);
-            string where = string.IsNullOrEmpty(s.FilePath) ? "" :
-                "\n\n" + System.IO.Path.GetFileName(s.FilePath) + (s.LineNumber > 0 ? ":" + s.LineNumber : "");
+            string where = string.IsNullOrEmpty(s.FilePath) ? "" : "\n\n" + LocationLink(s.FilePath, s.LineNumber);
             return "```clarion\n" + sig + "\n```\n" + SymbolIndex.CompletionDetail(s) + where;
+        }
+
+        /// <summary>"File.inc:12" as a markdown link to <c>file:///…/File.inc#L12</c>, which the page's link opener
+        /// (monaco-embeditor.html registerLinkOpener) hands to the IDE, as the language server's hover footers
+        /// do. Plain text when the path is not an absolute path (a relative or malformed index row) or has no line.
+        /// <paramref name="line"/> is the 1-based line the index stores.</summary>
+        internal static string LocationLink(string filePath, int line)
+        {
+            string name;
+            try { name = System.IO.Path.GetFileName(filePath); }
+            catch (ArgumentException) { name = filePath; }   // .NET Framework rejects some characters: one bad row must not abort the card
+            string label = name + (line > 0 ? ":" + line : "");
+            try
+            {
+                if (line <= 0 || !System.IO.Path.IsPathRooted(filePath)) return label;
+                var uri = new Uri(filePath);
+                if (!uri.IsAbsoluteUri || !uri.IsFile) return label;
+                return "[" + label.Replace("[", "\\[").Replace("]", "\\]") + "](" + uri.AbsoluteUri + "#L" + line + ")";
+            }
+            catch (Exception) { return label; }
         }
 
         private static void AddAll(List<LspClient.CompletionItemInfo> into, HashSet<string> seen, List<LspClient.CompletionItemInfo> from)
@@ -491,13 +651,25 @@ namespace ClarionAssistant.Services
         /// the local layer found no project DB at all: no hover for GlobalRequest or InventoryFastAddForm on
         /// build 1247. The walk-up is SharedLspBridge.ResolveCodeGraphDb's fallback, cached per directory.
         /// </summary>
+        /// <summary>
+        /// f64ba833: the folder of the solution open in the IDE, or null. Set once by the host at startup. The
+        /// walk-up needs a folder to start from, and the CA Embeditor has none whenever EmbedLspContext.TryCapture
+        /// failed (it then passes a bare "InventoryTable.clw"): no project DB meant GlobalRequest waited on the
+        /// LSP ("Loading...") and PASSWORD( fell through to the ENTRY attribute's keyword card, while the CA
+        /// Editor, which always has a real path, answered both instantly.
+        /// </summary>
+        public static Func<string> SolutionDirPath;
+
         private static string ProjectDb(LocalLayerOptions o)
         {
             string p = Cached(ProjectDbPath, ref _projPath, ref _projAt);
             if (p != null) return p;
             string dir = null;
             try { if (o != null && !string.IsNullOrEmpty(o.FileName)) dir = System.IO.Path.GetDirectoryName(o.FileName); } catch { }
-            return string.IsNullOrEmpty(dir) ? null : NearestDb(dir);
+            if (!string.IsNullOrEmpty(dir)) return NearestDb(dir);
+            string sln = null;
+            try { var f = SolutionDirPath; if (f != null) sln = f(); } catch { }
+            return string.IsNullOrEmpty(sln) ? null : NearestDb(sln);
         }
 
         private static string LibraryDb() { return Cached(LibraryDbPath, ref _libPath, ref _libAt); }
@@ -551,7 +723,7 @@ namespace ClarionAssistant.Services
             {
                 case SlotDiagnostics: return new Dictionary<string, object> { { "markers", new List<Dictionary<string, object>>() } };
                 case LocalCompletion: return new Dictionary<string, object> { { "items", new List<Dictionary<string, object>>() }, { "source", "local" } };
-                case LocalHover: return new Dictionary<string, object> { { "contents", null }, { "authoritative", false } };
+                case LocalHover: return new Dictionary<string, object> { { "contents", null }, { "authoritative", false }, { "fallback", false }, { "kind", null } };
                 default: return new Dictionary<string, object>();
             }
         }
