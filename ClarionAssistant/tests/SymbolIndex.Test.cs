@@ -49,6 +49,7 @@ static class SymbolIndexTest
             BuildOldSchema(old, ProjectRows());
 
             Queries(proj, lib);
+            NocaseLookups(repo);
             Fallback(old);
             IndexerCreatesIndexes();
             AutoIndexBuild();
@@ -162,9 +163,9 @@ static class SymbolIndexTest
 
     // ------------------------------------------------------------------------------ file-level equates
 
-    static void Sym(SQLiteConnection cn, string name, string type, string file, string scope, string prms, int project)
+    static void Sym(SQLiteConnection cn, string name, string type, string file, string scope, string prms, int project, string parent = null)
     {
-        using (var cmd = new SQLiteCommand("INSERT INTO symbols (name, type, file_path, line_number, project_id, params, scope) VALUES (@n, @t, @f, 1, @pr, @p, @s)", cn))
+        using (var cmd = new SQLiteCommand("INSERT INTO symbols (name, type, file_path, line_number, project_id, params, scope, parent_name) VALUES (@n, @t, @f, 1, @pr, @p, @s, @par)", cn))
         {
             cmd.Parameters.AddWithValue("@n", name);
             cmd.Parameters.AddWithValue("@t", type);
@@ -172,6 +173,7 @@ static class SymbolIndexTest
             cmd.Parameters.AddWithValue("@pr", project);
             cmd.Parameters.AddWithValue("@p", (object)prms ?? DBNull.Value);
             cmd.Parameters.AddWithValue("@s", scope);
+            cmd.Parameters.AddWithValue("@par", (object)parent ?? DBNull.Value);
             cmd.ExecuteNonQuery();
         }
     }
@@ -252,41 +254,193 @@ static class SymbolIndexTest
         Check(SymbolIndex.IncludeClosure(dir + "Mem.clw", new[] { oldDb }, fastOnly: true) == null, "E.12", "fastOnly on a DB without the NOCASE indexes -> null");
         Check(SymbolIndex.IncludeClosure(dir + "Mem.clw", new[] { oldDb }) != null, "E.13", "the same DB is still usable off the keystroke lane");
 
-        // ScopeEquateToIncludes: an unfiltered exact-name hit (a provider's FindByName-style first row), scoped to
-        // what the context file can see. Own name prefixes so the E.3-E.5 counts above stay as they are.
+        // FirstVisibleByName: the hover / definition fallbacks' exact-name lookup over every same-named row of a
+        // provider, scoped to what the context file can see. Own name prefixes so the E.3-E.5 counts above stay
+        // as they are. The rows come back ordered by scope, then file path, so an invisible row is placed where
+        // it sorts BEFORE the visible one (C.inc < Common.inc) - the filter, not the order, must pick the hit.
+        // Rows are also inserted invisible-first, the order that won the old unordered LIMIT 1.
         using (var cn = new SQLiteConnection("Data Source=" + db + ";Version=3;"))
         {
             cn.Open();
-            Sym(cn, "DUP_X", "variable", dir + "C.inc", "global", "EQUATE", 1);       // not included, declared first
-            Sym(cn, "DUP_X", "variable", dir + "A.inc", "global", "EQUATE", 1);       // included by Mem.clw
+            Sym(cn, "DUP_X", "variable", dir + "C.inc", "global", "EQUATE", 1);       // not included; sorts first
+            Sym(cn, "DUP_X", "variable", dir + "Common.inc", "global", "EQUATE", 1);  // included via Mem.clw's PROGRAM
             Sym(cn, "ONLYC_Y", "variable", dir + "C.inc", "global", "EQUATE", 1);     // only in a not-included .inc
             Sym(cn, "ONLYEQU_Z", "variable", dir + "Std.equ", "global", "EQUATE", 1); // only in a not-included .equ
             Sym(cn, "SEEN_W", "variable", dir + "B.inc", "global", "EQUATE", 1);      // included (transitively)
+            // A local of another procedure first, then a visible equate of the same name.
+            Sym(cn, "OtherProc", "procedure", dir + "Other.clw", "module", null, 1);
+            Sym(cn, "LOC_EQ", "variable", dir + "Other.clw", "local", "LONG", 1, "OtherProc");
+            Sym(cn, "LOC_EQ", "variable", dir + "A.inc", "global", "EQUATE", 1);
+            // An equate the file cannot see first, then a local of another procedure.
+            Sym(cn, "OUT_LOC", "variable", dir + "C.inc", "global", "EQUATE", 1);
+            Sym(cn, "OUT_LOC", "variable", dir + "Other.clw", "local", "LONG", 1, "OtherProc");
+            // Only a local and a parameter of another procedure.
+            Sym(cn, "ONLY_LOC", "variable", dir + "Other.clw", "local", "LONG", 1, "OtherProc");
+            Sym(cn, "ONLY_LOC", "variable", dir + "Other.clw", "parameter", "LONG", 1, "OtherProc");
+            // A local first, then a module variable of another file (visible to the fallback, as before).
+            Sym(cn, "LOC_MOD", "variable", dir + "Other.clw", "local", "LONG", 1, "OtherProc");
+            Sym(cn, "LOC_MOD", "variable", dir + "Util.clw", "module", "LONG", 1);
         }
         SymbolIndex.Release(db);
         var idx2 = SymbolIndex.For(db);
         var memClosureDbs = new[] { db };
-        Func<string, CodeGraphSymbol> scoped = n =>
-            SymbolIndex.ScopeEquateToIncludes(idx2.FindByName(n), n, db, dir + "Mem.clw", memClosureDbs);
+        using (var p = new CodeGraphProvider())
+        {
+            Check(p.Open(db), "E.27", "the fixture DB opens in a CodeGraphProvider");
+            Func<string, CodeGraphSymbol> visible = n => SymbolIndex.FirstVisibleByName(p, n, dir + "Mem.clw", memClosureDbs);
 
-        var dup = scoped("DUP_X");
-        Check(dup != null && string.Equals(Path.GetFileName(dup.FilePath), "A.inc", StringComparison.OrdinalIgnoreCase), "E.14",
-              "two same-named equates, whichever the unfiltered lookup returns first -> the one from the INCLUDED file: " + (dup == null ? "null" : dup.FilePath));
-        Check(scoped("ONLYC_Y") == null, "E.15", "an equate only in a .inc this file never includes -> null (no hover)");
-        Check(scoped("ONLYEQU_Z") == null, "E.16", "an equate only in a .equ this file never includes -> null: .equ files are filtered like .inc");
-        var seenW = scoped("SEEN_W");
-        Check(seenW != null && seenW.Name == "SEEN_W", "E.17", "an equate in a transitively included .inc is kept");
+            var dup = visible("DUP_X");
+            Check(dup != null && string.Equals(Path.GetFileName(dup.FilePath), "Common.inc", StringComparison.OrdinalIgnoreCase), "E.14",
+                  "two same-named equates, the not-included one declared first -> the one from the INCLUDED file: " + (dup == null ? "null" : dup.FilePath));
+            Check(visible("ONLYC_Y") == null, "E.15", "an equate only in a .inc this file never includes -> null (no hover)");
+            Check(visible("ONLYEQU_Z") == null, "E.16", "an equate only in a .equ this file never includes -> null: .equ files are filtered like .inc");
+            var seenW = visible("SEEN_W");
+            Check(seenW != null && seenW.Name == "SEEN_W", "E.17", "an equate in a transitively included .inc is kept");
 
-        var proc = idx2.FindByName("EQ_PROC");
-        Check(ReferenceEquals(SymbolIndex.ScopeEquateToIncludes(proc, "EQ_PROC", db, dir + "Mem.clw", memClosureDbs), proc), "E.18",
-              "a non-equate row is returned unchanged");
-        var onlyC = idx2.FindByName("ONLYC_Y");
-        Check(ReferenceEquals(SymbolIndex.ScopeEquateToIncludes(onlyC, "ONLYC_Y", db, null, memClosureDbs), onlyC) &&
-              ReferenceEquals(SymbolIndex.ScopeEquateToIncludes(onlyC, "ONLYC_Y", db, dir + "Mem.clw", new string[] { null, db }), onlyC),
-              "E.19", "no context file, or no project DB to build a closure from -> unchanged (do not filter)");
-        Check(SymbolIndex.ScopeEquateToIncludes(null, "X", db, dir + "Mem.clw", memClosureDbs) == null, "E.20", "no symbol -> null");
+            var proc = visible("EQ_PROC");
+            Check(proc != null && proc.Type == "procedure", "E.18", "a non-equate row is not filtered by the include closure");
+            Check(SymbolIndex.FirstVisibleByName(p, "ONLYC_Y", null, memClosureDbs) != null &&
+                  SymbolIndex.FirstVisibleByName(p, "ONLYC_Y", dir + "Mem.clw", new string[] { null, db }) != null,
+                  "E.19", "no context file, or no project DB to build a closure from -> equates are not filtered");
+            Check(visible("NO_SUCH_NAME") == null && SymbolIndex.FirstVisibleByName(null, "X", dir + "Mem.clw", memClosureDbs) == null,
+                  "E.20", "no symbol, or no provider -> null");
+
+            var locEq = visible("LOC_EQ");
+            Check(locEq != null && locEq.Params == "EQUATE" && string.Equals(Path.GetFileName(locEq.FilePath), "A.inc", StringComparison.OrdinalIgnoreCase),
+                  "E.22", "another procedure's local declared first does not hide a visible equate of the same name - got " + (locEq == null ? "null" : locEq.FilePath));
+            Check(visible("OUT_LOC") == null, "E.23", "skipping an equate the file cannot see never lands on another procedure's local");
+            Check(visible("ONLY_LOC") == null, "E.24", "only a local and a parameter of another procedure -> null");
+            var locMod = visible("LOC_MOD");
+            Check(locMod != null && locMod.Scope == "module", "E.25", "a local declared first does not hide another file's module variable");
+            // No context file, so only the caller's test can skip the C.inc row that sorts first.
+            var rejected = SymbolIndex.FirstVisibleByName(p, "DUP_X", null, memClosureDbs,
+                s => string.Equals(Path.GetFileName(s.FilePath), "C.inc", StringComparison.OrdinalIgnoreCase));
+            Check(rejected != null && string.Equals(Path.GetFileName(rejected.FilePath), "Common.inc", StringComparison.OrdinalIgnoreCase),
+                  "E.26", "a row the caller's unreachable test rejects is skipped and the next row is tried");
+        }
 
         Check(mem.Contains("A.inc") && !mem.Contains("bad<name.inc"), "E.21", "a malformed include row is skipped, the rest of the closure is intact");
+    }
+
+    // ------------------------------------------------------------------------------ N.1-N.6 (GH #280)
+
+    /// <summary>Name lookups use = COLLATE NOCASE, not LOWER(x) = LOWER(@x): the same rows, in the same order,
+    /// and the plan SEARCHes the NOCASE index instead of scanning. The LOWER form is rebuilt from each query's
+    /// own text, so the comparison is against exactly what the query did before.</summary>
+    static void NocaseLookups(string repo)
+    {
+        Console.WriteLine("name lookups: COLLATE NOCASE (GH #280)");
+        string db = Path.Combine(_work, "nocase.codegraph.db");
+        string old = Path.Combine(_work, "nocase-old.codegraph.db");
+        var rows = ProjectRows().Concat(new[]
+        {
+            new[] { "glovar", "variable", "module", null, "BYTE" },          // a second GloVar, other case
+            new[] { "ÄrgerVar", "variable", "global", null, "LONG" },    // non-ASCII: neither form folds it
+            new[] { "mybrowse.Extra", "procedure", "global", "mybrowse", "()" },
+            new[] { "Glo%Var", "variable", "global", null, "LONG" },
+        }).ToArray();
+        BuildIndexed(db, rows);
+        BuildOldSchema(old, rows);
+
+        Func<string, string> lowered = sql => sql
+            .Replace("s.name = @name COLLATE NOCASE", "LOWER(s.name) = LOWER(@name)")
+            .Replace("s.parent_name = @parent COLLATE NOCASE", "LOWER(s.parent_name) = LOWER(@parent)");
+        Func<string, string, string, Action<SQLiteCommand>, string> ids = (path, sql, label, bind) =>
+        {
+            var got = new List<string>();
+            using (var cn = new SQLiteConnection("Data Source=" + path + ";Version=3;Read Only=True;"))
+            {
+                cn.Open();
+                using (var cmd = new SQLiteCommand(sql, cn))
+                {
+                    bind(cmd);
+                    using (var r = cmd.ExecuteReader()) while (r.Read()) got.Add(Convert.ToString(r[0]));
+                }
+            }
+            return string.Join(",", got);
+        };
+        var names = new[] { "GloVar", "glovar", "GLOVAR", "ärgervar", "ÄRGERVAR", "ÄrgerVar", "MyBrowse", "Glo%Var", "glo_var", "NoSuch" };
+        var parents = new[] { "MyBrowse", "mybrowse", "MYBROWSE", "BrowseClass", "NoSuch" };
+        var byName = new Dictionary<string, string>
+        {
+            { "CodeGraphProvider.ByNameSql", CodeGraphProvider.ByNameSql },
+            { "CodeGraphProvider.AllByNameSql", CodeGraphProvider.AllByNameSql },
+            { "SymbolIndex.ExactSql", SymbolIndex.ExactSql },
+            { "SymbolIndex.ExactSqlAll", SymbolIndex.ExactSqlAll },
+            { "SymbolIndex.BaseClassSql", SymbolIndex.BaseClassSql },
+        };
+        var byParent = new Dictionary<string, string>
+        {
+            { "CodeGraphProvider.MembersOfParentSql", CodeGraphProvider.MembersOfParentSql },
+            { "SymbolIndex.MembersSql", SymbolIndex.MembersSql },
+        };
+        Action<SQLiteCommand, string> bindName = (cmd, n) => { cmd.Parameters.AddWithValue("@name", n); cmd.Parameters.AddWithValue("@limit", 50); };
+        Action<SQLiteCommand, string> bindParent = (cmd, p) =>
+        {
+            cmd.Parameters.AddWithValue("@parent", p);
+            cmd.Parameters.AddWithValue("@parentDot", p.Replace("\\", "\\\\").Replace("%", "\\%").Replace("_", "\\_") + ".%");
+            cmd.Parameters.AddWithValue("@limit", 50);
+        };
+
+        foreach (var path in new[] { db, old })
+        {
+            string which = path == db ? "indexed" : "old schema";
+            var diffs = new List<string>();
+            int nonEmpty = 0;
+            foreach (var q in byName)
+            {
+                if (q.Value.IndexOf("COLLATE NOCASE", StringComparison.Ordinal) < 0) diffs.Add(q.Key + " has no COLLATE NOCASE");
+                foreach (var n in names)
+                {
+                    string a = ids(path, q.Value, q.Key, cmd => bindName(cmd, n)), b = ids(path, lowered(q.Value), q.Key, cmd => bindName(cmd, n));
+                    if (a != b) diffs.Add(q.Key + "(" + n + "): " + a + " vs LOWER " + b);
+                    if (a.Length > 0) nonEmpty++;
+                }
+            }
+            foreach (var q in byParent)
+                foreach (var p in parents)
+                {
+                    string a = ids(path, q.Value, q.Key, cmd => bindParent(cmd, p)), b = ids(path, lowered(q.Value), q.Key, cmd => bindParent(cmd, p));
+                    if (a != b) diffs.Add(q.Key + "(" + p + "): " + a + " vs LOWER " + b);
+                    if (a.Length > 0) nonEmpty++;
+                }
+            Check(diffs.Count == 0 && nonEmpty >= 20, path == db ? "N.1" : "N.2",
+                  which + ": every name/parent lookup returns the same rows, in the same order, as LOWER() = LOWER() (" + nonEmpty + " non-empty answers)" +
+                  (diffs.Count == 0 ? "" : " - " + string.Join("; ", diffs.Take(5))));
+        }
+
+        // The case behaviour the comparison above rests on: ASCII folds, non-ASCII does not (in either form).
+        using (var p = new CodeGraphProvider())
+        {
+            Check(p.Open(db), "N.3a", "the fixture opens in a CodeGraphProvider");
+            var all = p.FindAllSymbolsByName("GLOVAR");
+            Check(all.Count == 2 && all[0].Scope == "global" && all[1].Scope == "module" && p.FindSymbolByName("gLoVaR") != null &&
+                  p.FindSymbolByName("ÄrgerVar") != null && p.FindSymbolByName("ärgervar") == null,
+                  "N.3", "FindAllSymbolsByName GLOVAR -> both rows, global first; ASCII case folds, non-ASCII is matched exactly");
+            var members = p.FindMembersOfParent("MYBROWSE").Select(s => s.Name).ToList();
+            Check(members.SequenceEqual(new[] { "MyBrowse.Custom", "MyBrowse.ResetSort", "mybrowse.Extra" }), "N.3b",
+                  "FindMembersOfParent MYBROWSE -> " + string.Join(", ", members));
+        }
+
+        foreach (var q in byName)
+        {
+            string plan = Plan(db, q.Value, cmd => bindName(cmd, "GloVar"));
+            Check(plan.Contains("USING INDEX " + SymbolIndex.NameIndex) || plan.Contains("USING COVERING INDEX " + SymbolIndex.NameIndex),
+                  "N.4 " + q.Key, "the plan searches " + SymbolIndex.NameIndex + ": " + plan);
+        }
+        foreach (var q in byParent)
+        {
+            string plan = Plan(db, q.Value, cmd => bindParent(cmd, "MyBrowse"));
+            Check(plan.Contains("USING INDEX " + SymbolIndex.ParentIndex), "N.5 " + q.Key, "the plan searches " + SymbolIndex.ParentIndex + ": " + plan);
+        }
+
+        // N.6: no LOWER(column) = LOWER(@param) name lookup is left in either file.
+        foreach (var rel in new[] { @"CodeGraph\Graph\CodeGraphProvider.cs", @"Services\SymbolIndex.cs" })
+        {
+            string src = File.ReadAllText(Path.Combine(repo, rel));
+            var hits = System.Text.RegularExpressions.Regex.Matches(src, @"LOWER\(s\.(name|parent_name)\)").Cast<System.Text.RegularExpressions.Match>().Select(m => m.Value).ToList();
+            Check(hits.Count == 0, "N.6 " + Path.GetFileName(rel), "no LOWER(s.name) / LOWER(s.parent_name) lookup left" + (hits.Count == 0 ? "" : ": " + string.Join(", ", hits)));
+        }
     }
 
     static HashSet<string> Names(IEnumerable<CodeGraphSymbol> syms) { return new HashSet<string>(syms.Select(s => s.Name), StringComparer.Ordinal); }
@@ -588,12 +742,13 @@ static class SymbolIndexTest
         Console.WriteLine("release wiring (source scans)");
         string chat = File.ReadAllText(Path.Combine(repo, "AssistantChatControl.cs"));
         string work = Slice(chat, "worker.DoWork += (s, e) =>", "worker.ProgressChanged");
-        string cancelled = Slice(work, "if (wasCancelled && !incremental)", "}");
-        Check(Before(work, "SymbolIndex.Release(dbPath)", "db.Open(dbPath)") && Before(cancelled, "SymbolIndex.Release(dbPath)", "File.Delete(dbPath)"),
+        string cancelled = Slice(work, "if (wasCancelled && !ranIncremental)", "}");   // ef2fd2a9: what RAN (an upgraded incremental runs full)
+        // 583abdec: the write open is now the clarion-indexer.exe child (indexer.Run), so the release must precede it.
+        Check(Before(work, "SymbolIndex.Release(dbPath)", "indexer.Run(") && Before(cancelled, "SymbolIndex.Release(dbPath)", "File.Delete(dbPath)"),
               "2.18a", "RunIndex releases before the write open and before the cancelled-run delete");
         string reg = File.ReadAllText(Path.Combine(repo, "Services", "McpToolRegistry.cs"));
-        string exec = Slice(reg, "private object ExecuteIndexCodeGraph(", "indexer.IndexSolution");
-        Check(Before(exec, "SymbolIndex.Release(dbPath)", "db.Open(dbPath)"), "2.18b", "ExecuteIndexCodeGraph releases before the write open");
+        string exec = Slice(reg, "private object ExecuteIndexCodeGraph(", "#region");
+        Check(Before(exec, "SymbolIndex.Release(dbPath)", "indexer.Run("), "2.18b", "ExecuteIndexCodeGraph releases before the write open");
         string cg = File.ReadAllText(Path.Combine(repo, "Services", "ClarionGraphService.cs"));
         Check(Before(Slice(cg, "private static void DeleteDbFiles(", "catch"), "SymbolIndex.Release(dbPath)", "File.Delete"), "2.18c",
               "the ClarionGraph rebuild releases before deleting");

@@ -347,6 +347,13 @@ namespace ClarionAssistant.Services
 
         private static string FindClaudePath()
         {
+            return FindClaudePath(allowPathSearch: true);
+        }
+
+        // allowPathSearch=false stops after the three known install locations and never
+        // asks `where`, whose search includes the current directory and every PATH entry.
+        private static string FindClaudePath(bool allowPathSearch)
+        {
             string appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
             string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
             string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
@@ -362,6 +369,8 @@ namespace ClarionAssistant.Services
             // 3. WinGet install
             string wingetLink = Path.Combine(localAppData, "Microsoft", "WinGet", "Links", "claude.exe");
             if (File.Exists(wingetLink)) return wingetLink;
+
+            if (!allowPathSearch) return null;
 
             // 4. Try PATH via where command (catches any install location added to PATH)
             try
@@ -386,26 +395,82 @@ namespace ClarionAssistant.Services
         }
 
         /// <summary>
-        /// Finds the Clarion Assistant plugin directory.
-        /// Checks marketplace source first, then cache.
+        /// The installed Claude Code CLI's version ("2.1.293"), from <c>claude --version</c>,
+        /// or null when the CLI can't be found, doesn't answer within
+        /// <paramref name="timeoutMs"/>, or prints nothing recognisable. Blocks: call it
+        /// off the UI thread.
+        /// </summary>
+        /// <remarks>
+        /// Settings calls this just for opening, so it only runs a CLI from the known
+        /// install locations (npm global, ~/.claude/local, WinGet), never one found by
+        /// searching PATH: a PATH-only install reports null ("version unknown").
+        /// </remarks>
+        public static string GetInstalledClaudeVersion(int timeoutMs)
+        {
+            try
+            {
+                string path = FindClaudePath(allowPathSearch: false);
+                if (path == null) return null;
+                // claude.cmd (npm) needs cmd.exe to run; the other two locations are .exe.
+                bool isExe = path.EndsWith(".exe", StringComparison.OrdinalIgnoreCase);
+                var psi = new ProcessStartInfo
+                {
+                    FileName = isExe ? path : Path.Combine(Environment.SystemDirectory, "cmd.exe"),
+                    Arguments = isExe ? "--version" : "/d /s /c \"\"" + path + "\" --version\"",
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    // stderr is left alone: redirected and never read, a CLI that writes
+                    // much to it would fill the pipe and stall until the timeout.
+                    CreateNoWindow = true
+                };
+                using (var proc = Process.Start(psi))
+                {
+                    var read = proc.StandardOutput.ReadToEndAsync();
+                    if (!proc.WaitForExit(timeoutMs))
+                    {
+                        KillProcessTree(proc.Id);
+                        return null;
+                    }
+                    // Exited, but a grandchild can still hold stdout open: don't wait on it.
+                    return read.Wait(2000) ? ParseCliVersion(read.Result) : null;
+                }
+            }
+            catch { return null; }
+        }
+
+        // Process.Kill on .NET Framework stops only cmd.exe, leaving the node process it
+        // started running (and holding our stdout pipe). taskkill /T takes the tree.
+        private static void KillProcessTree(int pid)
+        {
+            try
+            {
+                var psi = new ProcessStartInfo
+                {
+                    FileName = Path.Combine(Environment.SystemDirectory, "taskkill.exe"),
+                    Arguments = "/T /F /PID " + pid,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+                using (var p = Process.Start(psi)) p.WaitForExit(5000);
+            }
+            catch { }
+        }
+
+        /// <summary>First "major.minor.patch" in <paramref name="text"/>, or null.</summary>
+        public static string ParseCliVersion(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return null;
+            var m = System.Text.RegularExpressions.Regex.Match(text, @"\b(\d+)\.(\d+)\.(\d+)\b");
+            return m.Success ? m.Value : null;
+        }
+
+        /// <summary>
+        /// Finds the Clarion Assistant plugin directory: shared marketplace, then the active profile's
+        /// marketplace, then its newest cached version. See ClaudePluginLocator (GH #214).
         /// </summary>
         private static string GetClarionAssistantPluginPath()
         {
-            string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-
-            // Check marketplace source
-            string marketplacePath = Path.Combine(userProfile, ".claude", "plugins", "marketplaces",
-                "clarionassistant-marketplace", "plugins", "clarion-assistant");
-            if (Directory.Exists(marketplacePath))
-                return marketplacePath;
-
-            // Check cache
-            string cachePath = Path.Combine(userProfile, ".claude", "plugins", "cache",
-                "clarionassistant-marketplace", "clarion-assistant", "1.0.0");
-            if (Directory.Exists(cachePath))
-                return cachePath;
-
-            return null;
+            return ClaudePluginLocator.FindClarionAssistantPlugin();
         }
 
         private static string EscapeArgument(string arg)

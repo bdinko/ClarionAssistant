@@ -39,6 +39,23 @@ namespace ClarionAssistant.Services
         public string Section { get; set; }   // the .red section the match came from (e.g. "Common")
     }
 
+    /// <summary>Why a .red {include} line was not followed (<see cref="RedFileService.SkippedIncludeKinds"/>).</summary>
+    public enum RedIncludeSkip
+    {
+        /// <summary>The {...} line is not an {include path} command.</summary>
+        NotAnInclude,
+        /// <summary>The path (after macro expansion) is not a valid path.</summary>
+        InvalidPath,
+        /// <summary>The file was already read (it includes itself, or round a loop): its entries are already in, nothing is lost.</summary>
+        AlreadyLoaded,
+        /// <summary>Nested deeper than the include limit.</summary>
+        TooDeep,
+        /// <summary>No file at that path - often an unexpanded %MACRO%.</summary>
+        FileNotFound,
+        /// <summary>The file exists but could not be read.</summary>
+        Unreadable
+    }
+
     /// <summary>
     /// Parses Clarion .red (redirection) files and resolves file paths.
     /// The .red file tells the compiler/IDE where to find source files,
@@ -107,6 +124,20 @@ namespace ClarionAssistant.Services
             return Load(redFilePath, macros, makeActive: true);
         }
 
+        /// <summary>
+        /// Rebuild, in another process, an instance a host already loaded (ticket 583abdec: the IDE's index
+        /// runs in clarion-indexer.exe). The host passes the file it loaded, its FINAL macro table
+        /// (<see cref="Macros"/>, which already holds the BIN/ROOT/REDDIR it derived) and the version names,
+        /// so resolution - the project-local .red rule of <see cref="ForProjectDirectory"/> included - is
+        /// the host's own, not a re-derivation from the file's location.
+        /// </summary>
+        public bool LoadAs(string redFilePath, Dictionary<string, string> macros, string versionRedFileName, string loadedForVersion)
+        {
+            VersionRedFileName = string.IsNullOrEmpty(versionRedFileName) ? null : versionRedFileName;
+            LoadedForVersion = string.IsNullOrEmpty(loadedForVersion) ? null : loadedForVersion;
+            return Load(redFilePath, macros, makeActive: true);
+        }
+
         private bool Load(string redFilePath, Dictionary<string, string> macros, bool makeActive)
         {
             if (string.IsNullOrEmpty(redFilePath) || !File.Exists(redFilePath))
@@ -132,9 +163,24 @@ namespace ClarionAssistant.Services
             if (!_macros.ContainsKey("REDDIR") && _macros.ContainsKey("reddir"))
                 _macros["REDDIR"] = _macros["reddir"];
 
+            // %REDNAME% is predefined by Clarion, not stored with the version's Macros: it is the version's
+            // redirection file NAME (RedirectionFile/Name, e.g. "Clarion110.red"). A project-local .red
+            // typically chains to the default one with {include %REDDIR%\%REDNAME%}; without it that include
+            // was skipped and every default search path lost. A local .red only loads under that same name,
+            // so the loaded file's own name is the right fallback when no version name was recorded.
+            if (!_macros.ContainsKey("REDNAME"))
+            {
+                string redName = !string.IsNullOrEmpty(VersionRedFileName) ? VersionRedFileName : redFilePath;
+                _macros["REDNAME"] = Path.GetFileName(redName);
+            }
+
+            _loadedFiles.Clear();
+            _watched.Clear();
+            _skippedIncludes.Clear();
+            _skippedIncludeKinds.Clear();
             try
             {
-                Parse(EncodingHelper.ReadAllLines(redFilePath, out _));
+                ParseFile(redFilePath, 0);
                 if (makeActive) Active = this;
                 return true;
             }
@@ -143,6 +189,69 @@ namespace ClarionAssistant.Services
                 return false;
             }
         }
+
+        /// <summary>
+        /// Every .red file this instance read: the loaded file first, then each {include}d one, as full paths.
+        /// </summary>
+        public IReadOnlyList<string> LoadedFiles => _loadedFiles.AsReadOnly();
+
+        /// <summary>{include} lines that could not be followed, with the reason: missing file, cycle,
+        /// too deep. Clarion reports these as errors; we skip the line and carry on, so say so here.</summary>
+        public IReadOnlyList<string> SkippedIncludes => _skippedIncludes;
+
+        /// <summary>
+        /// True when the redirection on disk may no longer be what this instance holds, so a host that caches
+        /// it should load again (GH #261: an edit to the .red changed nothing until the server restarted):
+        /// a file it read has changed or vanished, a file it could NOT read (locked mid-save) is readable now,
+        /// or a file it looked for and did not find has appeared (an {include} target, a project-local .red).
+        /// False for an instance that never loaded. Never throws.
+        /// </summary>
+        public bool IsStale()
+        {
+            foreach (var w in _watched)
+            {
+                try
+                {
+                    DateTime now = File.Exists(w.Key) ? File.GetLastWriteTimeUtc(w.Key) : AbsentOrUnread;
+                    if (now != w.Value) return true;
+                }
+                catch { return true; }
+            }
+            return false;
+        }
+
+        /// <summary>The watch stamp for a file that was absent, or present but unreadable: any readable file
+        /// then differs from it, so its appearance (or its unlock) makes the instance stale.</summary>
+        private static readonly DateTime AbsentOrUnread = DateTime.MinValue;
+
+        /// <summary>Record a path (absent, unread, or read with this stamp) for <see cref="IsStale"/>.</summary>
+        private void Watch(string path, DateTime stamp)
+        {
+            if (!string.IsNullOrEmpty(path)) _watched.Add(new KeyValuePair<string, DateTime>(path, stamp));
+        }
+
+        private static string FullPathOrSelf(string path)
+        {
+            try { return Path.GetFullPath(path); } catch { return path; }
+        }
+
+        private readonly List<string> _loadedFiles = new List<string>();
+        private readonly List<KeyValuePair<string, DateTime>> _watched = new List<KeyValuePair<string, DateTime>>();
+        private readonly List<string> _skippedIncludes = new List<string>();
+        private readonly List<RedIncludeSkip> _skippedIncludeKinds = new List<RedIncludeSkip>();
+
+        /// <summary>Why each <see cref="SkippedIncludes"/> entry was skipped, same order, so a caller can word its
+        /// report per reason: an {include} of a file already loaded loses nothing, a missing one loses its paths.</summary>
+        public IReadOnlyList<RedIncludeSkip> SkippedIncludeKinds => _skippedIncludeKinds;
+
+        private void Skip(string entry, RedIncludeSkip kind)
+        {
+            _skippedIncludes.Add(entry);
+            _skippedIncludeKinds.Add(kind);
+        }
+
+        /// <summary>Nesting limit for {include}; Clarion has none, but a cycle it would hang on must not hang us.</summary>
+        private const int MaxIncludeDepth = 8;
 
         /// <summary>
         /// Load from a ClarionVersionConfig (convenience method).
@@ -233,16 +342,25 @@ namespace ClarionAssistant.Services
             VersionRedFileName = config.RedFileName;
 
             // Check for a local .red file in the project directory
+            string localCandidate = null;
             if (!string.IsNullOrEmpty(projectDirectory) && Directory.Exists(projectDirectory))
             {
                 string localRed = FindLocalRedFile(projectDirectory, config.RedFileName);
                 if (localRed != null)
                     return Load(localRed, macros);
+                if (!string.IsNullOrEmpty(config.RedFileName))
+                    try { localCandidate = Path.Combine(projectDirectory, Path.GetFileName(config.RedFileName)); } catch { }
             }
 
             // Fall back to the version-level .red
             if (!string.IsNullOrEmpty(config.RedFilePath))
-                return Load(config.RedFilePath, macros);
+            {
+                bool ok = Load(config.RedFilePath, macros);
+                // GH #261: a project-local .red created later supersedes this one; watch for it (after Load,
+                // which resets the watch list).
+                Watch(localCandidate, AbsentOrUnread);
+                return ok;
+            }
 
             return false;
         }
@@ -306,8 +424,35 @@ namespace ClarionAssistant.Services
             catch { return null; }
         }
 
-        private void Parse(string[] lines)
+        /// <summary>
+        /// Parse one .red file into the sections, following its {include} lines. Mirrors Clarion's own
+        /// parser (Clarion.Core RedirectionFile.Load, GH #261):
+        /// - {include path} reads the other file IN PLACE, so its entries sit in the search order exactly
+        ///   where the line is. The path's macros are expanded (%THISDIR% = the INCLUDING file's folder),
+        ///   and a relative path is relative to the including file's folder.
+        /// - A section named twice ([Common] in the included file and again here) ADDS to the search
+        ///   order; it does not replace the earlier entries. Clarion keeps a list of sections and walks
+        ///   them all; appending to one section per name gives the same order for each name.
+        /// - Entries before any [section] header belong to [Common].
+        /// - The included file's own lines start with no section (so its headerless lines are Common);
+        ///   after it, this file carries on in the section it was in.
+        /// An include that can't be followed (missing file, cycle, too deep) is skipped and recorded in
+        /// <see cref="SkippedIncludes"/> - Clarion raises an error; a headless parser must not throw.
+        /// </summary>
+        private void ParseFile(string filePath, int depth)
         {
+            // Full path, so the cycle check in FollowInclude compares like with like (".." segments).
+            filePath = FullPathOrSelf(filePath);
+            // Stamp BEFORE the read (an edit during it then shows as stale), record it only AFTER: a file
+            // held by an editor mid-save throws here, and must stay stale so the next access retries
+            // rather than keeping this empty load as if it were current.
+            DateTime stamp = File.GetLastWriteTimeUtc(filePath);
+            string[] lines;
+            try { lines = EncodingHelper.ReadAllLines(filePath, out _); }
+            catch { Watch(filePath, AbsentOrUnread); throw; }
+            Watch(filePath, stamp);
+            _loadedFiles.Add(filePath);
+            string thisDir = Path.GetDirectoryName(filePath);
             RedSection current = null;
 
             foreach (string rawLine in lines)
@@ -318,18 +463,28 @@ namespace ClarionAssistant.Services
                 if (string.IsNullOrEmpty(line) || line.StartsWith("--"))
                     continue;
 
+                // %THISDIR% is the folder of the file the line is IN, not of the top-level .red.
+                if (line.IndexOf("%THISDIR%", StringComparison.OrdinalIgnoreCase) >= 0)
+                    line = Regex.Replace(line, "%THISDIR%", (thisDir ?? "").Replace("$", "$$"), RegexOptions.IgnoreCase);
+
                 // Section header: [SectionName]
                 if (line.StartsWith("[") && line.EndsWith("]"))
                 {
-                    string name = line.Substring(1, line.Length - 2).Trim();
-                    current = new RedSection { Name = name };
-                    _sections[name] = current;
+                    current = GetOrAddSection(line.Substring(1, line.Length - 2).Trim());
+                    continue;
+                }
+
+                // Command: {include path}
+                if (line.StartsWith("{"))
+                {
+                    FollowInclude(line, thisDir, depth);
                     continue;
                 }
 
                 // Entry: pattern = path1;path2;...
-                if (current != null && line.Contains("="))
+                if (line.Contains("="))
                 {
+                    if (current == null) current = GetOrAddSection("Common");
                     int eqIdx = line.IndexOf('=');
                     string pattern = line.Substring(0, eqIdx).Trim();
                     string pathsPart = line.Substring(eqIdx + 1).Trim().TrimEnd(';');
@@ -351,6 +506,65 @@ namespace ClarionAssistant.Services
                     }
                 }
             }
+        }
+
+        /// <summary>The section of that name, created on first use: a name met again ADDS to it.</summary>
+        private RedSection GetOrAddSection(string name)
+        {
+            RedSection section;
+            if (!_sections.TryGetValue(name, out section))
+            {
+                section = new RedSection { Name = name };
+                _sections[name] = section;
+            }
+            return section;
+        }
+
+        private void FollowInclude(string line, string thisDir, int depth)
+        {
+            int close = line.IndexOf('}');
+            Match m = Regex.Match(close > 0 ? line.Substring(1, close - 1) : line.Substring(1),
+                                  @"^\s*include\s+(.+?)\s*$", RegexOptions.IgnoreCase);
+            if (!m.Success)
+            {
+                Skip(line + "  (not an {include} command)", RedIncludeSkip.NotAnInclude);
+                return;
+            }
+
+            string target = ExpandMacros(m.Groups[1].Value.Trim().Trim('"'));
+            string full;
+            try
+            {
+                full = Path.GetFullPath(Path.IsPathRooted(target) || string.IsNullOrEmpty(thisDir)
+                    ? target : Path.Combine(thisDir, target));
+            }
+            catch
+            {
+                Skip(line + "  (invalid path: " + target + ")", RedIncludeSkip.InvalidPath);
+                return;
+            }
+
+            if (_loadedFiles.Exists(f => string.Equals(f, full, StringComparison.OrdinalIgnoreCase)))
+            {
+                // Includes itself, directly or round a loop. A local Clarion110.red with
+                // {include %BIN%\clarion110.red} lands here when %BIN% is the local folder.
+                Skip(line + "  (already loaded: " + full + ")", RedIncludeSkip.AlreadyLoaded);
+                return;
+            }
+            if (depth + 1 > MaxIncludeDepth)
+            {
+                Skip(line + "  (nested deeper than " + MaxIncludeDepth + ")", RedIncludeSkip.TooDeep);
+                return;
+            }
+            if (!File.Exists(full))
+            {
+                Skip(line + "  (file not found: " + full + ")", RedIncludeSkip.FileNotFound);
+                Watch(full, AbsentOrUnread);   // its creation later makes the instance stale
+                return;
+            }
+
+            try { ParseFile(full, depth + 1); }
+            catch (Exception ex) { Skip(line + "  (could not read: " + ex.Message + ")", RedIncludeSkip.Unreadable); }
         }
 
         private string ExpandMacros(string path)
@@ -399,14 +613,11 @@ namespace ClarionAssistant.Services
                 {
                     if (MatchesPattern(fileName, entry.Pattern))
                     {
-                        string candidate = Path.Combine(entry.ResolvedPath, fileName);
                         try
                         {
                             // Redirection relative paths are relative to the project dir, not the IDE's CWD.
-                            if (!Path.IsPathRooted(candidate) && !string.IsNullOrEmpty(baseDir))
-                                candidate = Path.Combine(baseDir, candidate);
-                            candidate = Path.GetFullPath(candidate);
-                            if (File.Exists(candidate))
+                            string candidate = AnchorAt(Path.Combine(entry.ResolvedPath, fileName), baseDir);
+                            if (candidate != null && File.Exists(candidate))
                                 return candidate;
                         }
                         catch { }
@@ -470,15 +681,10 @@ namespace ClarionAssistant.Services
 
                     trace.Add("  Pattern " + entry.Pattern + " matches  (" + entry.RawPath + ")");
 
-                    string candidate = Path.Combine(entry.ResolvedPath, fileName);
-                    try
-                    {
-                        // Same relative-path anchoring as ResolveFrom.
-                        if (!Path.IsPathRooted(candidate) && !string.IsNullOrEmpty(baseDir))
-                            candidate = Path.Combine(baseDir, candidate);
-                        candidate = Path.GetFullPath(candidate);
-                    }
-                    catch
+                    // Same relative-path anchoring as ResolveFrom.
+                    string candidate = null;
+                    try { candidate = AnchorAt(Path.Combine(entry.ResolvedPath, fileName), baseDir); } catch { }
+                    if (candidate == null)
                     {
                         trace.Add("    invalid path, skipped: " + entry.RawPath);
                         continue;
@@ -526,6 +732,205 @@ namespace ClarionAssistant.Services
             }
 
             return result;
+        }
+
+        /// <summary>
+        /// Like <see cref="GetSearchPaths(string, string)"/> for several extensions at once, in the .red's own entry
+        /// order (= precedence): an entry joins when its pattern matches ANY of them. 5a5581e6: templates are
+        /// <c>.tpl</c> and <c>.tpw</c>, and a .red may name them as <c>*.tp?</c> or one by one.
+        /// </summary>
+        public List<string> GetSearchPathsForAny(IEnumerable<string> extensions, string sectionName = "Common")
+        {
+            // No LINQ: the csc harnesses compile this file against System.dll alone.
+            var result = new List<string>();
+            if (extensions == null) return result;
+            var testNames = new List<string>();
+            foreach (string e in extensions)
+                if (!string.IsNullOrEmpty(e)) testNames.Add("test" + (e.StartsWith(".") ? e : "." + e));
+
+            RedSection section;
+            if (testNames.Count == 0 || !_sections.TryGetValue(sectionName, out section))
+                return result;
+
+            foreach (var entry in section.Entries)
+            {
+                bool matches = false;
+                foreach (string t in testNames)
+                    if (MatchesPattern(t, entry.Pattern)) { matches = true; break; }
+                if (!matches) continue;
+                string resolved = entry.ResolvedPath;
+                if (!string.IsNullOrEmpty(resolved) && !result.Contains(resolved))
+                    result.Add(resolved);
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// Anchor a .red path the way <see cref="ResolveFrom"/> does: a relative entry (".", ".\Source", "..\x") hangs
+        /// off <paramref name="baseDir"/> (the project dir), not the process CWD (the Clarion bin, in the IDE).
+        /// Absolute entries are only normalised. Drive-relative entries are rooted to Path but not absolute: "\x"
+        /// takes <paramref name="baseDir"/>'s drive, "C:x" is relative to <paramref name="baseDir"/> when that is on
+        /// C: - and with <paramref name="baseDir"/> on another drive it cannot be anchored (null; see
+        /// <see cref="UnanchorableReason"/>). Returns null for a path that cannot be made full. With no
+        /// <paramref name="baseDir"/>, the process's own CWD and drive apply, as they always did.
+        /// </summary>
+        public static string AnchorAt(string path, string baseDir)
+        {
+            if (string.IsNullOrEmpty(path)) return null;
+            try
+            {
+                if (!string.IsNullOrEmpty(baseDir))
+                {
+                    if (!Path.IsPathRooted(path))
+                        path = Path.Combine(baseDir, path);
+                    else if (IsRootRelative(path))
+                    {
+                        string drive = Path.GetPathRoot(Path.GetFullPath(baseDir));   // "H:\"
+                        path = drive.TrimEnd('\\', '/') + "\\" + path.TrimStart('\\', '/');
+                    }
+                    else if (IsDriveRelative(path))
+                    {
+                        if (!SameDrive(path, baseDir)) return null;
+                        path = Path.Combine(baseDir, path.Substring(2));
+                    }
+                }
+                string full = Path.GetFullPath(path);
+                // "x\Source\" and "x\Source" are one folder; keep a drive root's own backslash.
+                string root = Path.GetPathRoot(full) ?? "";
+                return full.Length > root.Length ? full.TrimEnd('\\', '/') : full;
+            }
+            catch { return null; }
+        }
+
+        /// <summary>A path that names its folder on its own: "C:\x" or "\\server\share\x".</summary>
+        public static bool IsFullyQualified(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return false;
+            try { return Path.IsPathRooted(path) && !IsRootRelative(path) && !IsDriveRelative(path); }
+            catch { return false; }
+        }
+
+        /// <summary>"\x": rooted, but on whichever drive is current (not "\\server\share").</summary>
+        private static bool IsRootRelative(string path)
+        {
+            return path.Length > 0 && (path[0] == '\\' || path[0] == '/')
+                && !(path.Length > 1 && (path[1] == '\\' || path[1] == '/'));
+        }
+
+        /// <summary>"C:x": a drive letter without a root, relative to that drive's current folder.</summary>
+        private static bool IsDriveRelative(string path)
+        {
+            return path.Length >= 2 && path[1] == ':' && char.IsLetter(path[0])
+                && !(path.Length > 2 && (path[2] == '\\' || path[2] == '/'));
+        }
+
+        private static bool SameDrive(string driveRelative, string baseDir)
+        {
+            try
+            {
+                string root = Path.GetPathRoot(Path.GetFullPath(baseDir)) ?? "";
+                return root.Length >= 2 && root[1] == ':' && char.ToUpperInvariant(root[0]) == char.ToUpperInvariant(driveRelative[0]);
+            }
+            catch { return false; }
+        }
+
+        /// <summary>An entry whose %MACRO% was never expanded: not a real folder, whatever it looks like.</summary>
+        public static bool HasUnexpandedMacro(string path)
+        {
+            return !string.IsNullOrEmpty(path) && Regex.IsMatch(path, @"%[^%\\/]+%");
+        }
+
+        /// <summary>
+        /// 5a5581e6: why <paramref name="path"/> cannot be anchored at <paramref name="baseDir"/> (an unexpanded
+        /// %MACRO%, a drive-relative "C:x" on a drive other than <paramref name="baseDir"/>'s, an invalid path), or
+        /// null when <see cref="AnchorAt"/> can.
+        /// </summary>
+        public static string UnanchorableReason(string path, string baseDir)
+        {
+            if (string.IsNullOrEmpty(path)) return "empty entry";
+            if (HasUnexpandedMacro(path)) return "unexpanded macro";
+            if (!string.IsNullOrEmpty(baseDir) && IsDriveRelative(path) && !SameDrive(path, baseDir))
+                return "drive-relative entry on another drive than " + baseDir;
+            return AnchorAt(path, baseDir) == null ? "invalid path" : null;
+        }
+
+        /// <summary>
+        /// 5a5581e6: <paramref name="paths"/> anchored at <paramref name="baseDir"/> (<see cref="AnchorAt"/>), order
+        /// kept, duplicates dropped - what an agent can Grep without knowing the .red's relative-path rule. Entries
+        /// that cannot be anchored (<see cref="UnanchorableReason"/>) are left out; list them with
+        /// <see cref="Unanchorable"/>. Null when there is no <paramref name="baseDir"/>: a relative entry would
+        /// otherwise silently land on the process CWD.
+        /// </summary>
+        public static List<string> AnchorAll(IEnumerable<string> paths, string baseDir)
+        {
+            if (paths == null || string.IsNullOrEmpty(baseDir)) return null;
+            var result = new List<string>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string p in paths)
+            {
+                if (UnanchorableReason(p, baseDir) != null) continue;
+                string full = AnchorAt(p, baseDir);
+                if (full != null && seen.Add(full))
+                    result.Add(full);
+            }
+            return result;
+        }
+
+        /// <summary>The entries <see cref="AnchorAll"/> leaves out, each as "entry (reason)". Empty when none.</summary>
+        public static List<string> Unanchorable(IEnumerable<string> paths, string baseDir)
+        {
+            var result = new List<string>();
+            if (paths == null) return result;
+            foreach (string p in paths)
+            {
+                string why = UnanchorableReason(p, baseDir);
+                if (why != null && !result.Contains(p + " (" + why + ")")) result.Add(p + " (" + why + ")");
+            }
+            return result;
+        }
+
+        /// <summary>One existing match for a file: the section and the anchored path.</summary>
+        public sealed class RedHit
+        {
+            public string Section { get; set; }
+            public string Path { get; set; }
+        }
+
+        /// <summary>
+        /// 5a5581e6: the first existing match for the LEAF name <paramref name="fileName"/> in EACH of
+        /// <paramref name="sectionNames"/> that has one, in that order. Entries are anchored with
+        /// <see cref="AnchorAt"/>; an entry that cannot be anchored is skipped, and a candidate that does not sit
+        /// directly in its entry's folder (a name that climbs out with "..\" or is rooted) never matches.
+        /// </summary>
+        public List<RedHit> FindInSections(string fileName, string baseDir, IEnumerable<string> sectionNames)
+        {
+            var hits = new List<RedHit>();
+            if (string.IsNullOrEmpty(fileName) || sectionNames == null) return hits;
+            foreach (string sectionName in sectionNames)
+            {
+                RedSection section;
+                if (string.IsNullOrEmpty(sectionName) || !_sections.TryGetValue(sectionName, out section)) continue;
+                foreach (var entry in section.Entries)
+                {
+                    if (!MatchesPattern(fileName, entry.Pattern)) continue;
+                    if (UnanchorableReason(entry.ResolvedPath, baseDir) != null) continue;
+                    // No base folder (no solution): a relative entry has nothing to hang off - never the process CWD
+                    // (run 2), as AnchorAll already refuses.
+                    if (string.IsNullOrEmpty(baseDir) && !IsFullyQualified(entry.ResolvedPath)) continue;
+                    string dir = AnchorAt(entry.ResolvedPath, baseDir);
+                    if (dir == null) continue;
+                    try
+                    {
+                        string candidate = Path.GetFullPath(Path.Combine(dir, fileName));
+                        if (!string.Equals(Path.GetDirectoryName(candidate), dir, StringComparison.OrdinalIgnoreCase)) continue;
+                        if (!File.Exists(candidate)) continue;
+                        hits.Add(new RedHit { Section = sectionName, Path = candidate });
+                        break;
+                    }
+                    catch { }
+                }
+            }
+            return hits;
         }
 
         /// <summary>
@@ -580,15 +985,8 @@ namespace ClarionAssistant.Services
 
                     // Resolve the entry's directory the same way ResolveFrom anchors candidates:
                     // relative paths hang off baseDir (the project dir), not the process CWD.
-                    string dir = entry.ResolvedPath;
-                    if (string.IsNullOrEmpty(dir)) continue;
-                    try
-                    {
-                        if (!Path.IsPathRooted(dir) && !string.IsNullOrEmpty(baseDir))
-                            dir = Path.Combine(baseDir, dir);
-                        dir = Path.GetFullPath(dir);
-                    }
-                    catch { continue; }
+                    string dir = AnchorAt(entry.ResolvedPath, baseDir);
+                    if (dir == null) continue;
 
                     List<string> filesInDir;
                     if (!dirCache.TryGetValue(dir, out filesInDir))
@@ -638,8 +1036,9 @@ namespace ClarionAssistant.Services
 
         /// <summary>
         /// Simple wildcard pattern matching for .red patterns like *.clw, *.inc, *.*
+        /// Internal (GH #204): ClarionBuildTarget's output lookup must match .red entries exactly as the resolver does.
         /// </summary>
-        private static bool MatchesPattern(string fileName, string pattern)
+        internal static bool MatchesPattern(string fileName, string pattern)
         {
             // Handle *.* (matches everything)
             if (pattern == "*.*") return true;

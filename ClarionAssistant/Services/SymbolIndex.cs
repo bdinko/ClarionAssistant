@@ -63,23 +63,22 @@ namespace ClarionAssistant.Services
         internal const string MembersSql = CodeGraphProvider.SymbolSelect +
             "WHERE s.parent_name = @parent COLLATE NOCASE AND s.name LIKE @parentDot ESCAPE '\\' ORDER BY s.name LIMIT @limit";
 
-        internal const string MembersSqlNoIndex = CodeGraphProvider.SymbolSelect +
-            "WHERE LOWER(s.parent_name) = LOWER(@parent) AND s.name LIKE @parentDot ESCAPE '\\' ORDER BY s.name LIMIT @limit";
+        // The NoIndex exact lookups are the same text as the indexed ones: = COLLATE NOCASE gives the rows that
+        // LOWER(x) = LOWER(@x) gave, and on an old DB that has ONE of the two NOCASE indexes it still uses that one
+        // (GH #280). They keep their own names because NoIndex also decides fastOnly (no keystroke-time scan).
+        internal const string MembersSqlNoIndex = MembersSql;
 
         /// <summary>A class's base class: its own row's parent_name.</summary>
         internal const string BaseClassSql =
             "SELECT s.parent_name FROM symbols s WHERE s.name = @name COLLATE NOCASE AND LOWER(s.type) IN ('class', 'interface') " +
             "AND s.parent_name IS NOT NULL AND s.parent_name <> '' LIMIT 1";
 
-        internal const string BaseClassSqlNoIndex =
-            "SELECT s.parent_name FROM symbols s WHERE LOWER(s.name) = LOWER(@name) AND LOWER(s.type) IN ('class', 'interface') " +
-            "AND s.parent_name IS NOT NULL AND s.parent_name <> '' LIMIT 1";
+        internal const string BaseClassSqlNoIndex = BaseClassSql;
 
         internal const string ExactSql = CodeGraphProvider.SymbolSelect +
             "WHERE s.name = @name COLLATE NOCASE AND " + ReachableScope + "LIMIT 1";
 
-        internal const string ExactSqlNoIndex = CodeGraphProvider.SymbolSelect +
-            "WHERE LOWER(s.name) = LOWER(@name) AND " + ReachableScope + "LIMIT 1";
+        internal const string ExactSqlNoIndex = ExactSql;
 
         // Every same-named candidate, for a lookup that filters out-of-scope equates after the query. Bounded
         // generously: one exact name rarely has more than a handful of rows, but a common one ("Text") is
@@ -87,8 +86,7 @@ namespace ClarionAssistant.Services
         internal const string ExactSqlAll = CodeGraphProvider.SymbolSelect +
             "WHERE s.name = @name COLLATE NOCASE AND " + ReachableScope + "LIMIT 500";
 
-        internal const string ExactSqlAllNoIndex = CodeGraphProvider.SymbolSelect +
-            "WHERE LOWER(s.name) = LOWER(@name) AND " + ReachableScope + "LIMIT 500";
+        internal const string ExactSqlAllNoIndex = ExactSqlAll;
 
         // ================================================================== registry and test hooks
 
@@ -437,31 +435,49 @@ namespace ClarionAssistant.Services
         }
 
         /// <summary>
-        /// Scopes an exact-name hit from an UNFILTERED lookup (a provider's own FindSymbolByName, whose first
-        /// same-named row can be any equate in the library) to what <paramref name="contextFile"/> can see. A
-        /// file-level EQUATE from an include file the context file does not include (see
-        /// <see cref="IncludeClosure"/>; <paramref name="dbPaths"/> = project DB first, then library) is not
-        /// visible there, so the next visible same-named row of <paramref name="db"/> is returned, or null when
-        /// there is none. Anything else - not an equate, no context file, no closure to filter by - is returned
-        /// unchanged. The closure is built only for an equate hit. Never throws.
+        /// The first same-named row of <paramref name="p"/> that <paramref name="contextFile"/> can see, for the
+        /// bridge's hover and definition fallbacks. Every exact-name row is considered, broader scopes first
+        /// (<see cref="CodeGraphProvider.FindAllSymbolsByName"/>), not just the provider's arbitrary first one,
+        /// so one invisible row no longer hides a visible one of the same name. Skipped:
+        ///   - a variable declared in a procedure or routine: scope 'local' / 'parameter' (the rows
+        ///     <see cref="ReachableScope"/> leaves out), or a row <paramref name="unreachable"/> rejects. The
+        ///     callers only get here after this file's own local scope came up empty, and Clarion cannot reach
+        ///     another procedure's locals. Those rows sort last, so a name with many locals is cheap. Only
+        ///     variables: a ROUTINE row (also scope 'local') was returned before and still is, as a last resort.
+        ///   - a file-level EQUATE from an include file the context file does not include (see
+        ///     <see cref="IncludeClosure"/>; <paramref name="dbPaths"/> = project DB first, then library). With
+        ///     no context file, or no closure to filter by, equates are not filtered.
+        /// Null when no row is visible. The closure is built only when an equate row is reached. Never throws.
         /// </summary>
-        public static CodeGraphSymbol ScopeEquateToIncludes(CodeGraphSymbol sym, string word, string db,
-                                                            string contextFile, string[] dbPaths, bool fastOnly = false)
+        public static CodeGraphSymbol FirstVisibleByName(CodeGraphProvider p, string word, string contextFile, string[] dbPaths,
+                                                         Func<CodeGraphSymbol, bool> unreachable = null)
         {
             try
             {
-                if (sym == null || string.IsNullOrEmpty(contextFile)) return sym;
-                if (!string.Equals(sym.Params, "EQUATE", StringComparison.OrdinalIgnoreCase)) return sym;
-                var included = IncludeClosure(contextFile, dbPaths, fastOnly);
-                if (included == null || !IsEquateOutside(sym, included)) return sym;
-                var idx = For(db);
-                return idx == null ? null : idx.FindByName(word, fastOnly, included);
+                if (p == null || string.IsNullOrEmpty(word)) return null;
+                HashSet<string> included = null;
+                bool closureBuilt = false;
+                // Bounded as ExactSqlAll is: a common equate name is declared in many library include files.
+                foreach (var s in p.FindAllSymbolsByName(word, 500))
+                {
+                    if (string.Equals(s.Type, "variable", StringComparison.OrdinalIgnoreCase) &&
+                        (string.Equals(s.Scope, "local", StringComparison.OrdinalIgnoreCase) ||
+                         string.Equals(s.Scope, "parameter", StringComparison.OrdinalIgnoreCase)))
+                        continue;
+                    if (unreachable != null && unreachable(s)) continue;
+                    if (!string.IsNullOrEmpty(contextFile) && string.Equals(s.Params, "EQUATE", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (!closureBuilt) { included = IncludeClosure(contextFile, dbPaths); closureBuilt = true; }
+                        if (included != null && IsEquateOutside(s, included)) continue;
+                    }
+                    return s;
+                }
             }
             catch (Exception ex)
             {
-                LspTrace.Write("[SymbolIndex] equate scoping failed: " + ex.Message);
-                return sym;
+                LspTrace.Write("[SymbolIndex] visible-row lookup failed: " + ex.Message);
             }
+            return null;
         }
 
         /// <summary>The base class named on <paramref name="className"/>'s own class row, or null.</summary>
@@ -590,6 +606,34 @@ namespace ClarionAssistant.Services
             if (!string.IsNullOrEmpty(s.ReturnType)) t += " : " + s.ReturnType;
             if (!string.IsNullOrEmpty(s.ProjectName)) t += "  (" + s.ProjectName + ")";
             return string.IsNullOrEmpty(t) ? null : t;
+        }
+
+        /// <summary>A card's closing location line: a blank line, then <see cref="LocationLink"/>; empty when the
+        /// row has no file. Shared by the local layer's index card and the host's CodeGraph hover card
+        /// (SharedLspBridge.CgHoverText), so it lives here, where both the addin and the MCP server compile it.</summary>
+        public static string LocationLine(string filePath, int line)
+        {
+            return string.IsNullOrEmpty(filePath) ? "" : "\n\n" + LocationLink(filePath, line);
+        }
+
+        /// <summary>"File.inc:12" as a markdown link to <c>file:///…/File.inc#L12</c>, which the page's link opener
+        /// (monaco-embeditor.html registerLinkOpener) hands to the IDE, as the language server's hover footers
+        /// do. Plain text when the path is not an absolute path (a relative or malformed index row) or has no line.
+        /// <paramref name="line"/> is the 1-based line the index stores.</summary>
+        public static string LocationLink(string filePath, int line)
+        {
+            string name;
+            try { name = Path.GetFileName(filePath); }
+            catch (ArgumentException) { name = filePath; }   // .NET Framework rejects some characters: one bad row must not abort the card
+            string label = name + (line > 0 ? ":" + line : "");
+            try
+            {
+                if (line <= 0 || !Path.IsPathRooted(filePath)) return label;
+                var uri = new Uri(filePath);
+                if (!uri.IsAbsoluteUri || !uri.IsFile) return label;
+                return "[" + label.Replace("[", "\\[").Replace("]", "\\]") + "](" + uri.AbsoluteUri + "#L" + line + ")";
+            }
+            catch (Exception) { return label; }
         }
 
         // ================================================================== plumbing

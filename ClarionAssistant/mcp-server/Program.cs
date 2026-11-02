@@ -8,9 +8,14 @@ namespace ClarionAssistant.McpServer
     /// clarion-mcp-server — standalone host for the editor-agnostic half of Clarion Assistant's
     /// MCP tools, over stdio, with no Clarion IDE running (ticket d051fbd1).
     ///
-    /// Serves 61 of the addin's 119 tools (as of 44a1b10c; --selftest prints the live split). The other 58 drive the IDE itself and are withheld by
+    /// Serves 61 of the addin's 120 tools (as of GH #205; --selftest prints the live split). The other 59 drive the IDE itself and are withheld by
     /// McpTool.IdeOnly — an MCP client reads the tool list as a contract, so a tool that can only
     /// throw is worse than an absent one.
+    ///
+    /// b8f9431c: started WITHOUT --ide-pid (by the plugin launcher, for MultiTerminal, VS Code and the like) it also
+    /// lists 57 of those 59 (not execute_command or dump_object_api: McpToolRegistry.IdeCallbackExcludedTools), with their real schemas, and FORWARDS each call to a running Clarion IDE that has this solution
+    /// open (ConfigureIdeProxy, IdeToolForwarder); with none, the call says so. Started by an IDE (a CA tab), it does
+    /// not, because that IDE's pane serves them itself.
     ///
     /// All 57 function. The eleven that need to know which solution they are on — the CodeGraph
     /// and solution family, index_solution and query_codegraph among them — get it from
@@ -28,6 +33,9 @@ namespace ClarionAssistant.McpServer
             bool stdioNoise = false, help = false;
             string solution = null;
             string clarionVersion = null;
+            string configDir = null;     // --clarion-config-dir (e1df6c2e)
+            bool pickServer = false;     // --pick-server (e1df6c2e)
+            string pickOut = null;       // --pick-out <file> (e1df6c2e pipeline run 1)
             bool unknownArg = false;
 
             for (int i = 0; i < args.Length; i++)
@@ -128,11 +136,45 @@ namespace ClarionAssistant.McpServer
                             return 64;
                         }
                         break;
+                    case StandaloneConfigDir.ArgName:
+                        // The Clarion settings folder, for a Clarion started with /ConfigDir= (e1df6c2e, GH #244).
+                        // Same "checked, not assumed" rule: a bare flag must not read as "no preference".
+                        if (i + 1 < args.Length) { configDir = args[++i]; }
+                        else
+                        {
+                            Console.Error.WriteLine(ServerName + ": " + StandaloneConfigDir.ArgName + " needs a folder path.");
+                            return 64;
+                        }
+                        break;
+                    case "--pick-server":
+                        // For the plugin launcher (clarion-tools.cmd): print the installed server to run for this
+                        // solution on stdout, the reason on stderr, and exit. See ServerPicker.
+                        pickServer = true;
+                        break;
+                    case "--capabilities":
+                        // e1df6c2e pipeline run 3: what this server can promise, for the launcher's security floor
+                        // (ServerPicker.PathPolicyFloor). An older server rejects the argument, which reads as "none".
+                        Console.Out.Write(ServerPicker.CapabilitiesText());
+                        Console.Out.Flush();
+                        return 0;
+                    case "--pick-out":
+                        // With --pick-server: write the answer to this file INSTEAD of stdout. The launcher runs the
+                        // pick directly (no for /f, no call: those re-expand % in the client's arguments), so its
+                        // stdout is the MCP stream and must carry nothing (pipeline run 1).
+                        if (i + 1 < args.Length) { pickOut = args[++i]; }
+                        else
+                        {
+                            Console.Error.WriteLine(ServerName + ": --pick-out needs a file path.");
+                            return 64;
+                        }
+                        break;
                     default:
                         if (a.StartsWith("--solution=", StringComparison.OrdinalIgnoreCase))
                             solution = a.Substring("--solution=".Length);
                         else if (a.StartsWith("--clarion-version=", StringComparison.OrdinalIgnoreCase))
                             clarionVersion = a.Substring("--clarion-version=".Length);
+                        else if (a.StartsWith(StandaloneConfigDir.ArgName + "=", StringComparison.OrdinalIgnoreCase))
+                            configDir = a.Substring(StandaloneConfigDir.ArgName.Length + 1);
                         else
                             unknownArg = true;
                         break;
@@ -150,6 +192,9 @@ namespace ClarionAssistant.McpServer
                 return 64; // EX_USAGE
             }
 
+            string configDirEnv = Environment.GetEnvironmentVariable(StandaloneConfigDir.EnvVar);
+            if (pickServer) return RunPickServer(solution, clarionVersion, configDir, configDirEnv, pickOut);
+
             // DEFAULT IS TO SERVE. An MCP client launches this with no arguments and immediately
             // starts talking JSON-RPC on the pipe; printing usage and exiting 64 (the old spike
             // behaviour) would look to every client like a server that crashes on startup.
@@ -161,6 +206,37 @@ namespace ClarionAssistant.McpServer
             // mystery the user has no way to diagnose from the client side.
             Console.Error.WriteLine(ServerName + ": " + workspace.ResolutionNote);
 
+            // WHICH SETTINGS FOLDER (e1df6c2e): before the version, which is looked up in it.
+            workspace.SetConfigDirSources(configDir, configDirEnv, Environment.CurrentDirectory);
+
+            // WHY THIS SERVER (e1df6c2e): when the plugin launcher started us, the reason - recomputed from the same
+            // inputs - and LOUDLY when it was only the newest-installed fallback.
+            string launcherMode = Environment.GetEnvironmentVariable(LauncherEnvVar);
+            if (!string.IsNullOrEmpty(launcherMode))
+            {
+                string own = System.Reflection.Assembly.GetExecutingAssembly().Location;
+                string launchSln = workspace.CurrentSolutionPath;
+                // The pick is re-made against the SAME bootstrap the launcher asked (pipeline run 1), so its downgrade
+                // guard and warning come out as they did there; without the variable, against this server.
+                string bootstrap = Environment.GetEnvironmentVariable(BootstrapEnvVar);
+                if (string.IsNullOrEmpty(bootstrap)) bootstrap = own;
+                workspace.ServerChosenBy = ServerPicker.DescribeLaunch(launcherMode, own,
+                    () => ServerPicker.PickForMachine(launchSln, clarionVersion, configDir, configDirEnv, Environment.CurrentDirectory, bootstrap),
+                    () => ServerPicker.FindInstalled(ClarionAssistant.Services.ClarionVersionService.InstalledClarionRoot()),
+                    Environment.GetEnvironmentVariable(PickedEnvVar));
+                Console.Error.WriteLine(ServerName + ": " + workspace.ServerChosenBy);
+                // Pipeline run 3: running OLDER than the bootstrap (or, overridden, than another install) is said where
+                // the model reads it - the initialize instructions, set below - as well as here and in serverChosenBy.
+                workspace.DowngradeWarning = ServerPicker.RunningDowngradeWarning(launcherMode, own, bootstrap,
+                    () => ServerPicker.FindInstalled(ClarionAssistant.Services.ClarionVersionService.InstalledClarionRoot()));
+                if (workspace.DowngradeWarning != null)
+                {
+                    Console.Error.WriteLine(ServerName + ": " + workspace.DowngradeWarning);
+                    if (workspace.ServerChosenBy.IndexOf(workspace.DowngradeWarning, StringComparison.Ordinal) < 0)
+                        workspace.ServerChosenBy += "; " + workspace.DowngradeWarning;
+                }
+            }
+
             // WHICH CLARION, AND WHO DECIDED. Resolved EAGERLY here, though everything else about
             // the workspace is lazy, and the exception is deliberate: the version silently sets
             // the redirection file, the library search paths and the build root, so the user needs
@@ -170,8 +246,17 @@ namespace ClarionAssistant.McpServer
             workspace.ResolveVersionNow();
             if (!string.IsNullOrEmpty(workspace.VersionNote))
                 Console.Error.WriteLine(ServerName + ": " + workspace.VersionNote);
+            if (!string.IsNullOrEmpty(workspace.SettingsNote))
+                Console.Error.WriteLine(ServerName + ": settings: " + workspace.SettingsNote);
 
             var bundle = BuildDispatcher(workspace);
+            bool ideProxy = ConfigureIdeProxy(bundle, workspace);
+            bundle.Dispatcher.InstructionsProvider = () =>
+            {
+                string downgrade = ServerPicker.DowngradeInstructions(workspace.DowngradeWarning);
+                if (!ideProxy) return downgrade;
+                return string.IsNullOrEmpty(downgrade) ? IdeProxyInstructions : downgrade + "\n\n" + IdeProxyInstructions;
+            };
             RegisterAsVisibleInstance(bundle, workspace);
             StartLspInBackground(bundle, workspace);
 
@@ -188,6 +273,56 @@ namespace ClarionAssistant.McpServer
                 // the finally every clean exit would rely on the next server's cleanup, and a
                 // developer closing their client would linger as a phantom peer for 30 seconds.
                 StopBeingAVisibleInstance(bundle);
+            }
+        }
+
+        /// <summary>
+        /// b8f9431c: THE IDE PROXY. A client that loads the clarion-assistant plugin (MultiTerminal, VS Code) runs only this
+        /// server, so it also lists the IdeOnly tools - with their real schemas - and forwards each call to a running
+        /// Clarion IDE that has this server's solution open (IdeToolForwarder). With no such IDE the call explains itself;
+        /// the server itself never needs one to start.
+        ///
+        /// NOT when an IDE launched this server (--ide-pid): that is a CA tab, whose own pane already serves the IdeOnly
+        /// tools as clarion-assistant; listing them here too would offer every one twice under two prefixes.
+        /// </summary>
+        /// <summary>
+        /// b8f9431c: the initialize instructions while the IDE tools are listed. Inside a CA tab the IDE's own CLAUDE.md
+        /// states the approval rule for writes (its rule #10); a plugin client has no such file, and these tools now
+        /// write into the developer's open Clarion, so the rule travels with the tools.
+        /// </summary>
+        internal const string IdeProxyInstructions =
+            "The IDE tools (described as running in the Clarion IDE) act on the developer's open Clarion: they need Clarion open "
+            + "on this server's solution, and they change what the developer is working on. Never write code to the embeditor, "
+            + ".clw or .inc files (write_embed_content, apply_embed_edits, replace_text, replace_range, insert_text_at_cursor, "
+            + "import_txa, save_and_close_embeditor) without the developer's explicit approval: show the code, say where it "
+            + "goes, and ask first.";
+
+        private static bool ConfigureIdeProxy(McpDispatcherBundle bundle, StandaloneWorkspace workspace)
+        {
+            if (bundle == null || workspace == null) return false;
+            int? launchingIde = ClarionAssistant.Services.McpToolRegistry.IdeProcessId;
+            if (launchingIde.HasValue)
+            {
+                Console.Error.WriteLine(ServerName + ": IDE tools: not listed here - launched by the Clarion IDE (pid "
+                    + launchingIde.Value + "), whose own pane serves them");
+                return false;
+            }
+            try
+            {
+                ClarionAssistant.Services.IdeToolForwarder.SolutionProvider = () => workspace.CurrentSolutionPath;
+                ClarionAssistant.Services.IdeToolForwarder.SolutionNote = () => workspace.ResolutionNote;
+                ClarionAssistant.Services.IdeToolForwarder.Log = ClarionAssistant.Services.LspTrace.Write;
+                int n = bundle.Registry.AddForwardedIdeTools(ClarionAssistant.Services.IdeToolForwarder.Forward,
+                    ClarionAssistant.Services.IdeToolForwarder.DescriptionNote);
+                Console.Error.WriteLine(ServerName + ": IDE tools: " + n + " listed, forwarded to a running Clarion IDE that has "
+                    + (workspace.CurrentSolutionPath ?? "this server's solution (none yet)") + " open (" + ServerPicker.IdeProxyText + ")");
+                return n > 0;
+            }
+            catch (Exception ex)
+            {
+                // The proxy is an addition: losing it must cost the IDE tools, never the server's own sixty-odd.
+                Console.Error.WriteLine(ServerName + ": IDE tools unavailable - " + ex.GetType().Name + ": " + ex.Message);
+                return false;
             }
         }
 
@@ -217,7 +352,9 @@ namespace ClarionAssistant.McpServer
             try
             {
                 var coord = bundle.InstanceCoordination;
-                coord.SolutionPath = workspace != null ? workspace.CurrentSolutionPath : null;
+                // 9e1bd280: re-read at registration and every heartbeat (Register/Heartbeat call the provider), so
+                // peers match this instance on the solution the IDE has open now, not the one this tab was launched on.
+                if (workspace != null) coord.SolutionPathProvider = () => workspace.CurrentSolutionPath;
                 coord.WorkingOn = ServerName + " " + ServerVersion + " (standalone, no IDE)";
                 coord.Start();
             }
@@ -291,6 +428,56 @@ namespace ClarionAssistant.McpServer
             t.Start();
         }
 
+        /// <summary>
+        /// Set by the plugin launcher (clarion-tools.cmd) on the server it starts: "pick" (it ran --pick-server),
+        /// "bootstrap" (the first server found could not pick), "override" (CLARION_MCP_SERVER named the server).
+        /// </summary>
+        internal const string LauncherEnvVar = "CLARION_MCP_LAUNCHER";
+
+        /// <summary>Set by the launcher: the server it asked to pick (the bootstrap), so a re-made pick uses the same one.</summary>
+        internal const string BootstrapEnvVar = "CLARION_MCP_BOOTSTRAP";
+
+        /// <summary>Set by the launcher with CLARION_MCP_LAUNCHER=fallback: the picked server that failed to start.</summary>
+        internal const string PickedEnvVar = "CLARION_MCP_PICKED";
+
+        /// <summary>
+        /// --pick-server (e1df6c2e): the launcher's question "which installed server for this solution?". The answer -
+        /// one exe path - goes to the --pick-out file when given (what the launcher uses), else as one line on stdout;
+        /// the reason goes to stderr, which the MCP client logs. Exit 0 with a path; 3 when no server is installed
+        /// anywhere it looked (the launcher then keeps the server it already found). Never reads stdin: the launcher
+        /// runs this on the MCP client's pipe. The pick is never an OLDER server than this one unless pinned
+        /// (ServerPicker.Pick).
+        /// </summary>
+        private static int RunPickServer(string solution, string clarionVersion, string configDir, string configDirEnv,
+                                         string pickOut)
+        {
+            try
+            {
+                var ws = StandaloneWorkspace.Resolve(solution, Environment.CurrentDirectory, clarionVersion);
+                var pick = ServerPicker.PickForMachine(ws.LaunchSolutionPath, clarionVersion, configDir, configDirEnv,
+                    Environment.CurrentDirectory, System.Reflection.Assembly.GetExecutingAssembly().Location);
+                Console.Error.WriteLine("clarion-tools: " + pick.Note);
+                if (pick.Server == null) return 3;
+                if (!string.IsNullOrEmpty(pickOut))
+                {
+                    // In the OEM code page, no BOM, no newline: cmd's `set /p X=<file` reads raw bytes as the console
+                    // code page and keeps everything up to the end of the line.
+                    var oem = System.Text.Encoding.GetEncoding(
+                        System.Globalization.CultureInfo.CurrentCulture.TextInfo.OEMCodePage);
+                    File.WriteAllBytes(pickOut, oem.GetBytes(pick.Server.ExePath));
+                    return 0;
+                }
+                Console.Out.WriteLine(pick.Server.ExePath);
+                Console.Out.Flush();
+                return 0;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("clarion-tools: could not pick a server - " + ex.Message);
+                return 3;
+            }
+        }
+
         private static void PrintUsage(TextWriter w)
         {
             w.WriteLine(ServerName + " — Clarion Assistant MCP tools, without the IDE.");
@@ -299,7 +486,9 @@ namespace ClarionAssistant.McpServer
             w.WriteLine("  --stdio              same, stated explicitly");
             w.WriteLine("  --solution <path>    the .sln the CodeGraph/solution tools work on.");
             w.WriteLine("  --ide-pid <pid>      the Clarion IDE that launched this server (set by the addin;");
-            w.WriteLine("                       lets the schema tools see the dictionary of the app it has open).");
+            w.WriteLine("                       lets the schema tools see the dictionary of the app it has open,");
+            w.WriteLine("                       and every tool follows the solution it has open; --solution");
+            w.WriteLine("                       then only seeds it until that IDE publishes one).");
             w.WriteLine("                       Without it, a single .sln in the working directory");
             w.WriteLine("                       is used; several means none, rather than a guess.");
             w.WriteLine("  --clarion-version <name>");
@@ -312,6 +501,14 @@ namespace ClarionAssistant.McpServer
             w.WriteLine("                       reported on stderr at startup. It decides the redirection");
             w.WriteLine("                       file, library search paths and build root - so with several");
             w.WriteLine("                       Clarions installed, commit the file.");
+            w.WriteLine("  " + StandaloneConfigDir.ArgName + " <folder>");
+            w.WriteLine("                       the Clarion settings folder, for a Clarion started with");
+            w.WriteLine("                       /ConfigDir=<folder> (the folder holding its ClarionProperties.xml).");
+            w.WriteLine("                       Also " + StandaloneConfigDir.EnvVar + ", or \"configDir\" in " + SolutionClarionVersion.FileName + ".");
+            w.WriteLine("                       A live IDE that has the solution open on a /ConfigDir folder");
+            w.WriteLine("                       beats all three. Without any, the default folders are read.");
+            w.WriteLine("  --pick-server        print which installed server should serve this solution (for the");
+            w.WriteLine("                       Claude Code plugin's launcher) and exit.");
             w.WriteLine("  --debug              write the LSP subsystem's diagnostics to stderr (stdout stays");
             w.WriteLine("                       pure JSON-RPC). Works in the SHIPPED build — this is the trace");
             w.WriteLine("                       to capture when the language server misbehaves.");
@@ -391,6 +588,16 @@ namespace ClarionAssistant.McpServer
                 Console.Error.WriteLine(ServerName + ": instance coordination unavailable - " + ex.Message);
             }
 
+            // GH #205: write_file / append_to_file are served HERE, with no editors, so before writing they ask every
+            // running IDE whether a NATIVE editor tab holds the file (refuse if it has unsaved changes, reload it after
+            // the write if not), over the pane endpoint (editor_tab_sync). Any IDE, not just this solution's: a stale tab
+            // in any of them clobbers the file on its next save. Set with or without a workspace, before serving.
+            ClarionAssistant.Services.IdeTabClient.Log = ClarionAssistant.Services.LspTrace.Write;
+            ClarionAssistant.Services.OpenTabGuard.Probe = ClarionAssistant.Services.IdeTabClient.Probe;
+            ClarionAssistant.Services.OpenTabGuard.Reload = ClarionAssistant.Services.IdeTabClient.Reload;
+            // Review F1-1: a refused or failed write gives a held IDE file watcher back at once.
+            ClarionAssistant.Services.OpenTabGuard.Release = ClarionAssistant.Services.IdeTabClient.Release;
+
             if (workspace != null)
             {
                 // MUST happen before serving. The registry reads _workspace inside the handlers,
@@ -411,45 +618,38 @@ namespace ClarionAssistant.McpServer
                 // kept none for its whole life while the developer opened one in the IDE - every
                 // lsp_* tool then failed with no way forward short of a new tab. When the IDE
                 // launched us (--ide-pid), the addin publishes its live open solution
-                // (IdeSolutionRecord), and the LSP falls back to that. Only the LSP: the
-                // CodeGraph/solution tools keep the --solution they were launched with.
+                // (IdeSolutionRecord), and the LSP falls back to that.
                 //
                 // It is a FOLLOWED source, not a one-shot fallback: the IDE can switch or close the
                 // solution while the server runs, and LspService re-asks it on every lsp_* call and
                 // restarts or stops the server to match (pipeline run 1). ReadCached keeps that to
                 // one file stat per call.
-                ClarionAssistant.Services.LspService.SolutionPathProvider =
-                    () => workspace.CurrentSolutionPath;
+                //
+                // 9e1bd280: NOT ONLY THE LSP ANY MORE, and not only without --solution. Every tool now
+                // follows the IDE (StandaloneWorkspace.CurrentSolutionPath reads a SolutionFollower), and
+                // the LSP follows THAT SAME follower, so the language server and the tools cannot answer
+                // for different solutions. Launched by an IDE, the solution is a followed source from the
+                // start - --solution only seeds it until the IDE publishes - so the LSP takes it through
+                // FollowedSolutionProvider (restart on a switch, stop on a close). With no IDE there is
+                // nothing to follow, and --solution is a plain provider as before.
                 int? launchingIde = ClarionAssistant.Services.McpToolRegistry.IdeProcessId;
-                if (string.IsNullOrEmpty(workspace.CurrentSolutionPath) && launchingIde.HasValue)
+                if (launchingIde.HasValue)
                 {
-                    int idePid = launchingIde.Value;
-                    string lastSeen = null;
-                    ClarionAssistant.Services.LspService.FollowedSolutionProvider = () =>
-                    {
-                        string note;
-                        string ideSln = ClarionAssistant.Services.IdeSolutionRecord.ReadCached(idePid, out note);
-                        if (!string.Equals(ideSln, lastSeen, StringComparison.OrdinalIgnoreCase))
-                        {
-                            ClarionAssistant.Services.LspTrace.Write("[LspService] no --solution; the IDE's "
-                                + "published solution is now: " + (ideSln ?? "none") + " (" + note + ")");
-                            lastSeen = ideSln;
-                        }
-                        return ideSln;
-                    };
+                    // Null ON PURPOSE: LspService consults SolutionPathProvider BEFORE FollowedSolutionProvider, and a
+                    // server started from it is never followed (no restart on a switch, no stop on a close).
+                    ClarionAssistant.Services.LspService.SolutionPathProvider = null;
+                    ClarionAssistant.Services.LspService.FollowedSolutionProvider = () => workspace.CurrentSolutionPath;
+                }
+                else
+                {
+                    ClarionAssistant.Services.LspService.SolutionPathProvider =
+                        () => workspace.CurrentSolutionPath;
                 }
 
                 // 44a1b10c: lsp_diagnostics is served HERE, with no editors, so it asks the IDE that has this solution
                 // open for an open editor's text (get_live_text over the pane's MCP endpoint), else checks the disk and
-                // says why. The solution matched is the one this server's LSP uses: --solution, else the followed one.
-                ClarionAssistant.Services.IdeLiveTextClient.SolutionProvider = () =>
-                {
-                    string s = workspace.CurrentSolutionPath;
-                    if (!string.IsNullOrEmpty(s)) return s;
-                    if (!launchingIde.HasValue) return null;
-                    string note;
-                    return ClarionAssistant.Services.IdeSolutionRecord.ReadCached(launchingIde.Value, out note);
-                };
+                // says why. The solution matched is the one this server's LSP uses - the followed one (9e1bd280).
+                ClarionAssistant.Services.IdeLiveTextClient.SolutionProvider = () => workspace.CurrentSolutionPath;
                 ClarionAssistant.Services.IdeLiveTextClient.PreferredIdePid = launchingIde;
                 ClarionAssistant.Services.IdeLiveTextClient.Log = ClarionAssistant.Services.LspTrace.Write;
                 ClarionAssistant.Services.SharedLspBridge.LiveTextProvider = ClarionAssistant.Services.IdeLiveTextClient.Get;
@@ -769,6 +969,214 @@ namespace ClarionAssistant.McpServer
                 failures.Add("split check: " + ex.GetType().Name + " - " + ex.Message);
             }
 
+            // b8f9431c: THE IDE PROXY LISTS EVERY IdeOnly TOOL WITH ITS REAL SCHEMA, and its handler is the forwarder - never
+            // the IDE handler, which would throw here. The agnostic tools are untouched, and the whole set is the full set.
+            try
+            {
+                int before = failures.Count;
+                var proxy = new ClarionAssistant.Services.McpToolRegistry(null, new ClarionAssistant.Services.ClarionClassParser());
+                int agnostic = proxy.GetToolCount();
+                string forwardedName = null;
+                int added = proxy.AddForwardedIdeTools((tool, a) =>
+                {
+                    forwardedName = tool.Name;
+                    return ClarionAssistant.Services.McpRawToolResult.Error("forwarded:" + tool.Name);
+                }, ClarionAssistant.Services.IdeToolForwarder.DescriptionNote);
+                // Review M1: the named exclusions (execute_command, dump_object_api) are the only IdeOnly tools not forwarded.
+                int excludedCount = ClarionAssistant.Services.McpToolRegistry.IdeCallbackExcludedTools.Count;
+                if (agnostic + added + excludedCount != withIdeCount)
+                    failures.Add("proxy: " + agnostic + " + " + added + " forwarded + " + excludedCount + " excluded != " + withIdeCount + " (the full set)");
+                var real = new Dictionary<string, Dictionary<string, object>>();
+                foreach (var t in new ClarionAssistant.Services.McpToolRegistry(new GateProbeEditorService(),
+                             new ClarionAssistant.Services.ClarionClassParser(), ideToolsOnly: true).GetToolDefinitions())
+                    real[(string)t["name"]] = t;
+                var ser = new System.Web.Script.Serialization.JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+                foreach (var t in proxy.GetToolDefinitions())
+                {
+                    string n = (string)t["name"];
+                    Dictionary<string, object> r;
+                    if (!real.TryGetValue(n, out r)) continue;   // an agnostic tool
+                    if (ser.Serialize(t["inputSchema"]) != ser.Serialize(r["inputSchema"]))
+                        failures.Add("proxy: " + n + " is listed with a different schema than the IDE's");
+                    if (!((string)t["description"]).StartsWith((string)r["description"], StringComparison.Ordinal)
+                        || !((string)t["description"]).EndsWith(ClarionAssistant.Services.IdeToolForwarder.DescriptionNote, StringComparison.Ordinal))
+                        failures.Add("proxy: " + n + "'s description is not the IDE's plus the forwarding note");
+                }
+                if (proxy.RequiresUiThread("open_procedure_embed"))
+                    failures.Add("proxy: a forwarded tool would marshal onto a UI thread this host does not have");
+                var res = proxy.ExecuteTool("open_procedure_embed", new Dictionary<string, object>()) as ClarionAssistant.Services.McpRawToolResult;
+                if (forwardedName != "open_procedure_embed" || res == null || res.FirstText != "forwarded:open_procedure_embed")
+                    failures.Add("proxy: open_procedure_embed did not reach the forwarder (got " + (forwardedName ?? "nothing") + ")");
+                // The wait: the IDE's UI budget for the tool (setting, never below the tool's own minimum) + the margin,
+                // or the tool's own "timeout" argument + the margin when longer.
+                var defs = new Dictionary<string, ClarionAssistant.Services.McpTool>();
+                foreach (var d in ClarionAssistant.Services.McpToolRegistry.IdeOnlyToolDefinitions()) defs[d.Name] = d;
+                Func<string, Dictionary<string, object>, string, int> budget = (n, a, s) =>
+                    ClarionAssistant.Services.IdeToolForwarder.BudgetMs(defs[n], a ?? new Dictionary<string, object>(), s) / 1000;
+                int m = ClarionAssistant.Services.IdeToolForwarder.MarginSeconds;
+                var cases = new[]
+                {
+                    Tuple.Create("get_app_info", (Dictionary<string, object>)null, (string)null, 30 + m),
+                    Tuple.Create("open_procedure_embed", (Dictionary<string, object>)null, (string)null, 180 + m),
+                    Tuple.Create("open_procedure_embed", (Dictionary<string, object>)null, "300", 300 + m),
+                    Tuple.Create("get_app_info", (Dictionary<string, object>)null, "90", 90 + m),
+                    Tuple.Create("build_app", new Dictionary<string, object> { { "timeout", 400 } }, (string)null, 400 + m),
+                    Tuple.Create("build_app", (Dictionary<string, object>)null, (string)null, 120 + m),
+                };
+                foreach (var c in cases)
+                {
+                    int got = budget(c.Item1, c.Item2, c.Item3);
+                    if (got != c.Item4)
+                        failures.Add("proxy budget: " + c.Item1 + " (setting " + (c.Item3 ?? "unset") + ") waits " + got + " s, expected " + c.Item4);
+                }
+                if (failures.Count == before)
+                    Console.WriteLine("  ok  IDE proxy: " + agnostic + " own + " + added + " forwarded = " + withIdeCount
+                        + " tools, real schemas, calls reach the forwarder; waits = the IDE's UI budget + " + m + " s");
+            }
+            catch (Exception ex)
+            {
+                failures.Add("proxy check: " + ex.GetType().Name + " - " + ex.Message);
+            }
+
+            // GH #205 pipeline run 2 (HIGH): THE IDE CALL-BACK ENDPOINT MUST ANSWER A TAB CHECK FOR A SOLUTION FILE.
+            // IdeCallbackHost serves editor_tab_sync with no chat pane; its check is read-gated by the #266 path policy,
+            // which is built from the registry's workspace. Built without one, every solution file was refused, the
+            // standalone read the refusal as "no IDE" and wrote under a dirty native tab. Built here exactly as the host
+            // builds it (McpToolRegistry.BuildIdeCallbackRegistry), once WITH a workspace naming the solution (must answer)
+            // and once with none (must refuse: the control that shows this check can fail).
+            int tabFailuresBefore = failures.Count;
+            string tabRoot = null;
+            var savedCheck = ClarionAssistant.Services.OpenTabGuard.LocalCheck;
+            try
+            {
+                tabRoot = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "selftest-tab-" + Guid.NewGuid().ToString("N").Substring(0, 8));
+                Directory.CreateDirectory(tabRoot);
+                string sln = Path.Combine(tabRoot, "Demo.sln");
+                File.WriteAllText(sln, "");
+                string module = Path.Combine(tabRoot, "Main001.clw");
+                File.WriteAllText(module, "  MEMBER()\r\n");
+                ClarionAssistant.Services.OpenTabGuard.LocalCheck = paths => new ClarionAssistant.Services.TabProbe
+                    { Reachable = true, Kind = ClarionAssistant.Services.OpenTabGuard.KindNative, Dirty = true };
+                var args = new Dictionary<string, object> { { "file_path", module }, { "action", "check" } };
+
+                var withWs = ClarionAssistant.Services.McpToolRegistry.BuildIdeCallbackRegistry(new GateProbeEditorService(),
+                    new ClarionAssistant.Services.ClarionClassParser(), new SelfTestWorkspace(sln), null);
+                var names = new List<string>();
+                foreach (var t in withWs.GetToolDefinitions()) names.Add((string)t["name"]);
+                // b8f9431c: the call-back endpoint serves EVERY IdeOnly tool (the forwarded ones too), minus the named
+                // exclusions - exactly the set the standalone forwards. Checked against an independent IdeOnly registry.
+                var ideOnlyNames = new List<string>();
+                foreach (var t in new ClarionAssistant.Services.McpToolRegistry(new GateProbeEditorService(),
+                             new ClarionAssistant.Services.ClarionClassParser(), ideToolsOnly: true).GetToolDefinitions())
+                    if (!ClarionAssistant.Services.McpToolRegistry.IdeCallbackExcludedTools.ContainsKey((string)t["name"]))
+                        ideOnlyNames.Add((string)t["name"]);
+                var forwardedNames = new List<string>();
+                foreach (var d in ClarionAssistant.Services.McpToolRegistry.IdeOnlyToolDefinitions()) forwardedNames.Add(d.Name);
+                var missingCb = ideOnlyNames.FindAll(n => !names.Contains(n));
+                var extraCb = names.FindAll(n => !ideOnlyNames.Contains(n));
+                if (missingCb.Count > 0 || extraCb.Count > 0 || !names.Contains("editor_tab_sync") || !names.Contains("get_live_text"))
+                    failures.Add("the call-back registry does not serve exactly the IdeOnly tools: missing [" + string.Join(", ", missingCb.ToArray())
+                                 + "], extra [" + string.Join(", ", extraCb.ToArray()) + "]");
+                var fwdMissing = ideOnlyNames.FindAll(n => !forwardedNames.Contains(n));
+                if (missingCb.Count > 0 || extraCb.Count > 0) { }   // reported above
+                else if (fwdMissing.Count > 0 || forwardedNames.Count != ideOnlyNames.Count)
+                    failures.Add("the forwarded set is not the call-back set: " + forwardedNames.Count + " forwarded vs " + ideOnlyNames.Count
+                                 + " served, missing [" + string.Join(", ", fwdMissing.ToArray()) + "]");
+                else
+                    Console.WriteLine("  ok  IDE call-back endpoint serves all " + names.Count + " IdeOnly tools ("
+                        + ClarionAssistant.Services.McpToolRegistry.IdeCallbackExcludedTools.Count + " excluded); the standalone forwards the same "
+                        + forwardedNames.Count);
+                var answered = ClarionAssistant.Services.OpenTabGuard.CheckFromWire(
+                    withWs.ExecuteTool("editor_tab_sync", args) as Dictionary<string, object>, "selftest");
+                if (!answered.Reachable || answered.Kind != ClarionAssistant.Services.OpenTabGuard.KindNative || !answered.Dirty)
+                    failures.Add("the call-back endpoint did not answer a tab check for a solution file (Reachable=" + answered.Reachable
+                                 + ", " + (answered.Reason ?? answered.Kind) + ") - every write would go ahead unchecked");
+
+                // Pipeline run 3: files OUTSIDE that IDE's roots. The gate refuses them, but the tab lookup still runs, by
+                // name only: a dirty tab holding one must be answered (the writer then refuses), and only with no tab is
+                // it "out of scope" (a second IDE on another solution), which the writer notes.
+                string dirtyOutside = Path.Combine(Path.GetTempPath(), "ca-selftest-outside-dirty-205.clw");
+                string cleanOutside = Path.Combine(Path.GetTempPath(), "ca-selftest-outside-205.clw");
+                ClarionAssistant.Services.OpenTabGuard.LocalCheckLexical = paths => new ClarionAssistant.Services.TabProbe
+                {
+                    Reachable = true,
+                    Kind = paths.Contains(dirtyOutside) ? ClarionAssistant.Services.OpenTabGuard.KindNative : ClarionAssistant.Services.OpenTabGuard.KindNone,
+                    Dirty = paths.Contains(dirtyOutside)
+                };
+                Func<ClarionAssistant.Services.McpToolRegistry, string, ClarionAssistant.Services.TabProbe> ask = (reg, f) =>
+                    ClarionAssistant.Services.OpenTabGuard.CheckFromWire(reg.ExecuteTool("editor_tab_sync",
+                        new Dictionary<string, object> { { "file_path", f }, { "action", "check" } }) as Dictionary<string, object>, "selftest");
+
+                var dirty = ask(withWs, dirtyOutside);
+                if (!dirty.Reachable || dirty.Kind != ClarionAssistant.Services.OpenTabGuard.KindNative || !dirty.Dirty)
+                    failures.Add("a DIRTY tab holding a file outside the IDE's roots was not reported (Reachable=" + dirty.Reachable
+                                 + ", " + (dirty.Reason ?? dirty.Kind) + ") - the write would go under it");
+                var outside = ask(withWs, cleanOutside);
+                if (outside.Reachable || !outside.OutOfScope || outside.Answered)
+                    failures.Add("a file outside the IDE's roots with no tab is not reported as out of scope (Reachable=" + outside.Reachable
+                                 + ", OutOfScope=" + outside.OutOfScope + ") - writes outside a running IDE's solution would be refused");
+
+                var noSln = ClarionAssistant.Services.McpToolRegistry.BuildIdeCallbackRegistry(new GateProbeEditorService(),
+                    new ClarionAssistant.Services.ClarionClassParser(), new SelfTestWorkspace(null), null);
+                // Softened after run 3: the lookup by name always runs, so an IDE with no solution open and no tab of the
+                // file answers "out of scope" (a note, by name only); a dirty tab matching by name is still answered.
+                var noSlnAnswer = ask(noSln, cleanOutside);
+                if (noSlnAnswer.Reachable || noSlnAnswer.Answered || !noSlnAnswer.OutOfScope || !noSlnAnswer.Reason.Contains("checked by path name only"))
+                    failures.Add("an IDE with NO solution open and no tab of the file did not answer 'out of scope (checked by path name only)': " + noSlnAnswer.Reason);
+                var noSlnDirty = ask(noSln, dirtyOutside);
+                if (!noSlnDirty.Reachable || noSlnDirty.Kind != ClarionAssistant.Services.OpenTabGuard.KindNative || !noSlnDirty.Dirty)
+                    failures.Add("an IDE with NO solution open did not report a DIRTY tab matching the file by name - the write would go under it");
+
+                // Pipeline run 4 (security MEDIUM): EVERY spelling is gated. An attacker-chosen UNC also_path, or a UNC reload
+                // path, must never reach the identity lookup (which opens handles; an SMB open leaks NTLM credentials).
+                var idAsked = new List<string>();
+                var nameAsked = new List<string>();
+                var savedLex = ClarionAssistant.Services.OpenTabGuard.LocalCheckLexical;
+                var savedReload = ClarionAssistant.Services.OpenTabGuard.LocalReload;
+                ClarionAssistant.Services.OpenTabGuard.LocalCheck = paths => { idAsked.AddRange(paths); return new ClarionAssistant.Services.TabProbe { Reachable = true, Kind = ClarionAssistant.Services.OpenTabGuard.KindNone }; };
+                ClarionAssistant.Services.OpenTabGuard.LocalCheckLexical = paths => { nameAsked.AddRange(paths); return new ClarionAssistant.Services.TabProbe { Reachable = true, Kind = ClarionAssistant.Services.OpenTabGuard.KindNone }; };
+                ClarionAssistant.Services.OpenTabGuard.LocalReload = (byId, byName, holdId) => { idAsked.AddRange(byId); nameAsked.AddRange(byName); return new ClarionAssistant.Services.TabReload { Reason = "none open" }; };
+                const string unc = @"\\attacker-205\s\Main001.clw";
+                withWs.ExecuteTool("editor_tab_sync", new Dictionary<string, object> { { "file_path", module }, { "also_path", unc }, { "action", "check" } });
+                withWs.ExecuteTool("editor_tab_sync", new Dictionary<string, object> { { "file_path", unc }, { "action", "reload" } });
+                if (idAsked.Exists(p => p.StartsWith(@"\\")) || !nameAsked.Contains(unc) || !idAsked.Exists(p => p.EndsWith("Main001.clw") && !p.StartsWith(@"\\")))
+                    failures.Add("a UNC spelling reached the identity lookup, or the allowed one did not (identity: [" + string.Join(", ", idAsked.ToArray())
+                                 + "], by name: [" + string.Join(", ", nameAsked.ToArray()) + "])");
+                ClarionAssistant.Services.OpenTabGuard.LocalCheckLexical = savedLex;
+                ClarionAssistant.Services.OpenTabGuard.LocalReload = savedReload;
+                ClarionAssistant.Services.OpenTabGuard.LocalCheck = paths => new ClarionAssistant.Services.TabProbe
+                    { Reachable = true, Kind = ClarionAssistant.Services.OpenTabGuard.KindNative, Dirty = true };
+
+                // Pipeline run 3 (security LOW): get_live_text returns buffer TEXT, so it is read-gated like read_file.
+                var liveOut = withWs.ExecuteTool("get_live_text", new Dictionary<string, object> { { "file_path", cleanOutside } }) as string;
+                if (liveOut == null || !liveOut.StartsWith("Error: get_live_text refused by the Clarion Assistant path policy", StringComparison.Ordinal))
+                    failures.Add("get_live_text answered for a file outside the IDE's roots: " + (liveOut ?? "(a JSON answer)"));
+                var liveIn = withWs.ExecuteTool("get_live_text", new Dictionary<string, object> { { "file_path", module } });
+                if (liveIn is string && ((string)liveIn).StartsWith("Error", StringComparison.Ordinal))
+                    failures.Add("get_live_text refused a file inside the IDE's solution: " + liveIn);
+
+                var noWs = ClarionAssistant.Services.McpToolRegistry.BuildIdeCallbackRegistry(new GateProbeEditorService(),
+                    new ClarionAssistant.Services.ClarionClassParser(), null, null);
+                var refused = ask(noWs, module);
+                if (refused.Reachable && refused.Kind == ClarionAssistant.Services.OpenTabGuard.KindNone)
+                    failures.Add("negative control: with NO workspace the check answered 'not open' - this check cannot tell a broken host from a working one");
+                else if (!refused.Reachable && (!refused.Answered || refused.OutOfScope))
+                    failures.Add("a refused check with no workspace reads as 'no IDE' or 'out of scope': the write tools would only note it and write");
+
+                if (failures.Count == tabFailuresBefore)
+                    Console.WriteLine("  ok  IDE call-back endpoint: solution file answered; dirty tab outside its roots answered (solution open or not); no tab = out of scope by name; no workspace = failed check");
+            }
+            catch (Exception ex)
+            {
+                failures.Add("call-back tab check: " + ex.GetType().Name + " - " + ex.Message);
+            }
+            finally
+            {
+                ClarionAssistant.Services.OpenTabGuard.LocalCheck = savedCheck;
+                ClarionAssistant.Services.OpenTabGuard.LocalCheckLexical = null;
+                try { if (tabRoot != null) Directory.Delete(tabRoot, true); } catch { }
+            }
+
             // THE SIDECAR MUST NOT BE ABLE TO OVERRIDE AN ADDIN SERVER, and clarion-tools is the
             // case that matters: a user's mcp-extra.json entry of that name would silently point
             // the IDE pane at a different executable and a different solution, while the pane went
@@ -846,6 +1254,24 @@ namespace ClarionAssistant.McpServer
 
             Console.WriteLine("SELFTEST PASSED - agnostic service layer loads with no IDE assemblies.");
             return 0;
+        }
+
+        /// <summary>TEST FIXTURE ONLY (GH #205 pipeline run 2): a workspace that names one solution and nothing else, as
+        /// the IDE's IdeWorkspace would for an IDE with that solution open.</summary>
+        private sealed class SelfTestWorkspace : ClarionAssistant.Services.IWorkspaceContext
+        {
+            private readonly string _sln;
+            public SelfTestWorkspace(string sln) { _sln = sln; }
+            public string CurrentSolutionPath { get { return _sln; } }
+            public ClarionAssistant.Services.ClarionVersionConfig CurrentVersionConfig { get { return null; } }
+            public ClarionAssistant.Services.RedFileService RedFile { get { return null; } }
+            public ClarionAssistant.Services.RedFileService ActiveRedFileService { get { return null; } }
+            public string CurrentDbPath { get { return null; } }
+            public List<string> BuildIndexLibraryPaths() { return new List<string>(); }
+            public void RunIndex(bool incremental) { }
+            public void RunIndex(bool incremental, Action<ClarionCodeGraph.Graph.IndexProgressEvent> onProgress, Action<string> onCompleted) { }
+            public string GetHostOpenSolutionPath() { return _sln; }
+            public string GetClarionInstallPath() { return null; }
         }
 
         /// <summary>

@@ -32,9 +32,17 @@ const SRC = [
     slice(html, '    var DIAG_TIMEOUT_MS = ', '    // registerClarionFolding()', 'diagnostics'),
 ].join('\n');
 
-const DECLARED = new Set();
-for (const m of SRC.matchAll(/\bfunction\s+([A-Za-z_$][\w$]*)/g)) DECLARED.add(m[1]);
-for (const m of SRC.matchAll(/\bvar\s+([A-Za-z_$][\w$]*)/g)) DECLARED.add(m[1]);
+// H1-b (opt-in, load({ nav: true })): the navigation history (navStack, recordNavAt, revealLineFromHost,
+// cmdNavBack/Forward) runs for real, so a test can press Back. Opt-in because it declares revealLineFromHost,
+// which the other harnesses replace with a recorder.
+const NAV_SRC = slice(html, '    var navStack = [];', '    function updateNavUI() {', 'navigation history');
+
+function declaredIn(src) {
+    const d = new Set();
+    for (const m of src.matchAll(/\bfunction\s+([A-Za-z_$][\w$]*)/g)) d.add(m[1]);
+    for (const m of src.matchAll(/\bvar\s+([A-Za-z_$][\w$]*)/g)) d.add(m[1]);
+    return d;
+}
 const STUB = function () { return undefined; };
 
 function makeModel(id, lines) {
@@ -66,6 +74,8 @@ function makeModel(id, lines) {
 
 function load(opts) {
     opts = opts || {};
+    const src = opts.nav ? SRC + '\n' + NAV_SRC : SRC;
+    const DECLARED = declaredIn(src);
     const posted = [];
     const providers = { completion: [], hover: [], signatureHelp: [] };
     const timers = [];                      // {id, fn, ms, cleared, fired}
@@ -74,6 +84,7 @@ function load(opts) {
         posted, providers, timers, triggers,
         pendingRequests: {}, reqSeq: 0, fileMode: false, embedRanges: [[1, 100]],
         keywordCaseMode: 'upper', commitKeysEnabled: true, snippetsList: [],
+        linkOpeners: [], generatedSource: false, isReadOnlyNow() { return false; },
         clock: 0,
         postToHost(obj) { posted.push(JSON.parse(JSON.stringify(obj))); },
         setTimeout(fn, ms) { const t = { id: timers.length + 1, fn, ms, cleared: false, fired: false }; timers.push(t); return t.id; },
@@ -91,7 +102,7 @@ function load(opts) {
                 registerSignatureHelpProvider(lang, p) { providers.signatureHelp.push(p); },
             },
             editor: {
-                registerLinkOpener() { },
+                registerLinkOpener(o) { env.linkOpeners.push(o); },   // GH #263: hover-attribute-chips.test.js clicks through it
                 setModelMarkers(m, owner, list) { (env.markers = env.markers || {})[owner] = list; },
                 getModelMarkers(f) { return (env.markers && env.markers[f.owner]) || []; },
                 TrackedRangeStickiness: { AlwaysGrowsWhenTypingAtEdges: 0 },
@@ -112,10 +123,14 @@ function load(opts) {
         set(t, k, v) { t[k] = v; return true; },
     });
     const exportsList = ['registerClarionProviders', 'resetLocalFirstState', 'resetBufferSync', 'applySpanMap', 'noteBufferEdit',
-        'withBuffer', 'buildSlice', 'refreshDiagnostics', 'resetDiagnosticsForNewSource', 'deliverHostReply'];
+        'withBuffer', 'buildSlice', 'refreshDiagnostics', 'resetDiagnosticsForNewSource', 'deliverHostReply',
+        'prepareAttributeLinks', 'applyAttributeEditLink', 'decodeAttributeEdits', 'isAttributeLinkUri', 'applyGeneratedSourceFlag',
+        'serverCardContent', 'snippetToPlainText', 'decodeAttributeEditQuery', 'attributeEditPayloadOfUri',   // GH #281
+        'setEmbedDocPath', 'prepareSelfLinks', 'markDiskSelfLinks',   // H1-a: hover-self-links.test.js
+        'revealLineFromHost', 'cmdNavBack', 'cmdNavForward'];        // H1-b: with load({ nav: true })
     const ret = '{' + exportsList.map(n => n + ': ' + (DECLARED.has(n) ? n : 'undefined')).join(', ') + '}';
     // eslint-disable-next-line no-new-func
-    env.api = new Function('__scope', 'with (__scope) {\n' + SRC + '\nreturn ' + ret + ';\n}')(scope);
+    env.api = new Function('__scope', 'with (__scope) {\n' + src + '\nreturn ' + ret + ';\n}')(scope);
     env.api.registerClarionProviders();
 
     env.requests = (action) => posted.filter(m => m.action === action);

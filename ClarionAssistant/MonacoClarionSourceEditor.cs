@@ -137,8 +137,12 @@ namespace ClarionAssistant
         /// IDE's own save-before-build (SaveAllFiles.SaveAll, which only reaches AbstractViewContent.IsDirty).
         /// Without this, "Build Solution" can silently compile a stale on-disk version of a file being
         /// edited in the CA Editor. Best-effort per tab; one tab's failure must not stop the others.</summary>
-        internal static void SaveAllDirtyBeforeBuild()
+        /// <param name="writeRefusal">b8f9431c N1: the assistant's build tools pass the #266 Write gate (path -> null to
+        /// save, else why not); a dirty tab it refuses is NOT written and is returned as "path: why". Null (the IDE's own
+        /// Build, SaveSourceEditorsBeforeBuildCommand: the developer's action) saves every dirty tab, as before.</param>
+        internal static List<string> SaveAllDirtyBeforeBuild(Func<string, string> writeRefusal = null)
         {
+            var skipped = new List<string>();
             List<MonacoClarionEditor> snapshot;
             lock (_instances) { snapshot = new List<MonacoClarionEditor>(_instances); }
 
@@ -162,9 +166,10 @@ namespace ClarionAssistant
 
             foreach (var inst in snapshot)
             {
-                try { inst.SaveDirtyBeforeBuild(); }
+                try { inst.SaveDirtyBeforeBuild(writeRefusal, skipped); }
                 catch (Exception ex) { MonacoSpikeLog.Write("SaveAllDirtyBeforeBuild per-instance error: " + ex.Message); }
             }
+            return skipped;
         }
 
         /// <summary>
@@ -275,12 +280,26 @@ namespace ClarionAssistant
         /// (the host doesn't track Monaco's edit-sequence counter, so it can't safely clear it). Silently
         /// skips a read-only file rather than throwing (matches OnSave's own guard) — the build will simply
         /// compile the file as it already is on disk.</summary>
-        private void SaveDirtyBeforeBuild()
+        private void SaveDirtyBeforeBuild(Func<string, string> writeRefusal, List<string> skipped)
         {
             try
             {
                 if (!(_overlayDirty && _overlayLiveText != null && !string.IsNullOrEmpty(_filePath))) return;
                 if (IsFileReadOnly()) return;
+                // b8f9431c N1: the assistant's build tools ask the #266 Write gate first. A refused file is not written
+                // (fail closed: a gate that throws refuses too) and stays dirty; the build result names it.
+                if (writeRefusal != null)
+                {
+                    string why;
+                    try { why = writeRefusal(_filePath); }
+                    catch (Exception ex) { why = "the path policy check failed (" + ex.Message + ")"; }
+                    if (why != null)
+                    {
+                        skipped.Add(_filePath + ": " + why);
+                        MonacoSpikeLog.Write("[save-before-build] NOT saved (write gate): " + _filePath);
+                        return;
+                    }
+                }
                 long seq = _overlayLiveSeq;
                 int n = WriteToDisk(_overlayLiveText);
                 _overlayDirty = false;
@@ -726,6 +745,7 @@ namespace ClarionAssistant
                 // code) — mirror any field added/removed/renamed here over there too.
                 bool fileReadOnly = IsFileReadOnly();
                 string pageTitle = fileReadOnly ? (_overlayTitle + " (read-only)") : _overlayTitle;
+                bool generatedSource = IsGeneratedSourceFile();   // GH #263 Q2; kept current by GeneratedSourceWatch
                 string json = "{\"type\":\"setSource\","
                     + "\"title\":" + MonacoEditorControl.JsonString(pageTitle) + ","
                     + "\"language\":\"clarion\","
@@ -733,6 +753,7 @@ namespace ClarionAssistant
                     + "\"chromeBg1\":" + MonacoEditorControl.JsonString(_chromeBg1 ?? "") + ","
                     + "\"chromeBg2\":" + MonacoEditorControl.JsonString(_chromeBg2 ?? "") + ","
                     + "\"fileMode\":true,"
+                    + "\"generatedSource\":" + (generatedSource ? "true" : "false") + ","   // GH #263 Q2
                     + "\"readOnly\":" + (fileReadOnly ? "true" : "false") + ","
                     + "\"breakpointsEnabled\":true,"
                     + "\"designerEnabled\":true,"
@@ -750,6 +771,8 @@ namespace ClarionAssistant
                     + "\"executionLine\":" + SeedExecutionLineForPage() + ","   // debugger marker (#26), painted after the content is in
                     + "\"sourceUrl\":\"https://clarion-embeditor-data/source.txt\"}";
                 _editor.PostJson(json);
+                _generatedFlag.MarkSent(generatedSource);
+                GeneratedSourceWatch.EnsureWired();
                 MonacoSpikeLog.Write("overlay setSource sent (fileMode editable, " + text.Length + " chars, file=" + (_filePath ?? "?") + (navLine >= 1 ? (", nav->line " + navLine) : "") + ", bps=[" + bpCsv + "])");
 
                 // The page can now be positioned. Re-register under the firm page-resolved path, flush any nav
@@ -910,7 +933,8 @@ namespace ClarionAssistant
                                 items.Add(new Dictionary<string, object>
                                 {
                                     { "label", c.Label }, { "kind", c.Kind }, { "detail", c.Detail },
-                                    { "documentation", c.Documentation }, { "insertText", c.InsertText }
+                                    { "documentation", c.Documentation }, { "insertText", c.InsertText },
+                                    { "insertTextFormat", c.InsertTextFormat }
                                 });
                     }
                 }
@@ -1548,6 +1572,7 @@ namespace ClarionAssistant
                 CaptureIdeChromeColors();
                 bool fileReadOnly = IsFileReadOnly();
                 string pageTitle = fileReadOnly ? (_overlayTitle + " (read-only)") : _overlayTitle;
+                bool generatedSource = IsGeneratedSourceFile();   // GH #263 Q2 (KEEP IN SYNC with the open path)
                 int curLine = _lastCursorLine >= 1 ? _lastCursorLine : 1;
                 int curCol = _lastCursorCol >= 1 ? _lastCursorCol : 1;
                 string json = "{\"type\":\"setSource\","
@@ -1558,6 +1583,7 @@ namespace ClarionAssistant
                     + "\"chromeBg1\":" + MonacoEditorControl.JsonString(_chromeBg1 ?? "") + ","
                     + "\"chromeBg2\":" + MonacoEditorControl.JsonString(_chromeBg2 ?? "") + ","
                     + "\"fileMode\":true,"
+                    + "\"generatedSource\":" + (generatedSource ? "true" : "false") + ","   // GH #263 Q2 (KEEP IN SYNC)
                     + "\"readOnly\":" + (fileReadOnly ? "true" : "false") + ","
                     + "\"breakpointsEnabled\":true,"
                     + "\"designerEnabled\":true,"
@@ -1578,6 +1604,7 @@ namespace ClarionAssistant
                     + "\"executionLine\":" + SeedExecutionLineForPage() + ","   // debugger marker (#26) survives a reload
                     + "\"sourceUrl\":\"https://clarion-embeditor-data/source.txt\"}";
                 _editor.PostJson(json);
+                _generatedFlag.MarkSent(generatedSource);
                 MonacoSpikeLog.Write("overlay reload: re-read from disk and resent (" + _filePath + ", " + text.Length + " chars)");
             }
             catch (Exception ex)
@@ -1884,6 +1911,11 @@ namespace ClarionAssistant
         /// edits)? A tab in native mode (overlay toggled off, or the file type excluded) has an instance but no overlay:
         /// that is <see cref="IsOpenInNativeEditor"/>, whose unsaved edits the tools cannot see.</summary>
         internal static bool IsOpenInOverlay(string path) { return OpenTabHasOverlay(path) == true; }
+
+        /// <summary>GH #205: is THIS tab's CA Editor up (the visible editor), and does it hold unsaved edits? Per instance,
+        /// so NativeTabSync can classify a tab it matched by file identity rather than by path text.</summary>
+        internal bool OverlayUp { get { return _editor != null; } }
+        internal bool OverlayDirty { get { return _overlayDirty; } }
 
         /// <summary>fc420c30: is <paramref name="path"/> open in a source tab showing the NATIVE Clarion editor?</summary>
         internal static bool IsOpenInNativeEditor(string path) { return OpenTabHasOverlay(path) == false; }
@@ -2325,6 +2357,36 @@ namespace ClarionAssistant
         {
             try { return !string.IsNullOrEmpty(_filePath) && File.Exists(_filePath) && new FileInfo(_filePath).IsReadOnly; }
             catch { return false; }
+        }
+
+        // GH #263 Q2: a module an open app generates. The page then shows a control hover card's attribute
+        // names as plain text instead of edit chips, since the next generate would overwrite the edit.
+        private bool IsGeneratedSourceFile()
+        {
+            try { return new Services.AppTreeService().IsGeneratedModuleOfOpenApp(_filePath); }
+            catch { return false; }
+        }
+
+        private readonly Services.GeneratedSourceFlag _generatedFlag = new Services.GeneratedSourceFlag();
+
+        /// <summary>GH #263 Q2 follow-up (GeneratedSourceWatch, UI thread): a tab opened or restored before its app
+        /// loaded got generatedSource=false. Re-check every live tab and post the new answer where it changed.</summary>
+        internal static void RefreshGeneratedSourceFlags()
+        {
+            List<MonacoClarionEditor> snapshot;
+            lock (_instances) { snapshot = new List<MonacoClarionEditor>(_instances); }
+            foreach (var inst in snapshot)
+            {
+                try
+                {
+                    if (inst._editor == null || !inst._pageReady) continue;
+                    string msg = inst._generatedFlag.Update(inst.IsGeneratedSourceFile());
+                    if (msg == null) continue;
+                    inst._editor.PostJson(msg);
+                    MonacoSpikeLog.Write("[generated-source] " + System.IO.Path.GetFileName(inst._filePath ?? "?") + " -> " + msg);
+                }
+                catch (Exception ex) { MonacoSpikeLog.Write("[generated-source] refresh error: " + ex.Message); }
+            }
         }
 
         private int WriteToDisk(string text)
@@ -3038,6 +3100,18 @@ namespace ClarionAssistant
 
         private static readonly object _writeLock = new object();   // pool-thread writers exist (WriteWithMemAsync)
 
+        /// <summary>"[pid N] " — every running IDE appends to the one file, so each line says which process wrote
+        /// it (GH #179: a second instance starting looked like a restart after a fault). It goes AFTER the
+        /// timestamp and its two-space separator, so a reader keyed on the line's leading timestamp still works.
+        /// ClarionConfigDirectory.LogOnce writes the same shape.</summary>
+        public static readonly string PidTag = MakePidTag();
+
+        private static string MakePidTag()
+        {
+            try { return "[pid " + System.Diagnostics.Process.GetCurrentProcess().Id + "] "; }
+            catch { return "[pid ?] "; }
+        }
+
         public static void Write(string message)
         {
             try
@@ -3047,7 +3121,7 @@ namespace ClarionAssistant
                     EnsureDir();
                     File.AppendAllText(
                         Path.Combine(DataDir, "monaco-spike.log"),
-                        DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + "  " + message + Environment.NewLine);
+                        DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + "  " + PidTag + message + Environment.NewLine);
                 }
             }
             catch { }

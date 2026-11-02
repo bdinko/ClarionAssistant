@@ -119,10 +119,13 @@
     <Compile Include="StandaloneUiDispatcher.cs" />
     <Compile Include="StandaloneWorkspace.cs" />
     <Compile Include="SolutionClarionVersion.cs" />
+    <Compile Include="StandaloneConfigDir.cs" />
+    <Compile Include="ServerPicker.cs" />
     <!-- Graph layer — SHARED, linked from ..\CodeGraph\ -->
     <Compile Include="..\CodeGraph\Graph\CodeGraphDatabase.cs"><Link>Graph\CodeGraphDatabase.cs</Link></Compile>
     <Compile Include="..\CodeGraph\Graph\CodeGraphIndexer.cs"><Link>Graph\CodeGraphIndexer.cs</Link></Compile>
     <Compile Include="..\CodeGraph\Graph\IndexProgress.cs"><Link>Graph\IndexProgress.cs</Link></Compile>
+    <Compile Include="..\CodeGraph\Graph\IndexerProtocol.cs"><Link>Graph\IndexerProtocol.cs</Link></Compile>
     <Compile Include="..\CodeGraph\Graph\CodeGraphQuery.cs"><Link>Graph\CodeGraphQuery.cs</Link></Compile>
     <!-- Declares CodeGraphProvider and CodeGraphSymbol, which SharedLspBridge uses to answer
          definition / references / workspace-symbol from the CodeGraph when the LSP returns
@@ -140,6 +143,7 @@
     <Compile Include="..\CodeGraph\Parsing\Models\ParseResult.cs"><Link>Parsing\Models\ParseResult.cs</Link></Compile>
     <!-- IDE-free Services the shared layer needs (same four the indexer links) -->
     <Compile Include="..\Services\RedFileService.cs"><Link>Services\RedFileService.cs</Link></Compile>
+    <Compile Include="..\Services\RedResolution.cs"><Link>Services\RedResolution.cs</Link></Compile>
     <Compile Include="..\Services\ClarionConfigDirectory.cs"><Link>Services\ClarionConfigDirectory.cs</Link></Compile>
     <Compile Include="..\Services\ClarionVersionService.cs"><Link>Services\ClarionVersionService.cs</Link></Compile>
     <Compile Include="..\Services\EffectiveClarionVersion.cs"><Link>Services\EffectiveClarionVersion.cs</Link></Compile>
@@ -151,6 +155,8 @@
     <Compile Include="..\Services\ClarionTraceService.cs"><Link>Services\ClarionTraceService.cs</Link></Compile>
     <Compile Include="..\Services\DocGraphService.cs"><Link>Services\DocGraphService.cs</Link></Compile>
     <Compile Include="..\Services\EverythingService.cs"><Link>Services\EverythingService.cs</Link></Compile>
+    <Compile Include="..\Services\McpPathPolicy.cs"><Link>Services\McpPathPolicy.cs</Link></Compile>
+    <Compile Include="..\Services\McpPathGate.cs"><Link>Services\McpPathGate.cs</Link></Compile>
     <Compile Include="..\Services\KnowledgeService.cs"><Link>Services\KnowledgeService.cs</Link></Compile>
     <Compile Include="..\Services\SchemaGraphService.cs"><Link>Services\SchemaGraphService.cs</Link></Compile>
     <Compile Include="..\Services\NpgsqlLoader.cs"><Link>Services\NpgsqlLoader.cs</Link></Compile>
@@ -189,6 +195,7 @@
     <Compile Include="..\Services\ClarionSourceText.cs"><Link>Services\ClarionSourceText.cs</Link></Compile>
     <Compile Include="..\Services\IndexRunGate.cs"><Link>Services\IndexRunGate.cs</Link></Compile>
     <Compile Include="..\Services\IndexRunLog.cs"><Link>Services\IndexRunLog.cs</Link></Compile>
+    <Compile Include="..\Services\OutOfProcessIndexer.cs"><Link>Services\OutOfProcessIndexer.cs</Link></Compile>
     <Compile Include="..\Services\InstanceCoordinationService.cs"><Link>Services\InstanceCoordinationService.cs</Link></Compile>
     <!-- The LSP subsystem's diagnostic sink. Linked BEFORE the three files that call it so the
          reason it exists reads in order: they used to call Debug.WriteLine, which a Release build
@@ -197,8 +204,15 @@
     <Compile Include="..\Services\LspService.cs"><Link>Services\LspService.cs</Link></Compile>
     <Compile Include="..\Services\LspStartResult.cs"><Link>Services\LspStartResult.cs</Link></Compile>
     <Compile Include="..\Services\IdeSolutionRecord.cs"><Link>Services\IdeSolutionRecord.cs</Link></Compile>
+    <Compile Include="..\Services\SolutionFollower.cs"><Link>Services\SolutionFollower.cs</Link></Compile>
     <Compile Include="..\Services\IdeEndpointRecord.cs"><Link>Services\IdeEndpointRecord.cs</Link></Compile>
     <Compile Include="..\Services\IdeLiveTextClient.cs"><Link>Services\IdeLiveTextClient.cs</Link></Compile>
+    <Compile Include="..\Services\OpenTabGuard.cs"><Link>Services\OpenTabGuard.cs</Link></Compile>
+    <Compile Include="..\Services\IdeTabClient.cs"><Link>Services\IdeTabClient.cs</Link></Compile>
+    <Compile Include="..\Services\IdeFanOut.cs"><Link>Services\IdeFanOut.cs</Link></Compile>
+    <!-- b8f9431c: the IDE proxy - lists the IdeOnly tools and forwards each call to a running Clarion IDE on this solution. -->
+    <Compile Include="..\Services\IdeToolForwarder.cs"><Link>Services\IdeToolForwarder.cs</Link></Compile>
+    <Compile Include="..\Services\FileIdentity.cs"><Link>Services\FileIdentity.cs</Link></Compile>
     <Compile Include="..\Services\EditorToolRouter.cs"><Link>Services\EditorToolRouter.cs</Link></Compile>
     <Compile Include="..\Services\EditorTextOps.cs"><Link>Services\EditorTextOps.cs</Link></Compile>
     <Compile Include="..\Services\HostRequestBroker.cs"><Link>Services\HostRequestBroker.cs</Link></Compile>
@@ -212,6 +226,7 @@
     <Compile Include="..\Services\EmbedToolRouter.cs"><Link>Services\EmbedToolRouter.cs</Link></Compile>
     <Compile Include="..\Services\EmbedSlotText.cs"><Link>Services\EmbedSlotText.cs</Link></Compile>
     <Compile Include="..\Services\ClarionClDiagnosis.cs"><Link>Services\ClarionClDiagnosis.cs</Link></Compile>
+    <Compile Include="..\Services\ClarionBuildTarget.cs"><Link>Services\ClarionBuildTarget.cs</Link></Compile>
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
   <!-- x86 SQLite.Interop.dll next to the exe, same as the indexer. -->

@@ -24,6 +24,15 @@ static class CaAgentIdentityTest
         else { fail++; Console.WriteLine("  [FAIL] " + name + (detail != null ? "  -> " + detail : "")); }
     }
 
+    // A method's text, from its signature to its closing brace (the first "\n        }" after it), or null.
+    static string Body(string src, string signature)
+    {
+        int at = src.IndexOf(signature, StringComparison.Ordinal);
+        if (at < 0) return null;
+        int end = src.IndexOf("\n        }", at, StringComparison.Ordinal);
+        return end < 0 ? src.Substring(at) : src.Substring(at, end - at);
+    }
+
     static int Main(string[] args)
     {
         Console.WriteLine("CaAgentIdentity identity prompt (c175492a) and numbered names (7792e3e0)");
@@ -70,6 +79,21 @@ static class CaAgentIdentityTest
         Ok("all numbers taken -> random fallback, still CA-prefixed", exhausted.StartsWith("CA-") && exhausted.Length == 9, exhausted);
         Ok("name is short (fits tab and prompt label)", CaAgentIdentity.NextFreeName(null).Length <= 5);
 
+        // ---- Per-backend prefixes (cfb63b58): CP1 Copilot, CX1 Codex, each numbered on its own ----
+        Ok("Claude -> CA", CaAgentIdentity.PrefixForBackend("Claude") == "CA");
+        Ok("Copilot -> CP", CaAgentIdentity.PrefixForBackend("Copilot") == "CP");
+        Ok("Codex -> CX", CaAgentIdentity.PrefixForBackend("codex") == "CX");
+        Ok("unknown / null -> CA", CaAgentIdentity.PrefixForBackend(null) == "CA" && CaAgentIdentity.PrefixForBackend("Gemini") == "CA");
+        held.Clear(); held.Add("CA1"); held.Add("CA2");
+        Ok("Copilot beside CA1+CA2 -> CP1 (own sequence)", CaAgentIdentity.NextFreeName("CP", held.Contains) == "CP1");
+        held.Add("CP1");
+        Ok("CP1 taken -> CP2", CaAgentIdentity.NextFreeName("CP", held.Contains) == "CP2");
+        Ok("Codex unaffected by CA/CP -> CX1", CaAgentIdentity.NextFreeName("CX", held.Contains) == "CX1");
+        Ok("CA numbering unaffected by CP1 -> CA3", CaAgentIdentity.NextFreeName(held.Contains) == "CA3");
+        Ok("empty prefix falls back to CA", CaAgentIdentity.NextFreeName("", null) == "CA1");
+        string cxExhausted = CaAgentIdentity.NextFreeName("CX", n => true);
+        Ok("exhausted CX fallback keeps its prefix", cxExhausted.StartsWith("CX-"), cxExhausted);
+
         // ---- TabLabel / IsDefaultTabName ----
         Ok("plain Terminal tab -> name alone", CaAgentIdentity.TabLabel("CA2", "Terminal 2") == "CA2");
         Ok("Terminal 12 -> name alone", CaAgentIdentity.TabLabel("CA2", "Terminal 12") == "CA2");
@@ -86,9 +110,16 @@ static class CaAgentIdentityTest
 
         // ---- Exit signal (7792e3e0 live test: pwsh -NoExit outlives Claude) ----
         string wrapped = CaAgentIdentity.WrapWithExitSignal("& 'claude' -n 'CA4'", "ab12cd34");
-        Ok("invocation sits inside try", wrapped.StartsWith("try { & 'claude' -n 'CA4' } finally { "));
+        Ok("invocation sits inside try", wrapped.Contains("try { & 'claude' -n 'CA4' } finally { "));
+        // cfb63b58 (Codex adversary): the title is reset BEFORE the try, so the finally's marker is
+        // always a change, even when a tab is relaunched in a console that already carries it.
+        int reset = wrapped.IndexOf("$Host.UI.RawUI.WindowTitle = 'Clarion Assistant';", StringComparison.Ordinal);
+        int tryAt = wrapped.IndexOf("try {", StringComparison.Ordinal);
+        Ok("title reset to a non-marker value before the try", reset >= 0 && reset < tryAt, "reset@" + reset + " try@" + tryAt);
         Ok("finally drops MULTITERMINAL_NAME", wrapped.Contains("Remove-Item Env:MULTITERMINAL_NAME"));
-        Ok("finally retitles the console", wrapped.Contains("$Host.UI.RawUI.WindowTitle = '"));
+        int finallyAt = wrapped.IndexOf("finally {", StringComparison.Ordinal);
+        Ok("finally retitles the console",
+            finallyAt >= 0 && wrapped.IndexOf("$Host.UI.RawUI.WindowTitle = '", finallyAt, StringComparison.Ordinal) > finallyAt);
         Ok("finally's title concatenates to the tab's marker",
             wrapped.Replace("' + '", "").Contains("WindowTitle = 'ca-assistant-exited:ab12cd34'"));
         // Pipeline run 3 (debugger): the command line itself must not carry the marker verbatim.
@@ -195,9 +226,85 @@ static class CaAgentIdentityTest
                 Ok("Claude command wrapped with the exit signal", wrap >= 0, "wrap@" + wrap);
                 Ok("output handler watches for the exit signal and releases the name",
                     sees >= 0 && seesRelease > sees && seesRelease < dataEnd, "sees@" + sees + " release@" + seesRelease + " end@" + dataEnd);
+
+                // cfb63b58: Copilot and Codex tabs get CP<n> / CX<n>, assigned at the top of their
+                // builders (before any abort, which releases it), and their CLIs are wrapped with
+                // the exit signal so the name is released when the CLI exits.
+                foreach (var be in new[] { new[] { "Copilot", "copilotInvocation" }, new[] { "Codex", "codexBase + modelFlag + effortFlag" } })
+                {
+                    int build = src.IndexOf("private BuiltBackendCommand Build" + be[0] + "Command(", StringComparison.Ordinal);
+                    int buildEnd = build < 0 ? -1 : src.IndexOf("\n        }", build, StringComparison.Ordinal);
+                    int assign = build < 0 ? -1 : src.IndexOf("AssignTabShortName(tab, \"" + be[0] + "\");", build, StringComparison.Ordinal);
+                    int firstAbort = build < 0 ? -1 : src.IndexOf("AbortLaunch(tab)", build, StringComparison.Ordinal);
+                    int beWrap = build < 0 ? -1 : src.IndexOf("CaAgentIdentity.WrapWithExitSignal(" + be[1] + ", tab.Id)", build, StringComparison.Ordinal);
+                    Ok(be[0] + " builder assigns its short name", assign >= 0 && assign < buildEnd, "assign@" + assign + " end@" + buildEnd);
+                    Ok(be[0] + " name assigned before any abort", assign >= 0 && (firstAbort < 0 || firstAbort > buildEnd || assign < firstAbort),
+                        "assign@" + assign + " abort@" + firstAbort);
+                    Ok(be[0] + " CLI wrapped with the exit signal", beWrap >= 0 && beWrap < buildEnd, "wrap@" + beWrap + " end@" + buildEnd);
+                }
+                int assignHelper = src.IndexOf("private void AssignTabShortName(TerminalTab tab, string backend)", StringComparison.Ordinal);
+                int assignHelperEnd = assignHelper < 0 ? -1 : src.IndexOf("\n        }", assignHelper, StringComparison.Ordinal);
+                int usesPrefix = assignHelper < 0 ? -1 : src.IndexOf("CaAgentIdentity.PrefixForBackend(backend)", assignHelper, StringComparison.Ordinal);
+                int storesName = assignHelper < 0 ? -1 : src.IndexOf("tab.AgentName = name;", assignHelper, StringComparison.Ordinal);
+                int relabels = assignHelper < 0 ? -1 : src.IndexOf("CaAgentIdentity.TabLabel(name, tab.BaseName)", assignHelper, StringComparison.Ordinal);
+                Ok("AssignTabShortName uses the backend's prefix", usesPrefix >= 0 && usesPrefix < assignHelperEnd);
+                Ok("AssignTabShortName stores the name on the tab (exit signal + release key on it)",
+                    storesName >= 0 && storesName < assignHelperEnd);
+                Ok("AssignTabShortName relabels the tab", relabels >= 0 && relabels < assignHelperEnd);
+                int resolvePrefixed = src.IndexOf("private string ResolveUniqueAgentName(TerminalTab tab, string prefix)", StringComparison.Ordinal);
+                int rosterGate = resolvePrefixed < 0 ? -1 : src.IndexOf("if (prefix == Services.CaAgentIdentity.ClaudePrefix)", resolvePrefixed, StringComparison.Ordinal);
+                int roster = resolvePrefixed < 0 ? -1 : src.IndexOf("ListTerminals()", resolvePrefixed, StringComparison.Ordinal);
+                Ok("only CA names consult the MultiTerminal roster", rosterGate >= 0 && roster > rosterGate,
+                    "gate@" + rosterGate + " roster@" + roster);
+
+                // ---- F4 (9e1bd280 live test 2026-10-19): a New Chat tab opened while demoleg was open read bare
+                // "CA1", and stayed "CA1" after the IDE switched to UltimateSQLTest though its tools followed. ----
+                string newChat = Body(src, "private void OnNewChat(object sender, EventArgs e)");
+                Ok("F4: New Chat tab follows the IDE's solution",
+                    newChat != null && newChat.Contains("tab.FollowsIdeSolution = true;"));
+                Ok("F4: New Chat tab is labelled with the IDE's open solution before it launches",
+                    newChat != null && newChat.Contains("GetOpenSolutionPath()") && newChat.Contains("RetitleFollowingTab(tab, ideSln);")
+                    && newChat.IndexOf("RetitleFollowingTab(tab, ideSln);", StringComparison.Ordinal)
+                       < newChat.IndexOf("_tabManager.ActivateTab(tab.Id);", StringComparison.Ordinal));
+                string openSln = Body(src, "private void OpenSolutionInNewTab(string slnPath)");
+                Ok("F4: a tab opened on a solution follows the IDE's solution",
+                    openSln != null && openSln.Contains("tab.FollowsIdeSolution = true;"));
+                string retitleAll = Body(src, "private void RetitleSolutionTabs(string newPath)");
+                Ok("F4: RetitleSolutionTabs relabels every non-home tab through RetitleFollowingTab",
+                    retitleAll != null && retitleAll.Contains("RetitleFollowingTab(tab, newPath)"));
+                string retitleOne = Body(src, "private void RetitleFollowingTab(TerminalTab tab, string newPath)");
+                Ok("F4: only a following tab is relabelled (project/class/Evaluate tabs keep their context)",
+                    retitleOne != null && retitleOne.Contains("if (!tab.FollowsIdeSolution) return;"));
+                Ok("F4: the label's context is the IDE's solution, or the tab's plain name with none",
+                    retitleOne != null && retitleOne.Contains("CaAgentIdentity.IdeSolutionContext(tab.DefaultName, newPath)")
+                    && retitleOne.Contains("CaAgentIdentity.TabLabel(tab.AgentName, followed)"));
+                string poll = Body(src, "private void PollForSolutionChange()");
+                Ok("F4: every poll retitles (the IDE closing or reopening a solution is no switch)",
+                    poll != null && poll.Contains("RetitleSolutionTabs(slnPath);"));
+
+                string tm = Path.Combine(args[0], "Terminal", "TabManager.cs");
+                string tmSrc = File.Exists(tm) ? File.ReadAllText(tm) : "";
+                string create = Body(tmSrc, "public TerminalTab CreateTerminalTab(string name, WebViewTerminalRenderer renderer)");
+                Ok("F4: every terminal tab remembers its plain 'Terminal N' name",
+                    create != null && create.Contains("DefaultName = \"Terminal \" + _terminalCounter,"));
             }
         }
         else Console.WriteLine("  (launch-order checks skipped: no project dir argument)");
+
+        // ---- IdeSolutionContext (9e1bd280, live test F4): a following tab's context is the IDE's solution ----
+        const string demo = @"C:\Clarion12\Examples\demoleg.sln", ult = @"C:\Clarion10v8\Examples\UltimateSQLTest.sln";
+        string atLaunch = CaAgentIdentity.IdeSolutionContext("Terminal 1", demo);
+        Ok("F4: a New Chat tab opened while demoleg is open reads 'CA1 · demoleg'",
+            CaAgentIdentity.TabLabel("CA1", atLaunch) == "CA1 · demoleg", CaAgentIdentity.TabLabel("CA1", atLaunch));
+        string moved = CaAgentIdentity.IdeSolutionContext("Terminal 1", ult);
+        Ok("F4: after the IDE switches to UltimateSQLTest it reads 'CA1 · UltimateSQLTest'",
+            CaAgentIdentity.TabLabel("CA1", moved) == "CA1 · UltimateSQLTest", CaAgentIdentity.TabLabel("CA1", moved));
+        string closed = CaAgentIdentity.IdeSolutionContext("Terminal 1", null);
+        Ok("F4: with no solution open it reads the agent name alone",
+            CaAgentIdentity.TabLabel("CA1", closed) == "CA1", CaAgentIdentity.TabLabel("CA1", closed));
+        Ok("F4: an empty IDE path counts as none", CaAgentIdentity.IdeSolutionContext("Terminal 3", "") == "Terminal 3");
+        Ok("F4: Copilot / Codex tabs label the same way",
+            CaAgentIdentity.TabLabel("CP1", moved) == "CP1 · UltimateSQLTest" && CaAgentIdentity.TabLabel("CX2", closed) == "CX2");
 
         Console.WriteLine();
         Console.WriteLine(fail == 0 ? "ALL " + pass + " CHECKS PASSED" : fail + " FAILED, " + pass + " passed");

@@ -95,8 +95,11 @@ namespace ClarionCodeGraph.Parsing
         internal sealed class ItemizeScope
         {
             // "[label] ITEMIZE[(seed)][,PRE[(prefix)]]" — the label is optional (blank-label blocks are indented).
+            // ITEMIZE is only followed by "(", "," or the end of the line. ITEMIZE may itself label
+            // data ("Itemize LONG", "Itemize EQUATE(3)"), and there the next word is the declaration's
+            // own keyword: that line is not an opener.
             private static readonly Regex OpenRegex = new Regex(
-                @"^\s*(?:([A-Za-z_][\w:]*)\s+)?ITEMIZE\b(.*)$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+                @"^\s*(?:([A-Za-z_][\w:]*)\s+)?ITEMIZE\s*([(,].*)?$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
             private static readonly Regex PreRegex = new Regex(
                 @",\s*PRE\b(?:\s*\(\s*([A-Za-z_][\w:]*)?\s*\))?", RegexOptions.Compiled | RegexOptions.IgnoreCase);
             private static readonly Regex CloseRegex = new Regex(
@@ -217,6 +220,33 @@ namespace ClarionCodeGraph.Parsing
         private static readonly Regex ExternalAttrRegex = new Regex(
             @",\s*EXTERNAL\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
+        // MODULE('x.clw') / LINK('x.clw'[,flag]) in a CLASS line's attribute list (GH #245): the files the
+        // compiler builds for the class whenever its declaration is INCLUDEd.
+        private static readonly Regex ClassModuleAttrRegex = new Regex(
+            @"\b(?:MODULE|LINK)\s*\(\s*'([^']+)'", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        /// <summary>
+        /// The .clw files a CLASS line's attributes name in MODULE(...) and LINK(...), in order and de-duplicated,
+        /// or null when there are none. A LINK naming a .lib/.obj is not source and is left out. A trailing comment
+        /// is stripped first so a quoted name in it cannot count.
+        /// </summary>
+        internal List<string> ImplementationModulesOf(string classAttributes)
+        {
+            if (string.IsNullOrEmpty(classAttributes)) return null;
+            List<string> names = null;
+            foreach (Match m in ClassModuleAttrRegex.Matches(StripInlineComment(classAttributes)))
+            {
+                string name = m.Groups[1].Value.Trim();
+                if (!name.EndsWith(".clw", StringComparison.OrdinalIgnoreCase)) continue;
+                if (names == null) names = new List<string>();
+                bool seen = false;
+                foreach (string n in names)
+                    if (string.Equals(n, name, StringComparison.OrdinalIgnoreCase)) { seen = true; break; }
+                if (!seen) names.Add(name);
+            }
+            return names;
+        }
+
         /// <summary>The declaration/definition line as a self-explaining preview, trimmed and
         /// capped — so query results identify themselves without a file read (b7553893).</summary>
         private static string Preview(string line)
@@ -249,22 +279,27 @@ namespace ClarionCodeGraph.Parsing
             bool inModule = false;
             string currentModuleFile = null;
             int mapDepth = 0;
+            var conditionals = new ConditionalBlocks();
 
             for (int i = 0; i < lines.Length; i++)
             {
                 string line = lines[i];
                 int lineNum = i + 1;
 
-                // Strip line continuation: join lines ending with |
-                while (line.TrimEnd().EndsWith("|") && i + 1 < lines.Length)
-                {
-                    line = line.TrimEnd();
-                    line = line.Substring(0, line.Length - 1) + " " + lines[++i].TrimStart();
-                }
+                // Strip line continuation: join lines ending with | (a | inside a comment is not one)
+                line = JoinContinuation(lines, ref i);
+
+                bool conditional = conditionals.Advance(lines, i, line);
 
                 // OMIT/COMPILE('terminator') — skip block
+                int skipFrom = i;
                 i = SkipConditionalBlock(lines, i, line);
-                if (i > lineNum - 1) { line = lines[i]; lineNum = i + 1; }
+                if (i > skipFrom)
+                {
+                    conditional = conditionals.Skipped(lines, skipFrom + 1, i);
+                    line = lines[i];
+                    lineNum = i + 1;
+                }
 
                 // Detect PROGRAM keyword
                 if (ProgramRegex.IsMatch(line))
@@ -364,8 +399,8 @@ namespace ClarionCodeGraph.Parsing
                     }
                 }
 
-                // Detect INCLUDE statements in MAP
-                var includeMatch = IncludeRegex.Match(line);
+                // Detect INCLUDE statements in MAP (not in a comment: "! INCLUDE('x.inc')" is not read)
+                var includeMatch = IncludeRegex.Match(StripInlineComment(line));
                 if (includeMatch.Success)
                 {
                     result.Symbols.Add(new ClarionSymbol
@@ -375,7 +410,8 @@ namespace ClarionCodeGraph.Parsing
                         FilePath = filePath,
                         LineNumber = lineNum,
                         ProjectId = projectId,
-                        Scope = "global"
+                        Scope = "global",
+                        Conditional = conditional
                     });
                 }
             }
@@ -452,6 +488,24 @@ namespace ClarionCodeGraph.Parsing
         /// </summary>
         public ParseResult ParseMemberFile(string filePath, int projectId, HashSet<string> knownProcedures, int startLine = 0)
         {
+            return ParseMemberFileCore(filePath, projectId, knownProcedures, startLine, false);
+        }
+
+        /// <summary>
+        /// GH #246: parse a file INCLUDEd into a PROGRAM's global data section as what it is there - more of that
+        /// section. Its declarations come back scope='global' (the same DATA machinery the PROGRAM file uses) and
+        /// its own INCLUDEs carry <see cref="ClarionSymbol.InGlobalData"/>. ParseIncFile, which every .inc also goes
+        /// through, emits classes, equates and includes but never file-level data, so this is the only place
+        /// "ActiveThreads ctQ_ActiveThreads:ThreadSafe" in such an .inc becomes a row. Callers keep only the
+        /// variables from the result: the classes and equates are ParseIncFile's.
+        /// </summary>
+        public ParseResult ParseGlobalDataInclude(string filePath, int projectId)
+        {
+            return ParseMemberFileCore(filePath, projectId, null, 0, true);
+        }
+
+        private ParseResult ParseMemberFileCore(string filePath, int projectId, HashSet<string> knownProcedures, int startLine, bool globalDataInclude)
+        {
             var result = new ParseResult { FilePath = filePath };
             if (!File.Exists(filePath))
                 return result;
@@ -465,7 +519,9 @@ namespace ClarionCodeGraph.Parsing
             // enclosing procedure is recoverable via the routine symbol's own ParentName.
             string currentRoutine = null;
             bool inCode = false;
-            bool inData = false; // True when between PROCEDURE def and CODE keyword
+            // True when between PROCEDURE def and CODE keyword. A global-data include starts INSIDE the PROGRAM's
+            // global data section, so it starts open.
+            bool inData = globalDataInclude;
             int dataGroupDepth = 0; // Track nested GROUP/QUEUE/RECORD in DATA sections
             var itemize = new ItemizeScope(); // ITEMIZE blocks in DATA sections (members named Prefix:Name)
             var localRoutines = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -474,7 +530,7 @@ namespace ClarionCodeGraph.Parsing
             bool inClassBody = false;
             int classEndDepth = 0;
             // PROGRAM (main) file: pre-procedure data is the app's GLOBAL data section
-            bool isProgramFile = false;
+            bool isProgramFile = globalDataInclude;
             // Explicit MAP tracking. Pass 1 (ParseMainFile) owns MAP contents; here a MAP must be
             // skipped WHOLESALE, because prototypes inside it may legally start at column 0
             // ("TestSignatureFlow PROCEDURE, LONG" — the codegraph-repro fixture compiles) and
@@ -484,22 +540,21 @@ namespace ClarionCodeGraph.Parsing
             // exactly that shape, and by nested MODULE(...)...END decrementing the depth early.
             bool inMap = false;
             int mapDepth = 0;
+            var conditionals = new ConditionalBlocks();
 
             for (int i = startLine; i < lines.Length; i++)
             {
                 string line = lines[i];
                 int lineNum = i + 1;
 
-                // Strip line continuation
-                while (line.TrimEnd().EndsWith("|") && i + 1 < lines.Length)
-                {
-                    line = line.TrimEnd();
-                    line = line.Substring(0, line.Length - 1) + " " + lines[++i].TrimStart();
-                }
+                // Strip line continuation (a | inside a comment is not one)
+                line = JoinContinuation(lines, ref i);
+
+                bool conditional = conditionals.Advance(lines, i, line);
 
                 // OMIT/COMPILE('terminator') — skip block
                 int newI = SkipConditionalBlock(lines, i, line);
-                if (newI > i) { i = newI; continue; }
+                if (newI > i) { conditionals.Skipped(lines, i + 1, newI); i = newI; continue; }
 
                 // Inside a MAP: consume until its own END, tracking nested MODULE(...)/MAP blocks.
                 // Everything in here is prototype territory — no symbols, no state changes.
@@ -570,6 +625,23 @@ namespace ClarionCodeGraph.Parsing
                             currentClassName = null;
                         }
                         continue;
+                    }
+
+                    // A GROUP/QUEUE/RECORD member opens its own END. Without counting it, its END closed the
+                    // CLASS early and the members after it read as data (GH #246: in a global-data .inc they
+                    // became phantom globals). Counted the way ParseIncFile counts it, self-closing forms
+                    // included. Confined to global-data includes for now: the same gap exists for a .clw's own
+                    // CLASS bodies, but changing that shifts every existing index and is its own ticket.
+                    if (globalDataInclude)
+                    {
+                        var nested = ClassGroupQueueRecordDeclRegex.Match(StripInlineComment(line.TrimStart()));
+                        if (nested.Success)
+                        {
+                            bool selfClosing = nested.Groups["term"].Success ||
+                                Regex.IsMatch(nested.Value.TrimEnd(), @"(\bEND|\.)\s*$", RegexOptions.IgnoreCase);
+                            if (!selfClosing) classEndDepth++;
+                            continue;
+                        }
                     }
 
                     // Method prototype inside CLASS: indented "MethodName PROCEDURE(...)"
@@ -766,7 +838,8 @@ namespace ClarionCodeGraph.Parsing
                         ProjectId = projectId,
                         ParentName = parentClass,
                         Scope = "global",
-                        SourcePreview = Preview(line)
+                        SourcePreview = Preview(line),
+                        ImplementationModules = ImplementationModulesOf(classMatch.Groups[3].Value)
                     });
 
                     // Enter CLASS body to extract method prototypes
@@ -823,8 +896,8 @@ namespace ClarionCodeGraph.Parsing
                     continue;
                 }
 
-                // Detect INCLUDE
-                var includeMatch = IncludeRegex.Match(line);
+                // Detect INCLUDE (not in a comment: "! INCLUDE('x.inc')" is not read)
+                var includeMatch = IncludeRegex.Match(StripInlineComment(line));
                 if (includeMatch.Success)
                 {
                     result.Symbols.Add(new ClarionSymbol
@@ -833,7 +906,12 @@ namespace ClarionCodeGraph.Parsing
                         Type = "include",
                         FilePath = filePath,
                         LineNumber = lineNum,
-                        ProjectId = projectId
+                        ProjectId = projectId,
+                        // GH #246: an INCLUDE in the PROGRAM's global data section - not in a MAP or CLASS body
+                        // (both consumed above), a procedure, a routine or a GROUP/QUEUE body.
+                        InGlobalData = isProgramFile && inData && !inCode && currentProcedure == null &&
+                                       currentRoutine == null && dataGroupDepth == 0,
+                        Conditional = conditional
                     });
                 }
 
@@ -1130,22 +1208,21 @@ namespace ClarionCodeGraph.Parsing
             bool inClassBody = false;
             int classEndDepth = 0;
             var itemize = new ItemizeScope();
+            var conditionals = new ConditionalBlocks();
 
             for (int i = 0; i < lines.Length; i++)
             {
                 string line = lines[i];
                 int lineNum = i + 1;
 
-                // Strip line continuation
-                while (line.TrimEnd().EndsWith("|") && i + 1 < lines.Length)
-                {
-                    line = line.TrimEnd();
-                    line = line.Substring(0, line.Length - 1) + " " + lines[++i].TrimStart();
-                }
+                // Strip line continuation (a | inside a comment is not one)
+                line = JoinContinuation(lines, ref i);
+
+                bool conditional = conditionals.Advance(lines, i, line);
 
                 // OMIT/COMPILE('terminator') — skip block
                 int newI = SkipConditionalBlock(lines, i, line);
-                if (newI > i) { i = newI; continue; }
+                if (newI > i) { conditionals.Skipped(lines, i + 1, newI); i = newI; continue; }
 
                 // Inside CLASS/INTERFACE body: extract method prototypes
                 if (inClassBody)
@@ -1395,7 +1472,8 @@ namespace ClarionCodeGraph.Parsing
                         ProjectId = projectId,
                         ParentName = parentClass,
                         Scope = "global",
-                        SourcePreview = Preview(line)
+                        SourcePreview = Preview(line),
+                        ImplementationModules = ImplementationModulesOf(classMatch.Groups[3].Value)
                     });
 
                     currentClassName = className;
@@ -1446,7 +1524,7 @@ namespace ClarionCodeGraph.Parsing
                     continue;
                 }
 
-                var includeMatch = IncludeRegex.Match(line);
+                var includeMatch = IncludeRegex.Match(StripInlineComment(line));
                 if (includeMatch.Success)
                 {
                     result.Symbols.Add(new ClarionSymbol
@@ -1455,12 +1533,110 @@ namespace ClarionCodeGraph.Parsing
                         Type = "include",
                         FilePath = filePath,
                         LineNumber = lineNum,
-                        ProjectId = projectId
+                        ProjectId = projectId,
+                        Conditional = conditional
                     });
                 }
             }
 
             return result;
+        }
+
+        /// <summary>
+        /// The COMPILE('term', expr) / OMIT('term', expr) blocks a line sits in. SkipConditionalBlock parses
+        /// their contents as code (CodeGraph cannot evaluate a project's defines); this only remembers that
+        /// it was conditional, so an INCLUDE in there that does not resolve is not reported as a gap.
+        /// An unconditional OMIT('term') is skipped wholesale and never reaches here; an unconditional
+        /// COMPILE('term') is always compiled, so neither opens a block. Nor does an include guard (see
+        /// <see cref="IsIncludeGuard"/>): its block is the whole file, compiled on the first read.
+        /// </summary>
+        internal sealed class ConditionalBlocks
+        {
+            private readonly List<string> _terminators = new List<string>();
+
+            /// <summary>Call once per line, in order; <paramref name="index"/> is the line's (last physical) index in
+            /// <paramref name="lines"/>. True when the line is inside a conditional block.</summary>
+            public bool Advance(string[] lines, int index, string line)
+            {
+                var match = OmitCompileRegex.Match(line);
+                if (match.Success && match.Groups[3].Success && !IsIncludeGuard(lines, index, match))
+                {
+                    _terminators.Add(match.Groups[2].Value);
+                    return true;
+                }
+                return Close(line);
+            }
+
+            /// <summary>
+            /// The lines an unconditional OMIT skipped (<paramref name="from"/>..<paramref name="to"/>, the terminator
+            /// line included) never reach <see cref="Advance"/>, but an outer conditional block can end among them: in a
+            /// build that omits the outer block the compiler stops omitting at the outer terminator, wherever it is.
+            /// Returns what <see cref="Advance"/> would for the last of them.
+            /// </summary>
+            public bool Skipped(string[] lines, int from, int to)
+            {
+                bool inside = _terminators.Count > 0;
+                for (int k = from; k <= to && k < lines.Length; k++)
+                    inside = Close(lines[k]);
+                return inside;
+            }
+
+            private bool Close(string line)
+            {
+                if (_terminators.Count == 0) return false;
+                // The terminator line still belongs to its block (same substring rule as SkipConditionalBlock).
+                _terminators.RemoveAll(t => line.Contains(t));
+                return true;
+            }
+        }
+
+        /// <summary>
+        /// Clarion's include guard, which nearly every LibSrc .inc opens with (ABUTIL.INC):
+        /// <code>
+        ///  OMIT('_EndOfInclude_',_UtilitiesPresent_)
+        /// _UtilitiesPresent_ EQUATE(1)
+        ///  ...
+        /// _EndOfInclude_
+        /// </code>
+        /// The OMIT's condition is a symbol its own block defines, so on the first read of the file it is undefined, the
+        /// OMIT is not taken and the whole block compiles; only a second read is omitted. So what is inside is as
+        /// unconditional as the file itself - an INCLUDE in there that does not resolve is a real gap. Recognised as an
+        /// OMIT whose condition is a bare symbol that an EQUATE at column 0 declares before the block's terminator.
+        /// COMPILE is never a guard: an undefined symbol leaves its block out.
+        /// </summary>
+        internal static bool IsIncludeGuard(string[] lines, int index, Match omitCompile)
+        {
+            if (lines == null || !omitCompile.Success || !omitCompile.Groups[3].Success) return false;
+            if (!string.Equals(omitCompile.Groups[1].Value, "OMIT", StringComparison.OrdinalIgnoreCase)) return false;
+            string symbol = omitCompile.Groups[3].Value.Trim();
+            if (!GuardSymbolRegex.IsMatch(symbol)) return false;
+            string terminator = omitCompile.Groups[2].Value;
+            var equate = new Regex("^" + Regex.Escape(symbol) + @"\s+EQUATE\b", RegexOptions.IgnoreCase);
+            for (int k = index + 1; k < lines.Length; k++)
+            {
+                if (lines[k].Contains(terminator)) return false;
+                if (equate.IsMatch(lines[k])) return true;
+            }
+            return false;
+        }
+
+        private static readonly Regex GuardSymbolRegex = new Regex(@"^[A-Za-z_][\w:]*$", RegexOptions.Compiled);
+
+        /// <summary>
+        /// The logical line starting at lines[i]: a line whose CODE ends with | continues on the next one. A | inside a
+        /// comment is not a continuation ("! note |" followed by an INCLUDE must not swallow the INCLUDE), and a comment
+        /// after the | ("X LONG, |  ! why") does not stop one. Leaves <paramref name="i"/> on the last line joined.
+        /// </summary>
+        private string JoinContinuation(string[] lines, ref int i)
+        {
+            string line = lines[i];
+            while (i + 1 < lines.Length)
+            {
+                string code = StripInlineComment(line).TrimEnd();
+                if (!code.EndsWith("|")) break;
+                line = code.Substring(0, code.Length - 1) + " " + lines[++i].TrimStart();
+            }
+            return line;
         }
 
         /// <summary>

@@ -433,6 +433,38 @@
         }
     }
 
+    /* Code excluded by OMIT/COMPILE (GH #264; installClarionOmitDimming in clarion-language.js). Greyed
+       the way the native editor shows it: the text fades toward the background (opacity, so every
+       token colour dims evenly in either theme) over a faint wash like the native WhiteSmoke band.
+       The wash stacks on .embed-readonly-line in the embeditor, so omitted generated code still reads
+       as both generated and omitted. */
+    .ca-omitted-text { opacity: 0.5; }
+    .ca-omitted-line { background: rgba(0, 0, 0, 0.035); }
+    body:not(.light) .ca-omitted-text { opacity: 0.45; }
+    body:not(.light) .ca-omitted-line { background: rgba(255, 255, 255, 0.03); }
+    /* High contrast: a 50% fade on pure black/white is still legible, but the alpha wash vanishes —
+       swap it for the dotted left edge, distinct from the read-only line's solid one. */
+    .monaco-editor.hc-black .ca-omitted-text,
+    .monaco-editor.hc-light .ca-omitted-text { opacity: 0.6; }
+    .monaco-editor.hc-black .ca-omitted-line,
+    .monaco-editor.hc-light .ca-omitted-line {
+        background: none;
+        box-sizing: border-box;
+        border-left: 3px dotted rgba(127, 127, 127, 0.9);
+    }
+    /* A block whose condition the editor can't evaluate (project defines such as _DEBUG_): the text
+       keeps its normal colours, and a faint bar in the line-decorations margin, directive line through
+       terminator line, says "this is conditional". */
+    .ca-conditional-margin { box-sizing: border-box; border-left: 3px solid rgba(30, 102, 245, 0.35); }
+    body:not(.light) .ca-conditional-margin { border-left-color: rgba(137, 180, 250, 0.4); }
+    .monaco-editor.hc-black .ca-conditional-margin,
+    .monaco-editor.hc-light .ca-conditional-margin { border-left: 3px dashed rgba(127, 127, 127, 0.9); }
+    @media (forced-colors: active) {
+        .ca-omitted-text { forced-color-adjust: none; opacity: 0.6; }
+        .ca-omitted-line { forced-color-adjust: none; box-sizing: border-box; border-left: 3px dotted rgba(127, 127, 127, 0.9); }
+        .ca-conditional-margin { forced-color-adjust: none; border-left: 3px dashed rgba(127, 127, 127, 0.9); }
+    }
+
     /* ---------- Find & Replace panel (Clarion-style: results grid of every match) ---------- */
     :root { --find-accent: #89b4fa; --find-hit: rgba(137,180,250,0.35); --find-hit-border: #89b4fa; --on-fg: #1e1e2e; --find-fz: 12px; }
     body.light { --find-accent: #1e66f5; --find-hit: rgba(30,102,245,0.22); --find-hit-border: #1e66f5; --on-fg: #eff1f5; }
@@ -697,6 +729,74 @@
     .monaco-editor .monaco-hover {
         transform: translateX(30px);
         font-size: var(--ca-hover-font-size, 12px);
+    }
+    /* The hover's resize edge (Monaco 0.4x+, a .monaco-sash on the card's right border) sits over the
+       last few pixels of the card, and the card is exactly as wide as its longest line - so the last word
+       of that line (a clickable attribute on a control card) was under the resize cursor and could not be
+       clicked. Extra right padding (Monaco's default is 4px 8px) keeps text clear of the edge. */
+    .monaco-editor .monaco-hover .hover-contents:not(.html-hover-contents) {
+        padding-right: 20px;
+    }
+    /* Attribute edit links on a hover card (applyAttributeEditLink) drawn as chips. Monaco tags every
+       hover link with its target (data-href) and title, so these rules reach only the
+       command:clarion.applyAttributeEdit?... links: a set attribute ("Remove ..." title) is a filled chip,
+       an available one ("Add ...") an outlined chip. Theme colours, so light and dark themes both work. */
+    .monaco-editor .monaco-hover a[data-href^="command:clarion.applyAttributeEdit"] {
+        display: inline-block;
+        padding: 0 6px;
+        margin: 1px 0;
+        border-radius: 9px;
+        border: 1px solid var(--vscode-textLink-foreground, #3794ff);
+        /* one step below the card's own size, which follows the editor font and zoom */
+        font-size: calc(var(--ca-hover-font-size, 12px) - 1px);
+        line-height: 1.45;
+        text-decoration: none !important;
+        cursor: pointer;
+    }
+    .monaco-editor .monaco-hover a[data-href^="command:clarion.applyAttributeEdit"][title^="Add "] {
+        background: transparent;
+        color: var(--vscode-textLink-foreground, #3794ff) !important;
+    }
+    .monaco-editor .monaco-hover a[data-href^="command:clarion.applyAttributeEdit"][title^="Remove "] {
+        background: var(--vscode-textLink-foreground, #3794ff);
+        color: var(--vscode-editorHoverWidget-background, #fff) !important;
+    }
+    .monaco-editor .monaco-hover a[data-href^="command:clarion.applyAttributeEdit"]:hover {
+        box-shadow: 0 0 0 1px var(--vscode-textLink-foreground, #3794ff);
+        filter: brightness(1.15);
+    }
+    /* The hover footer row (hoverContentsWithFooter): a card's second content entry, drawn like the bar
+       Monaco puts under a problem hover (View Problem / Quick Fix) — its background, a rule above it,
+       12px text on a 22px line, the links 16px apart. Monaco renders every entry of one hover result as a
+       .markdown-hover in the same row, and the page's cards are a single entry, so the last of two or
+       more is always a footer.
+       Sticky (geircodes, GH #270 follow-up): a tall card (a routine card with the first lines of its
+       body) is taller than the hover, and the bar sits inside the same scroll area, so without this it
+       shows only once scrolled to the end. Sticky to the bottom, the card scrolls behind it. A short card
+       looks the same either way. */
+    .monaco-editor .monaco-hover .hover-row-contents > .markdown-hover:not(:first-child):last-child {
+        background-color: var(--vscode-editorHoverWidget-statusBarBackground);
+        border-top: 1px solid var(--vscode-editorHoverWidget-border);
+        position: sticky;
+        bottom: 0;
+        z-index: 1;
+    }
+    .monaco-editor .monaco-hover .hover-row-contents > .markdown-hover:not(:first-child):last-child > .hover-contents {
+        padding-top: 0;
+        padding-bottom: 0;
+        font-size: 12px;
+        line-height: 22px;
+    }
+    .monaco-editor .monaco-hover .hover-row-contents > .markdown-hover:not(:first-child):last-child p {
+        margin: 0;
+        font-family: inherit;
+    }
+    .monaco-editor .monaco-hover .hover-row-contents > .markdown-hover:not(:first-child):last-child a {
+        margin-right: 16px;
+        white-space: nowrap;
+    }
+    .monaco-editor .monaco-hover .hover-row-contents > .markdown-hover:not(:first-child):last-child a:last-child {
+        margin-right: 0;
     }
 </style>
 </head>
@@ -987,6 +1087,9 @@
     var liveLinked = false;       // true when THIS tab holds the native embed open — its save is already save-and-exit
     var fileMode = false;         // true when the tab edits a plain source FILE — whole buffer editable,
                                   // no slot guard/decorations, save posts full text, embed nav disabled
+    var generatedSource = false;  // file mode only: the host says this file is a module of an open app, i.e.
+                                  // template-generated, so edits are lost on the next generate (GH #263 Q2:
+                                  // hover attribute chips render as plain names there)
     var reloadArmed = false;      // two-click confirm for Reload (discards edits)
     var isDirty = false;          // unsaved-changes flag — drives the ● indicator in the title banner
     var baseTitle = '(no procedure)';   // filename/procedure name without the dirty marker
@@ -1198,6 +1301,13 @@
                 showToast('Restored your unsaved edits from the interrupted embeditor session — Ctrl+S to save them.', true, true);
             }
         } catch (e) { }
+    }
+
+    // Restore slot texts now, or — when they arrive before the async source fetch has filled the model —
+    // park them until applySource's tail picks them up (pendingRestoreSlots).
+    function applyOrParkSlots(slots) {
+        if (embedRanges.length && editor && editor.getModel().getLineCount() > 1) restoreSlotContents(slots);
+        else pendingRestoreSlots = slots;
     }
 
     // Embed mode's sibling of pushFileState (task d19c036d): mirror the edited slot texts to the host on
@@ -1599,6 +1709,9 @@
                 installColonSuggest(editor);    // "glo:" / "PROP:" opens completion (ticket 38158e98)
                 installFormatOnEnter(editor);   // format the completed line on Enter (Clarion-style)
                 installCaretBehindEol(editor);  // Clarion "Can move caret behind EOL" (inert until settings arm it)
+                // GH #264: grey out OMIT/COMPILE-excluded code like the native editor. Model-level, so the
+                // split pane (same model) shows it too; covers the CA Editor (fileMode) and the CA Embeditor.
+                if (typeof installClarionOmitDimming === 'function') installClarionOmitDimming(editor);
                 // GH #206: list Monaco's own actions in the gear panel's Keyboard table and apply any moved keys.
                 // After every addAction above, so this page's own right-click actions are listed too.
                 if (loadEditorActions(editor)) buildKeybindTable();
@@ -1677,6 +1790,7 @@
         embedRanges = msg.editableRanges || [];
         saveEnabled = !!msg.saveEnabled;
         fileMode = !!msg.fileMode;
+        generatedSource = fileMode && msg.generatedSource === true;   // the embeditor's own module is fine: its slots guard it
         // The slot checks run unless the host turns them off (the Embeditor's file-mode tab: LSP only). The CA
         // Editor overlay keeps them over the whole file, so this is NOT the same switch as fileMode. (1c685f2e)
         slotChecksEnabled = msg.slotChecks !== false;
@@ -1686,6 +1800,7 @@
         var tgRo = document.getElementById('tgRo');
         if (tgRo) tgRo.style.display = fileMode ? 'none' : '';
         currentFilePath = msg.filePath || '';
+        setEmbedDocPath(fileMode ? '' : (msg.docPath || ''));   // H1-a: links to it stay in the CA Embeditor
         breakpointsEnabled = !!msg.breakpointsEnabled;   // overlay: gutter-click toggles a breakpoint (not a bookmark)
         designerEnabled = !!msg.designerEnabled;         // overlay: Ctrl+D designs structures in plain source files
         var sb = document.getElementById('saveBtn');
@@ -2021,6 +2136,7 @@
         if (idleSyncTimer) clearTimeout(idleSyncTimer);
         idleSyncTimer = setTimeout(idleSync, IDLE_SYNC_MS);
         if (e && e.changes) markDirtyPieces(e.changes);   // R11b: an edited DATA piece travels as text
+        if (e && e.changes) invalidateLspComplOnEdit(editor && editor.getModel(), e.changes);   // GH #280
     }
     function idleSync() {
         idleSyncTimer = null;
@@ -2076,13 +2192,20 @@
         // '' is a MEANINGFUL insertText ("nothing left to insert"), so test for absence, not falsiness.
         var text = (it.insertText != null) ? it.insertText : it.label;
         var r = range;
+        // GH #281: from server v1.0.9 an attribute that takes a value comes as a snippet (insertTextFormat 2,
+        // "TIP('${1:text}')"): insert it as one, so the value is selected and Tab moves on. Only the
+        // server's own insertText is a snippet; the label (below) never is.
+        var snippet = it.insertTextFormat === 2 && it.insertText != null;
         if (colonRun && colonRun.indexOf(':') !== -1 &&
             label.toUpperCase().indexOf(colonRun.toUpperCase()) === 0) {
             text = label;
+            snippet = false;
             r = new monaco.Range(range.endLineNumber, range.endColumn - colonRun.length,
                                  range.endLineNumber, range.endColumn);
         }
+        var rules = monaco.languages.CompletionItemInsertTextRule;
         return {
+            insertTextRules: snippet ? (rules && rules.InsertAsSnippet != null ? rules.InsertAsSnippet : 4) : undefined,
             label: it.label,
             kind: lspKindToMonaco(it.kind),
             detail: it.detail || undefined,
@@ -3499,6 +3622,8 @@
                 // layer has nothing for "g:" yet) shows Monaco's "No suggestions" box, and while that box is up
                 // Monaco calls no provider at this caret again - not the late refresh, not Ctrl+Space (1328 log).
                 // An auto one that comes back empty just closes quietly.
+                // Noted first so the provider serves it from the cache rather than as a Ctrl+Space (GH #280).
+                if (typeof notePageSuggestTrigger === 'function') notePageSuggestTrigger(ed);
                 try { ed.trigger('clarion-colon', 'editor.action.triggerSuggest', { auto: true }); } catch (e) { }
             }, 0);
         });
@@ -4826,16 +4951,26 @@
     // Host-driven navigation (debugger / breakpoint-list click): reveal + position an ALREADY-open editor.
     // Gated on `ready` — a nav that arrives before Monaco finishes loading is parked and flushed on ready,
     // so the first click after opening a cold file still lands. 1-based line/column (Monaco-native).
+    // H1-b: a hover link's navigation starts at the HOVERED position, not the caret. msg.from carries it for a
+    // link revealed in place (the CA Embeditor's own document); for the CA Editor's link to its own file the
+    // host answers openLocation with a plain revealLine, which picks up pendingHoverOrigin (set by the link
+    // opener) when it lands on the clicked line within HOVER_ORIGIN_TTL_MS. Consumed once either way.
+    var pendingHoverOrigin = null;   // {from: {line, column}, line, at}
     function revealLineFromHost(msg) {
         if (!ready) { pendingReveal = msg; return; }
         var ln = parseInt(msg && msg.line, 10);
         if (!ln || ln < 1) return;
         var col = Math.max(1, parseInt(msg && msg.column, 10) || 1);
         var ed = activeEd();
+        var from = msg && msg.from;
+        var po = pendingHoverOrigin;
+        pendingHoverOrigin = null;
+        if (!from && po && po.line === ln && Date.now() - po.at <= HOVER_ORIGIN_TTL_MS) from = po.from;
         ln = clampLine(ln);
         // Host-driven jump (debugger / breakpoint list / search results) = explicit navigation:
         // record origin + target (pinned) so Back retraces it. See recordNavAt.
-        var p = ed.getPosition();
+        var p = from ? { lineNumber: clampLine(parseInt(from.line, 10) || 1), column: Math.max(1, parseInt(from.column, 10) || 1) }
+                     : ed.getPosition();
         if (p) recordNavAt(p.lineNumber, p.column);
         ed.setPosition({ lineNumber: ln, column: col });
         ed.revealLineInCenter(ln);
@@ -5517,7 +5652,7 @@
     // A new document (setSource): cached answers and the miss count belong to the previous procedure. The
     // model id survives a setValue, so the (model.id, line, wordStart) key alone would serve them. (5.9)
     function resetLocalFirstState() {
-        lspComplCache = {}; lspComplMisses = {}; localHoverShared = null;
+        lspComplCache = {}; lspComplMisses = {}; localHoverShared = null; pageSuggestTrigger = null;
         clearSpanMap();
     }
 
@@ -5731,11 +5866,68 @@
     // prefix EXTENDS the cached one. Below 2 chars the host skips its bare-prefix merges (globals, CodeGraph),
     // so a 0-1 char answer is not a superset of a longer prefix's - except in a member/qualifier context
     // (after '.', ':' or '?'), where the server returns the whole member list regardless of what is typed.
-    function lspCacheServes(c, line, wordStart, prefix, qualified) {
+    // GH #280: `lead` is the line's text left of the word (the receiver, e.g. "    SELF."): it stays the same
+    // while one word is typed, so a rewritten receiver at the same column is a new question.
+    function lspCacheServes(c, line, wordStart, prefix, qualified, lead) {
         if (!c || c.line !== line || c.wordStart !== wordStart) return false;
+        if (lead != null && c.lead != null && c.lead !== lead) return false;
         var cp = c.prefix.toUpperCase(), p = prefix.toUpperCase();
         if (p.indexOf(cp) !== 0) return false;
         return p.length === cp.length || cp.length >= 2 || qualified;
+    }
+    // GH #280: an answer that has NOTHING for the typed prefix is not reused - it may be a stale or incomplete
+    // list (the server re-read an .inc since) - but asked again, at most once per LSP_ZERO_MATCH_RETRY_MS of
+    // that answer, so typing on through a word the server does not know does not flood it.
+    var LSP_ZERO_MATCH_RETRY_MS = 500;
+    function lspAnswerHasNothingFor(c, prefix) {
+        if (!c.done || !c.resp) return false;              // still on its way (or deferred): keep waiting for it
+        var items = c.resp.items || [];
+        if (!items.length) return true;
+        if (prefix.length <= c.prefix.length) return false;
+        var P = prefix.toUpperCase();
+        return !items.some(function (it) { return completionMatchesPrefix(it, P); });
+    }
+    // GH #280: an edit outside the word the cached answer was asked for (another line, a line break, the text
+    // before the word) can change what the server would answer: drop that model's entry. Typing inside the
+    // word (same line, at or after its start) keeps it - that is the keystroke path the cache exists for.
+    function invalidateLspComplOnEdit(model, changes) {
+        if (!model || !changes || !changes.length) return;
+        var id = modelKey(model), c = lspComplCache[id];
+        if (!c) return;
+        for (var i = 0; i < changes.length; i++) {
+            var r = changes[i].range, t = String(changes[i].text || '');
+            if (!r || r.startLineNumber !== c.line || r.endLineNumber !== c.line || r.startColumn < c.wordStart ||
+                t.indexOf('\n') >= 0 || t.indexOf('\r') >= 0) {
+                delete lspComplCache[id];
+                return;
+            }
+        }
+    }
+    // Suggest the PAGE opens itself (refreshWhenLspLands, the ':' handler) reaches the provider as an Invoke, the
+    // same kind as Ctrl+Space. It must be served from the cache - that is why it was opened - so it is noted
+    // here and the provider does not count it as the user asking. Consumed by the first query at that caret.
+    var pageSuggestTrigger = null;     // {id, line, column, at}
+    function notePageSuggestTrigger(ed) {
+        try {
+            var m = ed && ed.getModel && ed.getModel(), p = ed && ed.getPosition && ed.getPosition();
+            pageSuggestTrigger = (m && p) ? { id: modelKey(m), line: p.lineNumber, column: p.column, at: rtNow() } : null;
+        } catch (e) { pageSuggestTrigger = null; }
+    }
+    function takePageSuggestTrigger(model, position) {
+        var t = pageSuggestTrigger;
+        if (!t || t.id !== modelKey(model) || t.line !== position.lineNumber || t.column !== position.column ||
+            rtNow() - t.at > 1000) return false;
+        pageSuggestTrigger = null;
+        return true;
+    }
+    // Ctrl+Space (or any Invoke the page did not start itself): the user is asking again. Monaco also sends
+    // Invoke for a quick suggest on a word's first letter and for the re-query after Backspace; asking the
+    // server again there costs one request per suggest session, not one per keystroke.
+    function isExplicitInvoke(model, position, context) {
+        var INVOKE = (monaco.languages.CompletionTriggerKind && monaco.languages.CompletionTriggerKind.Invoke != null)
+            ? monaco.languages.CompletionTriggerKind.Invoke : 0;
+        if (!context || context.triggerKind !== INVOKE) return false;
+        return !takePageSuggestTrigger(model, position);
     }
     // The cached LSP completion that serves this query, or a new request that becomes the cache entry.
     // While the version is being typed and unsynced (R12) - which is EVERY query while typing, since the
@@ -5743,11 +5935,15 @@
     // sent from the idle sync for this position (the cache matches later keystrokes by prefix extension, so
     // the version moving on does not matter), unless a newer entry replaced it meanwhile. The list is
     // local-only until then; the first keystroke after the pause is served the LSP answer. (F3)
-    function lspCompletionFor(model, position, wordStart, prefix, qualified) {
+    // GH #280: `explicit` (Ctrl+Space) always asks and replaces the entry; a served answer with nothing for the
+    // prefix is asked again (rate-limited); `lead` keys the entry on the text left of the word.
+    function lspCompletionFor(model, position, wordStart, prefix, qualified, lead, explicit) {
         var id = modelKey(model);
         var c = lspComplCache[id];
-        if (lspCacheServes(c, position.lineNumber, wordStart, prefix, qualified)) return c;
-        c = { line: position.lineNumber, wordStart: wordStart, prefix: prefix, done: false, resp: null, sentAt: 0, deferred: false };
+        if (!explicit && lspCacheServes(c, position.lineNumber, wordStart, prefix, qualified, lead) &&
+            !(lspAnswerHasNothingFor(c, prefix) && rtNow() - c.doneAt >= LSP_ZERO_MATCH_RETRY_MS)) return c;
+        c = { line: position.lineNumber, wordStart: wordStart, prefix: prefix, lead: lead == null ? null : lead,
+              done: false, resp: null, sentAt: 0, doneAt: 0, deferred: false };
         // Captured, not re-read at reply time: a late reply from before a setSource must reset the OLD
         // document's miss count, not the new one's (resetLocalFirstState replaces the object).
         var misses = lspComplMisses;
@@ -5770,6 +5966,7 @@
         c.promise = sent
             .then(function (resp) {
                 c.done = true;
+                c.doneAt = rtNow();
                 c.resp = resp;
                 // null = timed out / dropped: no answer to reuse, so the next keystroke must ask again.
                 if (!resp) { if (lspComplCache[id] === c) delete lspComplCache[id]; return null; }
@@ -5810,6 +6007,7 @@
                 if (typeof ed.hasTextFocus === 'function' && !ed.hasTextFocus()) { why = 'skip=no-focus'; return; }
                 var p = ed.getPosition();
                 if (!p || p.lineNumber !== line || p.column !== column) { why = 'skip=caret-moved'; return; }
+                notePageSuggestTrigger(ed);                // served from the cache, not a Ctrl+Space (GH #280)
                 ed.trigger('clarion-late-lsp', 'editor.action.triggerSuggest', { auto: true });   // see installColonSuggest
             } catch (e) { why = 'error=' + (e && e.message); }
             finally {
@@ -5867,9 +6065,10 @@
     // Hover (R7): the local card and the LSP card come from two providers, which Monaco renders as they
     // settle. Both share ONE localHover request per (model, version, position). The LSP provider waits for
     // that answer before it asks, and the host decides which of three ways the local card plays:
-    //   authoritative (a local, a parameter, a routine, a module procedure, a dictionary or index card):
+    //   authoritative (a module procedure, a dictionary card, an index card that is not a procedure):
     //       no LSP request at all;
-    //   fallback (a keyword card, GH #250): the local provider shows nothing; the LSP provider asks the
+    //   fallback (a keyword card, GH #250; a DATA label - local, module data, structure; a routine; a
+    //       parameter; a procedure from the index): the local provider shows nothing; the LSP provider asks the
     //       server and shows ITS card, or the local card when the server has nothing, is down, or misses
     //       FALLBACK_LSP_DEADLINE_MS - one card either way;
     //   otherwise: both, and the LSP card is dropped when it names the same symbol as the local card, so
@@ -5896,7 +6095,7 @@
     // is down, or has not answered by the hover's deadline ({passed, fire}, armed when the hover started). Past
     // the deadline no hover is posted: nobody would read its answer.
     function fallbackHover(model, position, localCard, deadline) {
-        var localHover = { contents: [{ value: localCard }] };
+        var localHover = { contents: hoverContentsWithFooter(markDiskSelfLinks(localCard), model, position) };
         if (deadline.passed) return Promise.resolve(localHover);
         return new Promise(function (resolve) {
             var settled = false;
@@ -5904,10 +6103,537 @@
             deadline.fire = function () { settle(localHover); };
             whenIdleSynced(model, { line: position.lineNumber, column: position.column })
                 .then(function (payload) { return payload && !settled ? requestFromHost('hover', payload) : null; })
-                .then(function (resp) { settle(resp && resp.contents ? { contents: [{ value: resp.contents }] } : localHover); })
+                .then(function (resp) { settle(resp && resp.contents ? { contents: hoverContentsWithFooter(serverCardContent(resp.contents, model, position), model, position) } : localHover); })
                 .catch(function () { settle(localHover); });
         });
     }
+
+    // ---- H1-a: location links to the CA Embeditor's own document ----
+    // The language server analyses the embeditor's text under the module's path (docPath, from setSource), so
+    // its card's link to that path is a line of THIS text (the host has already shifted it past the MEMBER
+    // header it prepends for the server), not a line of the .clw on disk. A click on such a link reveals the
+    // line here and never opens the .clw, and its label reads "line N", not "Module.clw:N". A link marked
+    // ?ondisk is a line of the module ON DISK: a card from the solution index (the local card here, the host
+    // for the server path's index fallback), so it opens the .clw as before, as does a link to any other file.
+    // The CA Editor (file mode) has no docPath: there the line IS the file's line.
+    var embedDocPath = '';
+    var SELF_LINK_MD_RX = /\[((?:\\.|[^\]\\\r\n])*)\]\((file:[^)\s?#]*)(\?[^)\s#]*)?#L(\d+)((?:\s+"[^"\r\n]*")?)\)/g;
+    var ONDISK_QUERY_RX = /(?:^\??|&)ondisk(?:=|&|$)/i;
+    function setEmbedDocPath(p) { embedDocPath = String(p || ''); }
+    function normLinkPath(p) { return String(p || '').replace(/\//g, '\\').replace(/^\\+/, '').toLowerCase(); }
+    // "file:///H:/dir/Mod.clw" -> "/H:/dir/Mod.clw", decoded (the server encodes the drive colon: c%3A).
+    function linkHrefPath(href) {
+        var p = String(href || '').replace(/^file:(?:\/\/[^\/]*)?/i, '');
+        try { p = decodeURIComponent(p); } catch (e) { }
+        return p;
+    }
+    function isEmbedSelfHref(href) {
+        return !fileMode && !!embedDocPath && /^file:\/\/\//i.test(href) &&
+            normLinkPath(linkHrefPath(href)) === normLinkPath(embedDocPath);
+    }
+    // A clicked link (a Monaco URI): the embeditor's own document, and not a disk line?
+    function isEmbedSelfUri(uri) {
+        if (fileMode || !embedDocPath || !uri || uri.scheme !== 'file' || uri.authority) return false;
+        if (ONDISK_QUERY_RX.test(String(uri.query || ''))) return false;
+        return normLinkPath(uri.fsPath || uri.path) === normLinkPath(embedDocPath);
+    }
+    // The server's card: its own-document links relabelled "line N" (the target stays in this editor).
+    function prepareSelfLinks(markdown) {
+        var md = String(markdown || '');
+        if (fileMode || !embedDocPath || md.indexOf('](file:') < 0) return md;
+        return md.replace(SELF_LINK_MD_RX, function (all, label, href, query, line, title) {
+            if ((query && ONDISK_QUERY_RX.test(query)) || !isEmbedSelfHref(href)) return all;
+            return '[line ' + line + '](' + href + (query || '') + '#L' + line + title + ')';
+        });
+    }
+    // A local card's links come from the solution index: lines of the files on disk. Own-document ones are
+    // marked ?ondisk so a click opens the .clw at that line instead of revealing a disk line here.
+    function markDiskSelfLinks(markdown) {
+        if (fileMode || !embedDocPath || markdown == null) return markdown;
+        var md = String(markdown);
+        if (md.indexOf('](file:') < 0) return md;
+        return md.replace(SELF_LINK_MD_RX, function (all, label, href, query, line, title) {
+            if (query || !isEmbedSelfHref(href)) return all;
+            return '[' + label + '](' + href + '?ondisk#L' + line + title + ')';
+        });
+    }
+    function prepareServerCard(markdown, model, position) {
+        return prepareSelfLinks(prepareAttributeLinks(markdown, model, position));
+    }
+
+    // ---- H1-b: Back from a hover link returns to the HOVERED position, not the caret ----
+    // A hover is shown for the mouse position, which is usually NOT the caret: hover "DO PrepareProcedure"
+    // with the caret elsewhere, click the card's "line N" link, and Back must return to the DO line. So the
+    // hover providers remember the position each card was produced for (the hover's anchor), and a link
+    // click uses it as the history "from" when the clicked link is one of THAT card's links: whatever card is
+    // on screen was produced for the newest hover request, and a link from any other card (or a card that
+    // never came from these providers) falls back to the caret, as before. Monaco asks both providers for
+    // the same position in one go, so requests at one position in the same tick are ONE request (reqId).
+    // Ctrl+Click / F12 do not come through here: they start at the caret, which is where they were invoked.
+    var hoverRequestAt = null;      // {id, model, line, column}: the newest position Monaco asked a hover for
+    var hoverAnchor = null;         // {id, model, line, column, cards: [markdown]}: the cards produced for it
+    var _hoverReqSeq = 0, _hoverReqOpen = false;
+    var HOVER_LINK_HREF_RX = /\]\((file:[^)\s?#]*)(?:\?[^)\s#]*)?#L?(\d+)/g;
+    function noteHoverRequest(model, position) {
+        var rq = hoverRequestAt;
+        if (!(_hoverReqOpen && rq && rq.model === model && rq.line === position.lineNumber && rq.column === position.column)) {
+            hoverRequestAt = { id: ++_hoverReqSeq, model: model, line: position.lineNumber, column: position.column };
+            _hoverReqOpen = true;
+            Promise.resolve().then(function () { _hoverReqOpen = false; });
+        }
+        return hoverRequestAt.id;
+    }
+    // A provider's answer for request reqId: a card for the NEWEST request becomes (part of) the anchor.
+    // Every entry of the answer counts: the card AND its footer row (GH #270), where the card's location
+    // links now sit.
+    function noteHoverCard(reqId, hover) {
+        var list = hover && hover.contents, vals = [];
+        if (list && list.length) for (var i = 0; i < list.length; i++) if (list[i] && list[i].value != null) vals.push(String(list[i].value));
+        var rq = hoverRequestAt;
+        if (!vals.length || !rq || rq.id !== reqId) return hover;
+        if (!hoverAnchor || hoverAnchor.id !== reqId)
+            hoverAnchor = { id: reqId, model: rq.model, line: rq.line, column: rq.column, cards: [] };
+        hoverAnchor.cards.push(vals.join('\n'));
+        return hover;
+    }
+    // The history "from" for a click on uri inside a hover card: the hover's anchor, or null (use the caret).
+    function hoverLinkOrigin(uri) {
+        var a = hoverAnchor;
+        if (!a || !uri) return null;
+        var ed = activeEd();
+        if (ed && ed.getModel && ed.getModel() !== a.model) return null;
+        var want = normLinkPath(uri.fsPath || uri.path);
+        var wm = /^L?(\d+)/.exec(uri.fragment || '');
+        var wantLine = wm ? wm[1] : '';
+        for (var i = 0; i < a.cards.length; i++) {
+            var m, rx = new RegExp(HOVER_LINK_HREF_RX.source, 'g');
+            while ((m = rx.exec(a.cards[i])) !== null) {
+                if (m[2] === wantLine && normLinkPath(linkHrefPath(m[1])) === want) return { line: a.line, column: a.column };
+            }
+        }
+        return null;
+    }
+    // The CA Editor (file mode): a link to this same file goes to the host (openLocation), which positions
+    // this editor with a revealLine. That reveal takes the hover's anchor as its "from" (see
+    // revealLineFromHost) when it lands on the clicked line within HOVER_ORIGIN_TTL_MS.
+    var HOVER_ORIGIN_TTL_MS = 5000;
+    function isCurrentFileUri(uri) {
+        return fileMode && !!currentFilePath && typeof currentFilePath === 'string' && uri && uri.scheme === 'file' &&
+            !uri.authority && normLinkPath(uri.fsPath || uri.path) === normLinkPath(currentFilePath);
+    }
+
+    // ---- Attribute edit links on a hover card (click a chip to add/remove an attribute) ----
+    // The language server puts them there because LspClient announces
+    // capabilities.experimental.clarionAttributeEditLinks. From v1.0.9 a card for a control, a WINDOW /
+    // APPLICATION / REPORT header, or a FILE / KEY / INDEX / MEMO / BLOB declaration, hovered on its own
+    // declaration, lists its attributes as links (GH #281, msarson/Clarion-Extension#731/#745/#746):
+    //   **Attributes:** [AT](command:clarion.applyAttributeEdit?<q> "Remove AT(...) — ...")
+    //   **Available:** [BOXED](command:clarion.applyAttributeEdit?<q> "Add BOXED — ...") ...
+    // where <q> = encodeURIComponent(JSON.stringify([payload])) and payload = { e: [{ l, c, el, ec, t, o, s? }] }:
+    // lines relative to the hovered line, 0-based columns, the new text, the ORIGINAL text of lines l..el,
+    // and s: true when `t` is a snippet such as ,TIP('${1:text}') (msarson/Clarion-Extension#743; a
+    // snippet edit always comes alone). All the Clarion knowledge (commas, | continuations, comments,
+    // clashing attributes) is the server's and tested there; this page only checks the original text and
+    // applies the edit as one undo step. Reference client: msarson/Clarion-Extension
+    // client/src/hover/attributeEditLinks.ts (planAttributeEdit). The chips are drawn by the CSS
+    // (a[data-href^="command:clarion.applyAttributeEdit"]).
+    //
+    // Monaco drops every command: link from UNTRUSTED markdown, so a card that keeps live links is handed
+    // to Monaco as trusted for this ONE command only (serverCardContent: isTrusted.enabledCommands). The
+    // link opener below takes every command: link first and runs none of them as a command: Monaco's
+    // command opener never sees one.
+    //
+    // The payload is UNTRUSTED (GH #263): it comes from the language server. So a click applies only when
+    // ALL of this holds, and otherwise changes nothing and throws nothing:
+    //   * the payload is one the card on screen carried (attrCardTarget.payloads), not any link-shaped text;
+    //   * it decodes to a well-formed edit list: integer positions, `o` holding the original text of EVERY
+    //     line l..el, columns inside those lines, string `t`, boolean `s`, edits that do not overlap, and a
+    //     snippet edit alone;
+    //   * every line it touches still reads as `o` says, and is editable (lineIsEditable);
+    //   * the edits go to the card's own model, in the editor showing it.
+    //
+    // The first draft of #731 used file:///clarion-attr/edit/<base64url> links. No released server ever
+    // sent them (1.0.8 has no edit links, 1.0.9 sends the command: form), so they are no longer applied;
+    // the opener still swallows every file:///clarion-attr/ link so none can reach the open-file path.
+    var ATTR_EDIT_COMMAND = 'clarion.applyAttributeEdit';
+    var ATTR_LEGACY_LINK_ROOT = '/clarion-attr/';     // the retired draft form: swallowed, never applied, never navigation
+    var ATTR_EDIT_MAX_PAYLOAD = 16384;                // a real one is a few hundred characters
+    var ATTR_EDIT_MAX_EDITS = 32;
+    // A markdown link to the edit command, titled or not (the server escapes ( and ) in the query, and a
+    // title may hold \" escapes); and any OTHER command: link, which a card never needs.
+    var ATTR_LINK_MD_RX = /\[([^\]\r\n]*)\]\(command:clarion\.applyAttributeEdit\?([^\s"]*)(?:\s+"(?:[^"\\\r\n]|\\.)*")?\)/g;
+    // (The scheme in any case, as Monaco matches it; the edit command only in its exact spelling.)
+    var OTHER_COMMAND_LINK_MD_RX = /\[([^\]\r\n]*)\]\([Cc][Oo][Mm][Mm][Aa][Nn][Dd]:(?!clarion\.applyAttributeEdit\?)[^\s)]*(?:\s+"(?:[^"\\\r\n]|\\.)*")?\)/g;
+    var ANY_COMMAND_LINK_RX = /\(command:/i;
+    var attrCardTarget = null;   // { model, line, column, payloads } — the hovered keyword of the card last
+                                 // shown with live links, and the payloads that card carried (canonical JSON)
+
+    function flattenLinks(md, rx) {
+        return md.replace(rx, function (all, name) { return '`' + name.replace(/`/g, '') + '`'; });
+    }
+
+    // Card markdown on its way to the screen: remember where it was hovered, so a click knows its
+    // anchor. Where the declaration cannot be edited (read-only, outside the embed points of the CA
+    // Embeditor, a GENERATED module opened as a plain file) the links become plain names: the card
+    // still lists them, but offers no edit. The server leaves the links off in a generated module
+    // itself (1.0.9); generatedSource is the second safeguard.
+    function prepareAttributeLinks(markdown, model, position) {
+        var md = String(markdown || '');
+        if (!ANY_COMMAND_LINK_RX.test(md)) return md;
+        md = flattenLinks(md, OTHER_COMMAND_LINK_MD_RX);
+        if (md.indexOf('(command:' + ATTR_EDIT_COMMAND + '?') < 0) return md;
+        if (!model || !position || !lineIsEditable(position.lineNumber)) {
+            attrCardTarget = null;
+            return flattenLinks(md, ATTR_LINK_MD_RX);
+        }
+        var payloads = {}, any = false;
+        md = md.replace(ATTR_LINK_MD_RX, function (all, name, query) {
+            var key = attributeEditKey(decodeAttributeEditQuery(query));
+            if (!key) return '`' + name.replace(/`/g, '') + '`';   // not a payload we could ever apply: a plain name
+            payloads[key] = true; any = true;
+            return all;
+        });
+        attrCardTarget = any ? { model: model, line: position.lineNumber, column: position.column, payloads: payloads } : null;
+        return md;
+    }
+
+    // The hover contents for a server card: trusted for the edit command only, and only when the card
+    // still carries a live edit link (else Monaco would drop it, as it drops every untrusted command: link).
+    function serverCardContent(markdown, model, position) {
+        var md = prepareServerCard(markdown, model, position);
+        var c = { value: md };
+        if (typeof md === 'string' && md.indexOf('(command:' + ATTR_EDIT_COMMAND + '?') >= 0)
+            c.isTrusted = { enabledCommands: [ATTR_EDIT_COMMAND] };
+        return c;
+    }
+
+    // Can a chip edit this line? Not when the page is read-only, not outside the editable ranges (the
+    // embed points in the CA Embeditor; the whole buffer in file mode), and never in a GENERATED module
+    // opened as a plain file (generatedSource, from the host): the next generate would overwrite the edit.
+    function lineIsEditable(line) {
+        if (generatedSource) return false;
+        if (isReadOnlyNow()) return false;
+        var ranges = liveEditableRanges() || [];
+        return ranges.some(function (r) { return line >= r[0] && line <= r[1]; });
+    }
+
+    // The host re-sends generatedSource when an app opens or closes after the tab loaded (a tab restored at
+    // startup is set up before its app is). File mode only, like setSource. Turning it on also drops the
+    // card target, so a chip still on screen from before does nothing.
+    function applyGeneratedSourceFlag(value) {
+        generatedSource = fileMode && value === true;
+        if (generatedSource) attrCardTarget = null;
+    }
+
+    function isWholeNumber(v) { return typeof v === 'number' && isFinite(v) && Math.floor(v) === v; }
+
+    // The link's query (still URI-encoded, as in the markdown) → the payload object, or null. The
+    // query is a JSON array of ONE payload: JSON.parse(decodeURIComponent(query))[0].
+    function decodeAttributeEditQuery(query) {
+        if (typeof query !== 'string' || !query || query.length > ATTR_EDIT_MAX_PAYLOAD) return null;
+        try { return payloadOfArgs(JSON.parse(decodeURIComponent(query))); } catch (e) { return null; }
+    }
+    function payloadOfArgs(args) {
+        return Array.isArray(args) && args.length === 1 && args[0] && typeof args[0] === 'object' ? args[0] : null;
+    }
+    // The key a payload is remembered and looked up by: its canonical JSON, so the card's encoded query
+    // and the opener's decoded one compare equal however each was escaped on the way.
+    function attributeEditKey(payload) {
+        if (!payload) return null;
+        try { return JSON.stringify(payload); } catch (e) { return null; }
+    }
+
+    // payload object → the validated edit list, or null for anything malformed (never throws).
+    function decodeAttributeEdits(payload) {
+        try {
+            var edits = payload && payload.e;
+            if (!Array.isArray(edits) || !edits.length || edits.length > ATTR_EDIT_MAX_EDITS) return null;
+            for (var k = 0; k < edits.length; k++) {
+                var x = edits[k];
+                if (!x || typeof x !== 'object') return null;
+                if (!isWholeNumber(x.l) || !isWholeNumber(x.el) || !isWholeNumber(x.c) || !isWholeNumber(x.ec)) return null;
+                if (x.el < x.l || x.c < 0 || x.ec < 0 || typeof x.t !== 'string') return null;
+                if (x.s !== undefined && typeof x.s !== 'boolean') return null;
+                // `o` must prove EVERY line the edit spans, or a line it changes would go unchecked.
+                if (!Array.isArray(x.o) || x.o.length !== x.el - x.l + 1) return null;
+                for (var j = 0; j < x.o.length; j++) if (typeof x.o[j] !== 'string') return null;
+                if (x.c > x.o[0].length || x.ec > x.o[x.o.length - 1].length) return null;
+                if (x.l === x.el && x.ec < x.c) return null;
+            }
+            // A snippet is inserted on its own: other edits would move the place it goes (#743).
+            if (edits.length > 1 && edits.some(function (x) { return x.s === true; })) return null;
+            return edits;
+        } catch (e) { return null; }
+    }
+
+    // A snippet's plain text: each placeholder's default (${1:text} → text, ${1|a,b|} → a), bare tab
+    // stops ($1, ${1}, $0) dropped, \$ \} \\ unescaped. Used when the editor's snippet support is not
+    // there or does not take it; the issue allows inserting TIP('text') then.
+    function snippetToPlainText(s) {
+        var i = 0, n = s.length;
+        function body(stopAtBrace) {
+            var out = '';
+            while (i < n) {
+                var ch = s.charAt(i);
+                if (ch === '\\' && i + 1 < n && '$}\\,|'.indexOf(s.charAt(i + 1)) >= 0) { out += s.charAt(i + 1); i += 2; continue; }
+                if (stopAtBrace && ch === '}') return out;
+                if (ch === '$') {
+                    var m = /^\$(\d+)/.exec(s.slice(i));
+                    if (m) { i += m[0].length; continue; }
+                    m = /^\$\{(\d+)(:|\||\})/.exec(s.slice(i));
+                    if (m) {
+                        i += m[0].length;
+                        if (m[2] === '}') continue;
+                        if (m[2] === ':') { out += body(true); i++; continue; }
+                        var close = s.indexOf('|}', i), choices = close >= 0 ? s.slice(i, close) : '';
+                        out += choices.split(',')[0];
+                        i = close >= 0 ? close + 2 : n;
+                        continue;
+                    }
+                }
+                out += ch; i++;
+            }
+            return out;
+        }
+        return body(false);
+    }
+
+    // Is this URI one of ours to swallow? Every command: link (none ever runs as a command), and the
+    // retired draft form's file:///clarion-attr/... links (any case, any host).
+    function isAttributeLinkUri(uri) {
+        if (!uri) return false;
+        if (uri.scheme === 'command') return true;
+        return uri.scheme === 'file' && String(uri.path || '').toLowerCase().indexOf(ATTR_LEGACY_LINK_ROOT) === 0;
+    }
+    // The payload of a clicked edit link, from the URI the opener gets (Monaco's URI.parse has already
+    // percent-decoded the query), or null when it is not the edit command.
+    function attributeEditPayloadOfUri(uri) {
+        if (!uri || uri.scheme !== 'command' || uri.path !== ATTR_EDIT_COMMAND) return null;
+        var q = String(uri.query || '');
+        if (!q || q.length > ATTR_EDIT_MAX_PAYLOAD) return null;
+        try { return payloadOfArgs(JSON.parse(q)); } catch (e) { /* still encoded? */ }
+        try { return payloadOfArgs(JSON.parse(decodeURIComponent(q))); } catch (e) { return null; }
+    }
+
+    // The editor (main pane or split pane) that shows `model`, or null.
+    function editorShowingModel(model) {
+        var eds = [typeof editor !== 'undefined' ? editor : null, typeof editor2 !== 'undefined' ? editor2 : null];
+        for (var i = 0; i < eds.length; i++) {
+            var e = eds[i];
+            if (e && typeof e.getModel === 'function' && e.getModel() === model) return e;
+        }
+        return null;
+    }
+
+    // Insert a snippet edit at `range`: through Monaco's snippet controller, so the tab stop works and the
+    // value is selected for typing; else, or when the controller left the text unchanged (its insert
+    // swallows its own errors), the plain text as one executeEdits. Either way one undo step.
+    function applySnippetEdit(ed, model, range, snippet) {
+        var sc = null;
+        try { sc = typeof ed.getContribution === 'function' ? ed.getContribution('snippetController2') : null; } catch (e) { sc = null; }
+        if (sc && typeof sc.insert === 'function' && typeof ed.setSelection === 'function') {
+            var before = model.getVersionId();
+            try {
+                ed.focus();
+                ed.setSelection(range);
+                sc.insert(snippet, { overwriteBefore: 0, overwriteAfter: 0, undoStopBefore: true, undoStopAfter: true, adjustWhitespace: false });
+            } catch (e) { /* fall back below */ }
+            if (model.getVersionId() !== before) return true;
+        }
+        if (typeof ed.pushUndoStop === 'function') ed.pushUndoStop();
+        ed.executeEdits('clarion-attr', [{ range: range, text: snippetToPlainText(snippet) }]);
+        if (typeof ed.pushUndoStop === 'function') ed.pushUndoStop();
+        ed.focus();
+        return true;
+    }
+
+    // A chip was clicked: check the lines the edits touch still read as they did when the card was
+    // made, apply all edits as one undo step, then refresh the card. If the text has moved on, nothing
+    // is applied — the card is just shown again, freshly computed from the current text. A payload
+    // that is not the card's, or not well formed, does nothing at all. Returns true when it edited.
+    function applyAttributeEditLink(payload) {
+        var t = attrCardTarget, ed = null, applied = false, snippet = false;
+        try {
+            var key = attributeEditKey(payload);
+            if (!key || !t || !t.model || t.model.isDisposed() || !t.payloads ||
+                !Object.prototype.hasOwnProperty.call(t.payloads, key)) return false;
+            ed = editorShowingModel(t.model);
+            if (!ed) return false;
+            var edits = decodeAttributeEdits(payload);
+            if (!edits) return false;
+            var count = t.model.getLineCount(), ops = [], spans = [], current = true;
+            for (var k = 0; k < edits.length && current; k++) {
+                var x = edits[k], first = t.line + x.l, last = t.line + x.el;
+                if (first < 1 || last > count) { current = false; break; }
+                for (var i = 0; i < x.o.length; i++) {
+                    if (t.model.getLineContent(first + i) !== x.o[i] || !lineIsEditable(first + i)) { current = false; break; }
+                }
+                spans.push({ sl: first, sc: x.c, el: last, ec: x.ec });
+                ops.push({ range: new monaco.Range(first, x.c + 1, last, x.ec + 1), text: x.t });
+                if (x.s === true) snippet = true;
+            }
+            // Overlapping edits are malformed (executeEdits would throw on them): apply none.
+            spans.sort(function (a, b) { return a.sl - b.sl || a.sc - b.sc; });
+            for (var s = 1; s < spans.length; s++) {
+                var p = spans[s - 1], q = spans[s];
+                if (q.sl < p.el || (q.sl === p.el && q.sc < p.ec)) return false;
+            }
+            if (current && ops.length) {
+                if (snippet) {
+                    applied = applySnippetEdit(ed, t.model, ops[0].range, ops[0].text);
+                } else {
+                    // One undo step of its own: executeEdits pushes no undo stop, so without these the
+                    // edit could merge with the typing before or after it.
+                    if (typeof ed.pushUndoStop === 'function') ed.pushUndoStop();
+                    ed.executeEdits('clarion-attr', ops);
+                    if (typeof ed.pushUndoStop === 'function') ed.pushUndoStop();
+                    ed.focus();
+                    applied = true;
+                }
+            }
+        } catch (e) { return applied; }
+        // Refresh the card: post the edited buffer NOW instead of after the IDLE_SYNC_MS typing pause
+        // (the server card must arrive within FALLBACK_LSP_DEADLINE_MS, or the plain keyword card wins),
+        // then show the hover again on the same keyword — the new card moves the name across. After a
+        // snippet the caret sits on the value to type: the card may come back, but the caret must not move.
+        try {
+            if (idleSyncTimer) { clearTimeout(idleSyncTimer); idleSync(); }
+            reshowHover(ed, t.line, t.column, applied && snippet);
+        } catch (e) { /* the refresh is a nicety; the edit (if any) stands */ }
+        return applied;
+    }
+
+    // Show the hover at (line, column) without moving the cursor, through Monaco's content-hover
+    // controller (an internal API, checked in Monaco 0.52.2: showContentHover(range, mode, source, focus);
+    // its own "show hover" action passes mode 1 = Immediate, source 1 = Keyboard, so the card stays up
+    // while the mouse sits on it). If that API is not there, fall back to the public "show hover"
+    // action, which hovers at the cursor: move the cursor there first.
+    // MONACO PIN: these internals were checked against Monaco 0.52.2 (MONACO_VERSION). Whoever upgrades
+    // Monaco (ticket af046356) must re-check the contribution id, showContentHover's signature and the
+    // private _hideWidgets. Both methods are feature-detected; if either is missing the public action
+    // below is used, so an upgrade degrades to "the cursor moves to the keyword", not to an error.
+    // keepCaret (after a snippet edit, whose value is selected for typing): no fallback, since moving the
+    // cursor would end the snippet; the card just is not re-shown.
+    function reshowHover(ed, line, column, keepCaret) {
+        if (!ed) return;
+        try {
+            var c = typeof ed.getContribution === 'function' ? ed.getContribution('editor.contrib.contentHover') : null;
+            if (c && typeof c.showContentHover === 'function' && typeof c._hideWidgets === 'function') {
+                // Close the open card first: showContentHover keeps the current result when the new
+                // anchor equals the open card's (`_currentResult.anchor.equals(...)`), so a second
+                // click on the same declaration would leave the old card up. `_hideWidgets` is the
+                // controller's own (private) close. Without it showContentHover alone would leave that
+                // stale card up, so it is required, not optional.
+                c._hideWidgets();
+                c.showContentHover(new monaco.Range(line, column, line, column), 1, 1, false);
+                return;
+            }
+        } catch (e) { /* fall back below */ }
+        if (keepCaret) return;
+        try {
+            ed.setPosition({ lineNumber: line, column: column });
+            ed.trigger('clarion-attr', 'editor.action.showHover', {});
+        } catch (e) { /* nothing more to try */ }
+    }
+    // Close the hover card on screen, through the content-hover controller's own (private) close; see the
+    // MONACO PIN above. Without it the card stays up until the mouse leaves, which does no harm.
+    function hideHoverCard(ed) {
+        try {
+            var c = ed && typeof ed.getContribution === 'function' ? ed.getContribution('editor.contrib.contentHover') : null;
+            if (c && typeof c._hideWidgets === 'function') c._hideWidgets();
+        } catch (e) { /* the card closes when the mouse leaves */ }
+    }
+    // ---- end attribute edit links ----
+
+    // ---- Hover footer row: the card's links and actions in a bar under it ----
+    // A problem hover ends in Monaco's "View Problem / Quick Fix" bar. A hover provider cannot add to that
+    // bar (Monaco 0.52 builds it only for its own hover participants), so the page draws a look-alike: the
+    // hover's content list gets a second entry, which the CSS styles as that bar. It holds
+    //   * the card's location links: every line (outside a code block) that is only
+    //     [File.clw:12](file:///...#L12) links, with an optional 📍 and a → between a declaration and its
+    //     implementation, moved out of the card;
+    //   * on a WINDOW/REPORT header card or a control card, "Open Structure Designer (<its key>)": the
+    //     Structure Designer command (Ctrl+D by default) run on the hovered line, offered only where that
+    //     command would run. It designs the WINDOW or REPORT around the line, whichever control it is on.
+    var STRUCTURE_DESIGNER_COMMAND = 'clarion.openStructureDesigner';
+    // A label may hold escaped characters ([Foo\_Bar.clw:3]); the link may carry a "title" (H1-a keeps it),
+    // and a ?ondisk query (H1-a, a line of the module on disk) before its #L<line>.
+    var LOCATION_LINK_SRC = '\\[(?:\\\\.|[^\\]\\\\\\r\\n])+\\]\\(file:\\/\\/[^)\\s#]*#L\\d+(?:\\s+"[^"\\r\\n]*")?\\)';
+    var LOCATION_LINE_RX = new RegExp('^\\s*(?:📍\\s*)?' + LOCATION_LINK_SRC + '(?:\\s*(?:→\\s*)?' + LOCATION_LINK_SRC + ')*\\s*$');
+    // A WINDOW/REPORT header card opens with "**Label WINDOW**". A control card opens with the bare control
+    // keyword ("**BUTTON** — Declares a pushbutton...", no label) AND lists the control's attributes
+    // (**Attributes:** / **Available:** / **With value:**, v1.0.9, on the control's own declaration). The
+    // attribute sections alone are not enough: the FILE, KEY, MEMO and APPLICATION cards list them too
+    // ("**Customer FILE** — ..."), and the designer lookup takes only a WINDOW or REPORT.
+    var CONTROL_ATTRS_RX = /^\*\*(?:Attributes|Available|With value):\*\*/m;
+    var CONTROL_HEAD_RX = /^\*\*(BOX|BUTTON|CHECK|COMBO|CUSTOM|ELLIPSE|ENTRY|GROUP|IMAGE|ITEM|LINE|LIST|MENU|MENUBAR|OLE|OPTION|PANEL|PROGRESS|PROMPT|RADIO|REGION|SHEET|SLIDER|SPIN|STRING|TAB|TEXT|TOOLBAR|DETAIL|HEADER|FOOTER|FORM|BREAK)\*\*(?:\s|$)/;
+    var STRUCTURE_HEADER_CARD_RX = /^\*\*[A-Za-z_][\w:]* (?:WINDOW|REPORT)\*\*/;
+    var designerCardTarget = null;   // { model, line, column } — where the card last offering the designer was hovered
+
+    // Is this the server's control card or a WINDOW/REPORT header card (the cards that offer the designer)?
+    function isDesignerCard(md) {
+        md = String(md || '');
+        return STRUCTURE_HEADER_CARD_RX.test(md) || (CONTROL_HEAD_RX.test(md) && CONTROL_ATTRS_RX.test(md));
+    }
+
+    // A hover's content list: the card (a markdown string or a content object), then the footer row when
+    // there is anything to put in it. The card arrives already prepared (H1-a's "line N" / ?ondisk links,
+    // #281's chip trust): the links move into the footer as they are, so the link opener and the H1-b
+    // anchor (noteHoverCard records every entry) see the same hrefs.
+    function hoverContentsWithFooter(card, model, position) {
+        var content = typeof card === 'string' ? { value: card } : (card || { value: '' });
+        var lines = String(content.value || '').split('\n'), kept = [], parts = [], inFence = false;
+        for (var i = 0; i < lines.length; i++) {
+            if (/^\s*```/.test(lines[i])) inFence = !inFence;
+            if (!inFence && LOCATION_LINE_RX.test(lines[i])) parts.push(lines[i].trim().replace(/^📍\s*/, ''));
+            else kept.push(lines[i]);
+        }
+        // A card that is nothing but its links keeps them: Monaco skips an empty entry, so the footer would
+        // be the row's only entry and draw as a card anyway.
+        if (parts.length && !/\S/.test(kept.join(''))) { kept = lines; parts = []; }
+        var designer = designerActionFor(content.value, model, position);
+        if (designer) parts.push(designer);
+        if (!parts.length) return [content];
+        var body = { value: kept.join('\n').replace(/\n{3,}/g, '\n\n').replace(/\s+$/, '') };
+        if (content.isTrusted) body.isTrusted = content.isTrusted;
+        var footer = { value: parts.join(' ') };
+        if (designer) footer.isTrusted = { enabledCommands: [STRUCTURE_DESIGNER_COMMAND] };
+        return [body, footer];
+    }
+
+    // The footer's designer action for this card, or '' — the same conditions cmdStructureDesigner checks
+    // before it asks the host, so the action is not offered where the key would only show a refusal.
+    function designerActionFor(md, model, position) {
+        md = String(md || '');
+        if (!model || !position) return '';
+        if (!isDesignerCard(md)) return '';
+        if ((fileMode && !designerEnabled) || designerSession) return '';
+        var key = '';
+        try { var entry = keyEntryById('structureDesigner'); key = (entry && effectiveChord(entry)) || ''; } catch (e) { key = ''; }
+        designerCardTarget = { model: model, line: position.lineNumber, column: position.column };
+        return '[Open Structure Designer' + (key ? ' (' + key + ')' : '') + '](command:' + STRUCTURE_DESIGNER_COMMAND +
+            ' "Design the WINDOW or REPORT around this line")';
+    }
+
+    // The footer's designer action was clicked: put the cursor where the card was hovered and run the
+    // Structure Designer command, as its key would there: the key table's own entry (EDITOR_COMMANDS,
+    // whose run the key dispatcher calls), so the click and the key are one code path. Returns true when
+    // it ran the command.
+    function openDesignerFromCard() {
+        var t = designerCardTarget;
+        try {
+            if (!t || !t.model || t.model.isDisposed()) return false;
+            var ed = editorShowingModel(t.model);
+            if (!ed) return false;
+            hideHoverCard(ed);
+            ed.setPosition({ lineNumber: t.line, column: t.column });
+            ed.focus();
+            var entry = keyEntryById('structureDesigner');
+            if (entry && typeof entry.run === 'function') entry.run(); else cmdStructureDesigner();
+            return true;
+        } catch (e) { return false; }
+    }
+    // ---- end hover footer row ----
 
     function registerClarionProviders() {
         // ----- Column-1 typing = no completion (native Clarion parity, task 8933fa05) -----
@@ -6016,7 +6742,8 @@
                 // bufferSync ahead of the LSP's.
                 var localP = requestLocal('localCompletion', model, position,
                     context && context.triggerCharacter ? { triggerCharacter: context.triggerCharacter } : null);
-                var lsp = lspCompletionFor(model, position, startCol, prefix, qualified);
+                var lsp = lspCompletionFor(model, position, startCol, prefix, qualified, before.substring(0, startCol - 1),
+                    isExplicitInvoke(model, position, context));
                 return Promise.all([localP, lspWithinBudget(lsp, modelKey(model))])
                     .then(function (r) {
                         // No local answer (timed out / host without the local layer): wait for the LSP as
@@ -6158,13 +6885,15 @@
         // decided only once the local answer is in (see sharedLocalHover).
         monaco.languages.registerHoverProvider('clarion', {
             provideHover: function (model, position) {
+                var hoverReq = noteHoverRequest(model, position);   // H1-b: the card's anchor
                 if (isInClarionComment(model.getLineContent(position.lineNumber), position.column - 1)) return null;
                 return sharedLocalHover(model, position)
                     .then(function (local) {
                         if (!local || !local.contents) return null;
                         if (local.fallback) return null;   // the LSP provider shows it if the server has nothing
-                        return { contents: [{ value: local.contents }] };
+                        return { contents: hoverContentsWithFooter(markDiskSelfLinks(local.contents), model, position) };
                     })
+                    .then(function (h) { return noteHoverCard(hoverReq, h); })
                     .catch(function () { return null; });
             }
         });
@@ -6174,6 +6903,7 @@
                 // keyword-looking word like 'End' in a '! ...' comment must be ignored. position.column
                 // is 1-based, so pass column-1 as the 0-based index. Guarding here (not host-side) avoids
                 // a wasted round-trip and needs no C# change. (task 37e2079f)
+                var hoverReq = noteHoverRequest(model, position);   // H1-b: the card's anchor
                 if (isInClarionComment(model.getLineContent(position.lineNumber), position.column - 1)) return null;
                 // GH #250: the fallback deadline runs from the hover's start, so the local answer and an idle-sync
                 // wait while typing both count against it.
@@ -6192,9 +6922,10 @@
                                 if (!resp || !resp.contents) return null;
                                 // Same symbol as the local card already on screen: one card, not two.
                                 if (localSymbol && localSymbol === hoverCardSymbol(resp.contents)) return null;
-                                return { contents: [{ value: resp.contents }] };
+                                return { contents: hoverContentsWithFooter(serverCardContent(resp.contents, model, position), model, position) };
                             });
                     })
+                    .then(function (h) { return noteHoverCard(hoverReq, h); })
                     .catch(function () { return null; });
             }
         });
@@ -6203,14 +6934,43 @@
         // selection itself, but then hands the file: URI to its DEFAULT opener, which treats it as an
         // external link (window.open) — useless for a Clarion source file. Intercept and let the IDE
         // navigate. Registered here (once, with the other providers) though link openers are global, not
-        // per-language; non-file schemes fall through to the default opener untouched.
+        // per-language; other non-file schemes fall through to the default opener untouched.
         monaco.editor.registerLinkOpener({
             open: function (uri) {
+                // Attribute edit links on a hover card (see applyAttributeEditLink). EVERY command: link
+                // is swallowed here, whether or not it applies, so none ever runs as a Monaco command, and
+                // so is every file:///clarion-attr/ link (the retired draft form), so none of them ever
+                // reaches openLocation (the host's navigation/open-file path).
+                // The hover footer's designer action (see hoverContentsWithFooter).
+                if (uri && uri.scheme === 'command' && uri.path === STRUCTURE_DESIGNER_COMMAND) {
+                    openDesignerFromCard();
+                    return true;
+                }
+                if (isAttributeLinkUri(uri)) {
+                    var payload = attributeEditPayloadOfUri(uri);
+                    if (payload) applyAttributeEditLink(payload);
+                    return true;
+                }
                 if (!uri || uri.scheme !== 'file') return false;
+                // H1-a: a link to the CA Embeditor's own document is a line of THIS text (see prepareSelfLinks):
+                // reveal it here, caret on it, and never open the .clw (whose line it is not).
+                // H1-b: Back history starts at the HOVERED position (the card's anchor), not the caret.
+                if (isEmbedSelfUri(uri)) {
+                    var sm = /^L?(\d+)/.exec(uri.fragment || '');
+                    revealLineFromHost({ line: sm ? (parseInt(sm[1], 10) || 1) : 1, column: 1, from: hoverLinkOrigin(uri) });
+                    return true;
+                }
                 // Hover footers only ever emit a bare #L<line> (see HoverFormatter.locationLink on the
                 // language-server side) — no column — matching what the host's navigation (EditorService.
                 // NavigateToFileAndLine, same as the open_file MCP tool) accepts.
                 var m = /^L?(\d+)/.exec(uri.fragment || '');
+                // H1-b: the CA Editor's link to its own file comes back as a revealLine from the host; that
+                // reveal records the hover's anchor as its "from" (see revealLineFromHost).
+                pendingHoverOrigin = null;
+                if (isCurrentFileUri(uri)) {
+                    var hfrom = hoverLinkOrigin(uri);
+                    if (hfrom) pendingHoverOrigin = { from: hfrom, line: m ? (parseInt(m[1], 10) || 1) : 1, at: Date.now() };
+                }
                 postToHost({
                     action: 'openLocation',
                     path: uri.fsPath,
@@ -9436,6 +10196,11 @@
             if (msg.type === 'setSource') {
                 if (msg.executionLine != null) execLineWanted = normExecLine(msg.executionLine);   // #26: record on arrival
                 if (ready) applySource(msg); else pending = msg;
+            } else if (msg.type === 'generatedSource') {
+                // GH #263 Q2 follow-up: an app opened or closed after this tab loaded. A setSource still waiting
+                // for Monaco takes the newer answer with it; otherwise apply it now.
+                if (!ready && pending) pending.generatedSource = msg.value === true;
+                else applyGeneratedSourceFlag(msg.value);
             } else if (msg.type === 'applyTheme') {
                 setTheme(themePrefDark);   // user preference wins over IDE theme changes
             } else if (msg.type === 'confirmSaveExitResult') {
@@ -9529,9 +10294,19 @@
             } else if (msg.type === 'externalFileState') {
                 handleExternalFileState(msg);
             } else if (msg.type === 'restoreSlots') {
-                // May arrive before the async source fetch fills the model — park until applySource's tail.
-                if (embedRanges.length && editor && editor.getModel().getLineCount() > 1) restoreSlotContents(msg.slots);
-                else pendingRestoreSlots = msg.slots;
+                applyOrParkSlots(msg.slots);
+            } else if (msg.type === 'offerSavedEdits') {
+                // GH #179: a save that reported ok but never reached the procedure (the Generator faulted after it).
+                // OFFERED, never applied: Restore puts the text in as unsaved edits (the same path as restoreSlots),
+                // Discard forgets it, and the toast's own dismiss leaves it to be offered again at the next open.
+                var offered = msg.slots;
+                showActionToast(msg.message, false, [
+                    { label: 'Restore', onClick: function () {
+                        applyOrParkSlots(offered);
+                        postToHost({ action: 'savedEditsOffer', choice: 'restore' });
+                    } },
+                    { label: 'Discard (a copy is kept)', onClick: function () { postToHost({ action: 'savedEditsOffer', choice: 'discard' }); } }
+                ]);
             } else if (msg.type === 'restoreSlotsFailed') {
                 showToast('Your unsaved edits from the interrupted embeditor session could not be restored (the generated source changed underneath them).', false);
             }

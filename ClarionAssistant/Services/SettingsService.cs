@@ -583,7 +583,16 @@ namespace ClarionAssistant.Services
             {
                 string asmDir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location) ?? "";
                 string path = Path.Combine(asmDir, "Terminal", "models.json");
-                if (File.Exists(path)) return File.ReadAllText(path);
+                // The deployed copy is user-editable, so a hand edit can break it. The
+                // caller splices this text into the Settings page's JSON message and the
+                // retired-model remap parses it, so a broken copy falls through to the
+                // embedded one rather than breaking both.
+                if (File.Exists(path))
+                {
+                    string deployed = File.ReadAllText(path);
+                    if (IsUsableRegistry(deployed)) return deployed;
+                    System.Diagnostics.Debug.WriteLine("[Settings] " + path + " is not a valid model registry; using the embedded copy");
+                }
             }
             catch { }
 
@@ -594,7 +603,10 @@ namespace ClarionAssistant.Services
                 {
                     if (s != null)
                         using (var reader = new StreamReader(s))
-                            return reader.ReadToEnd();
+                        {
+                            string embedded = reader.ReadToEnd();
+                            if (IsUsableRegistry(embedded)) return embedded;
+                        }
                 }
             }
             catch { }
@@ -602,8 +614,87 @@ namespace ClarionAssistant.Services
             return MinimalRegistryJson;
         }
 
+        /// <summary>
+        /// True when <paramref name="json"/> parses and has a "backends" object whose
+        /// every entry is an object with "plans" and "models" arrays.
+        /// </summary>
+        public static bool IsUsableRegistry(string json)
+        {
+            try
+            {
+                var root = new System.Web.Script.Serialization.JavaScriptSerializer()
+                    .DeserializeObject(json) as Dictionary<string, object>;
+                object backendsObj;
+                if (root == null || !root.TryGetValue("backends", out backendsObj)) return false;
+                var backends = backendsObj as Dictionary<string, object>;
+                if (backends == null || backends.Count == 0) return false;
+                foreach (var b in backends.Values)
+                {
+                    var info = b as Dictionary<string, object>;
+                    object plans, models;
+                    if (info == null
+                        || !info.TryGetValue("plans", out plans) || !(plans is object[])
+                        || !info.TryGetValue("models", out models) || !(models is object[]))
+                        return false;
+                }
+                return true;
+            }
+            catch { return false; }
+        }
+
+        /// <summary>
+        /// Maps a model id the provider has retired to its replacement, using the
+        /// backend's <c>retired</c> map in models.json ({ "oldId": "newId" }).
+        /// Returns <paramref name="modelId"/> unchanged when it is not retired or the
+        /// registry can't be read. A replacement of "" means the backend's Default.
+        /// </summary>
+        public string ResolveRetiredModel(string backend, string modelId)
+        {
+            return ResolveRetiredModel(GetModelRegistryJson(), backend, modelId);
+        }
+
+        /// <summary>Registry-text overload, so the lookup is testable without a deploy.</summary>
+        public static string ResolveRetiredModel(string registryJson, string backend, string modelId)
+        {
+            string id = (modelId ?? "").Trim();
+            if (id.Length == 0 || string.IsNullOrEmpty(backend)) return modelId;
+            try
+            {
+                var root = new System.Web.Script.Serialization.JavaScriptSerializer()
+                    .DeserializeObject(registryJson) as Dictionary<string, object>;
+                object o;
+                if (root != null && root.TryGetValue("backends", out o)
+                    && o is Dictionary<string, object> backends && backends.TryGetValue(backend, out o)
+                    && o is Dictionary<string, object> info && info.TryGetValue("retired", out o)
+                    && o is Dictionary<string, object> retired && retired.TryGetValue(id, out o)
+                    && o is string replacement)
+                    return replacement;
+            }
+            catch { }
+            return modelId;
+        }
+
+        /// <summary>
+        /// Reads <paramref name="settingsKey"/> and, if it names a retired model,
+        /// saves the replacement in its place. <paramref name="retiredFrom"/> is the
+        /// old id when a swap happened, else null. A failed save (settings locked by
+        /// another process) still returns the replacement for this launch.
+        /// </summary>
+        public string GetModelRemappingRetired(string backend, string settingsKey, out string retiredFrom)
+        {
+            retiredFrom = null;
+            string saved = Get(settingsKey) ?? "";
+            string resolved = ResolveRetiredModel(backend, saved);
+            if (string.Equals(resolved, saved, StringComparison.Ordinal)) return saved;
+            retiredFrom = saved.Trim();
+            try { Set(settingsKey, resolved); } catch { }
+            return resolved;
+        }
+
         // Minimal registry used only when both the deployed file and the embedded
-        // resource are unavailable — keeps the settings dialog functional.
+        // resource are unavailable — keeps the settings dialog functional. It has no
+        // "retired" maps, so retired ids pass through unchanged in that (broken-install)
+        // case; BuildCodexModelFlag still keeps an empty Codex model off gpt-5.5.
         private const string MinimalRegistryJson =
             "{\"version\":\"1\",\"backends\":{" +
             "\"Claude\":{\"plans\":[{\"id\":\"Pro\",\"label\":\"Pro\"}],\"defaultPlan\":\"Pro\",\"models\":[{\"id\":\"sonnet\",\"label\":\"Sonnet\",\"plans\":[\"Pro\"]}]}," +

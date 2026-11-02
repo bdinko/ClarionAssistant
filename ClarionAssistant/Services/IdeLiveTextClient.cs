@@ -69,37 +69,11 @@ namespace ClarionAssistant.Services
 
         private static SharedLspBridge.LiveText CallGetLiveText(IdeEndpointRecord.Endpoint ep, string path, Stopwatch sw)
         {
-            string session = SessionFor(ep, sw, false);
             var args = new Dictionary<string, object> { { "file_path", path } };
-            string body = new JavaScriptSerializer().Serialize(new Dictionary<string, object>
-            {
-                { "jsonrpc", "2.0" }, { "id", 2 }, { "method", "tools/call" },
-                { "params", new Dictionary<string, object> { { "name", "get_live_text" }, { "arguments", args } } }
-            });
-
-            string sessionOut;
-            int status;
-            string reply = Post(ep, body, session, sw, out sessionOut, out status);
-            if (status == 400)   // the pane forgot the session (restarted, or swept it): one fresh initialize
-            {
-                session = SessionFor(ep, sw, true);
-                reply = Post(ep, body, session, sw, out sessionOut, out status);
-            }
-            if (status != 200) throw new IOException("HTTP " + status);
-
-            var js = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
-            var env = js.DeserializeObject(reply) as Dictionary<string, object>;
-            object r;
-            var res = env != null && env.TryGetValue("result", out r) ? r as Dictionary<string, object> : null;
-            if (res == null) throw new IOException("no result in the reply");
-            object content;
-            var list = res.TryGetValue("content", out content) ? content as object[] : null;
-            var first = list != null && list.Length > 0 ? list[0] as Dictionary<string, object> : null;
-            object textObj;
-            string text = first != null && first.TryGetValue("text", out textObj) ? textObj as string : null;
-            if (text == null) throw new IOException("empty tool result");
+            string text = CallTool(ep, "get_live_text", args, sw, TotalBudgetMs);
             if (text.StartsWith("Error", StringComparison.Ordinal)) return new SharedLspBridge.LiveText { Reason = "the IDE refused: " + text };
 
+            var js = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
             var a = js.DeserializeObject(text) as Dictionary<string, object>;
             if (a == null) throw new IOException("get_live_text did not return JSON");
             object found;
@@ -121,7 +95,83 @@ namespace ClarionAssistant.Services
             };
         }
 
-        private static string SessionFor(IdeEndpointRecord.Endpoint ep, Stopwatch sw, bool renew)
+        /// <summary>
+        /// One tools/call of an IdeOnly tool on the pane <paramref name="ep"/>, inside <paramref name="budgetMs"/> counted
+        /// from <paramref name="sw"/> (initialize included when the session is not cached). Returns the tool's text result;
+        /// throws on any transport failure (HTTP status, timeout, no result). Shared with IdeTabClient (GH #205).
+        /// </summary>
+        internal static string CallTool(IdeEndpointRecord.Endpoint ep, string toolName, Dictionary<string, object> args,
+                                        Stopwatch sw, int budgetMs)
+        {
+            var res = CallToolRaw(ep, toolName, args, sw, budgetMs);
+            object content;
+            var list = res.TryGetValue("content", out content) ? content as object[] : null;
+            var first = list != null && list.Length > 0 ? list[0] as Dictionary<string, object> : null;
+            object textObj;
+            string text = first != null && first.TryGetValue("text", out textObj) ? textObj as string : null;
+            if (text == null) throw new IOException("empty tool result");
+            return text;
+        }
+
+        /// <summary>
+        /// b8f9431c: one tools/call on <paramref name="ep"/>, returning the WHOLE MCP result ({content, isError}) as the
+        /// IDE sent it, for the standalone's forwarded IDE tools. Same transport and budget rules as <see cref="CallTool"/>;
+        /// a non-200 reply throws <see cref="IdeHttpStatusException"/> (its Status says which), a missing result IOException.
+        /// The one retry is on HTTP 400 only - the endpoint rejected the session BEFORE running anything - so a tool that
+        /// changes the IDE is never sent twice.
+        /// </summary>
+        internal static Dictionary<string, object> CallToolRaw(IdeEndpointRecord.Endpoint ep, string toolName,
+                                                               Dictionary<string, object> args, Stopwatch sw, int budgetMs,
+                                                               Dictionary<string, object> meta = null)
+        {
+            string session = SessionFor(ep, sw, false, budgetMs);
+            var prm = new Dictionary<string, object> { { "name", toolName }, { "arguments", args } };
+            // b8f9431c review M2: params._meta carries the solution this call was matched to; the IDE checks it again.
+            if (meta != null && meta.Count > 0) prm["_meta"] = meta;
+            // MaxJsonLength: the default 2 MB cap would throw on a large forwarded write (apply_embed_edits, b8f9431c).
+            string body = new JavaScriptSerializer { MaxJsonLength = int.MaxValue }.Serialize(new Dictionary<string, object>
+            {
+                { "jsonrpc", "2.0" }, { "id", 2 }, { "method", "tools/call" }, { "params", prm }
+            });
+
+            string sessionOut;
+            int status;
+            string reply = Post(ep, body, session, sw, budgetMs, out sessionOut, out status);
+            if (status == 400)   // the pane forgot the session (restarted, or swept it): one fresh initialize
+            {
+                session = SessionFor(ep, sw, true, budgetMs);
+                reply = Post(ep, body, session, sw, budgetMs, out sessionOut, out status);
+            }
+            if (status != 200) throw new IdeHttpStatusException(status);
+
+            var js = new JavaScriptSerializer { MaxJsonLength = int.MaxValue, RecursionLimit = 1000 };
+            var env = js.DeserializeObject(reply) as Dictionary<string, object>;
+            object r;
+            var res = env != null && env.TryGetValue("result", out r) ? r as Dictionary<string, object> : null;
+            if (res == null)
+            {
+                // b8f9431c review L4: a JSON-RPC error object (method not found, invalid params, internal error) keeps
+                // its code and message, so the caller can say whether anything ran.
+                object e;
+                var err = env != null && env.TryGetValue("error", out e) ? e as Dictionary<string, object> : null;
+                if (err != null)
+                {
+                    object c, m;
+                    int code = err.TryGetValue("code", out c) && c != null ? SafeInt(c) : 0;
+                    string msg = err.TryGetValue("message", out m) ? m as string : null;
+                    throw new IdeJsonRpcErrorException(code, msg);
+                }
+                throw new IOException("no result in the reply");
+            }
+            return res;
+        }
+
+        private static int SafeInt(object o)
+        {
+            try { return Convert.ToInt32(o); } catch { return 0; }
+        }
+
+        private static string SessionFor(IdeEndpointRecord.Endpoint ep, Stopwatch sw, bool renew, int budgetMs)
         {
             lock (_sessionLock)
             {
@@ -132,18 +182,18 @@ namespace ClarionAssistant.Services
                 + "\"capabilities\":{},\"clientInfo\":{\"name\":\"clarion-mcp-server-live-text\",\"version\":\"1\"}}}";
             string sessionOut;
             int status;
-            Post(ep, body, null, sw, out sessionOut, out status);
+            Post(ep, body, null, sw, budgetMs, out sessionOut, out status);
             if (status != 200 || string.IsNullOrEmpty(sessionOut)) throw new IOException("initialize failed (HTTP " + status + ")");
             lock (_sessionLock) { _sessions[ep.Label] = sessionOut; }
             return sessionOut;
         }
 
         // One POST, inside what is left of the budget. Returns the body; status and the session header via out.
-        private static string Post(IdeEndpointRecord.Endpoint ep, string body, string session, Stopwatch sw,
+        private static string Post(IdeEndpointRecord.Endpoint ep, string body, string session, Stopwatch sw, int budgetMs,
                                    out string sessionOut, out int status)
         {
-            int left = TotalBudgetMs - (int)sw.ElapsedMilliseconds;
-            if (left <= 0) throw new TimeoutException("the " + TotalBudgetMs + " ms budget ran out");
+            int left = budgetMs - (int)sw.ElapsedMilliseconds;
+            if (left <= 0) throw new TimeoutException("the " + budgetMs + " ms budget ran out");
 
             // Connect to the IP (no name resolution, so no ::1 attempt), but send Host: localhost:<port>, the host the
             // pane's HttpListener prefix is registered under (http.sys matches the prefix on the Host header).
@@ -179,7 +229,7 @@ namespace ClarionAssistant.Services
 
         // An exception as a Reason: type and message. The token only ever travels in a request header, which no
         // WebException/IOException message includes, and HTTP error replies are reported by status, not by body.
-        private static string Describe(Exception ex, Stopwatch sw)
+        internal static string Describe(Exception ex, Stopwatch sw)
         {
             return ex is WebException && ((WebException)ex).Status == WebExceptionStatus.Timeout
                 ? "timed out after " + sw.ElapsedMilliseconds + " ms"
@@ -187,5 +237,31 @@ namespace ClarionAssistant.Services
         }
 
         private static void Write(string line) { if (Log != null) try { Log(line); } catch { } }
+    }
+
+    /// <summary>b8f9431c: the IDE endpoint answered with a non-200 HTTP status. The message stays "HTTP &lt;status&gt;", as the
+    /// IOException it replaces said; the body is never part of it.</summary>
+    public sealed class IdeHttpStatusException : IOException
+    {
+        public readonly int Status;
+        public IdeHttpStatusException(int status) : base("HTTP " + status) { Status = status; }
+    }
+
+    /// <summary>b8f9431c review L4: the IDE answered with a JSON-RPC error object instead of a tool result. -32601 (method
+    /// not found), -32602 (invalid params), -32600 (invalid request) and -32700 (parse error) are refusals before any tool
+    /// ran.</summary>
+    public sealed class IdeJsonRpcErrorException : IOException
+    {
+        public readonly int Code;
+        public readonly string RpcMessage;
+        public IdeJsonRpcErrorException(int code, string message)
+            : base("JSON-RPC error " + code + (string.IsNullOrEmpty(message) ? "" : ": " + message))
+        {
+            Code = code;
+            RpcMessage = message;
+        }
+
+        /// <summary>True when the code says the request was rejected before any tool ran.</summary>
+        public bool NothingRan { get { return Code == -32601 || Code == -32602 || Code == -32600 || Code == -32700; } }
     }
 }

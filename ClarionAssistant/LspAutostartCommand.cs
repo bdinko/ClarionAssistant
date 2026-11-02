@@ -84,6 +84,18 @@ namespace ClarionAssistant
             try { EditorLiveTextProvider.Register(); }
             catch (Exception ex) { Debug.WriteLine("[LspAutostart] live-text provider failed: " + ex.Message); }
 
+            // GH #205: write_file / append_to_file never write underneath a native editor tab's stale buffer. The IDE
+            // half of the check (editor_tab_sync, and the direct probe when this addin serves write_file itself). Here,
+            // at addin start on the UI thread, so it works with no chat tab and knows the UI thread to post to.
+            try { NativeTabSync.Register(); }
+            catch (Exception ex) { Debug.WriteLine("[LspAutostart] native tab sync failed: " + ex.Message); }
+
+            // GH #205 pipeline run 1: and the endpoint the standalone server calls those through (editor_tab_sync,
+            // get_live_text), plus the IDE's open solution record, with NO chat pane. They used to exist only while a chat
+            // pane's McpServer ran. One endpoint record per IDE (McpServer hands it between its servers).
+            try { IdeCallbackHost.Start(); }
+            catch (Exception ex) { Debug.WriteLine("[LspAutostart] IDE callback host failed: " + ex.Message); }
+
             // fc420c30: the MCP editor tools reach the CA Editor (Monaco) instead of the native document hidden under it.
             // At addin start, on the UI thread, so it works with no chat tab and the router knows the UI thread.
             try
@@ -181,6 +193,11 @@ namespace ClarionAssistant
                     ? ClarionVersionSelector.NormalizeIdeChoice(live) : null;
             };
             IdeSolutionRecord.ConfigDirProvider = ClarionConfigDirectory.Resolve;
+            // 5a5581e6: and the live build configuration, so .red sections follow Build > Set Configuration; re-published
+            // on ProjectService.SolutionConfigurationChanged (and on every solution poll, which compares it too).
+            IdeSolutionRecord.BuildConfigurationProvider = EditorService.GetOpenSolutionConfiguration;
+            try { SubscribeSolutionConfigurationChanged(); }
+            catch (Exception ex) { Debug.WriteLine("[LspAutostart] SolutionConfigurationChanged subscribe failed: " + ex.Message); }
 
             // Run() is a /Workspace/Autostart command, so this is the UI thread with the workbench's
             // WindowsFormsSynchronizationContext installed. Without one the handler below runs inline
@@ -203,6 +220,33 @@ namespace ClarionAssistant
                 catch { }
             };
             PropertyService.PropertyChanged += _versionHandler;
+        }
+
+        private static Delegate _configurationChangedHandler;
+
+        /// <summary>5a5581e6: ProjectService.SolutionConfigurationChanged (a static event; args ignored) re-publishes
+        /// the record, so the standalone sees a Debug/Release switch at once.</summary>
+        private static void SubscribeSolutionConfigurationChanged()
+        {
+            var asm = Assembly.Load("ICSharpCode.SharpDevelop");
+            var type = asm != null ? asm.GetType("ICSharpCode.SharpDevelop.Project.ProjectService") : null;
+            var evt = type != null ? type.GetEvent("SolutionConfigurationChanged", BindingFlags.Public | BindingFlags.Static) : null;
+            MethodInfo handler = typeof(LspAutostartCommand).GetMethod("OnSolutionConfigurationChanged", BindingFlags.NonPublic | BindingFlags.Static);
+            if (evt == null || handler == null) return;
+            _configurationChangedHandler = Delegate.CreateDelegate(evt.EventHandlerType, handler);
+            evt.AddEventHandler(null, _configurationChangedHandler);
+        }
+
+        private static void OnSolutionConfigurationChanged(object sender, EventArgs e)
+        {
+            try
+            {
+                // Posted: run after the IDE has stored the new configuration.
+                var ctx = _uiContext;
+                if (ctx != null) ctx.Post(_ => IdeSolutionRecord.Republish(), null);
+                else IdeSolutionRecord.Republish();
+            }
+            catch (Exception ex) { Debug.WriteLine("[LspAutostart] configuration republish failed: " + ex.Message); }
         }
 
         /// <summary>One PropertyService read; raises OnIdeVersionChanged when the choice moved. Never throws.</summary>

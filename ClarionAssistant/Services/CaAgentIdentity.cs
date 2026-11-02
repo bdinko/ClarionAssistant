@@ -4,14 +4,26 @@ using System.Text;
 namespace ClarionAssistant.Services
 {
     /// <summary>
-    /// Identity helpers for CA-spawned Claude Code terminals that register
-    /// with the MultiTerminal broker. Each tab is known by a short numbered agent name
-    /// (CA1, CA2, ...) - by name alone, with no docId: a docId identifies a pane
-    /// MultiTerminal itself launched (ticket b24bcaf4).
+    /// Identity helpers for CA-spawned assistant terminals. Each tab is known by a short
+    /// numbered name whose prefix says which assistant is in it: CA1 (Claude Code), CP1
+    /// (Copilot CLI), CX1 (Codex CLI). A Claude tab's name is also its MultiTerminal identity -
+    /// by name alone, with no docId: a docId identifies a pane MultiTerminal itself launched
+    /// (ticket b24bcaf4). Copilot and Codex tabs don't register with MultiTerminal; their names
+    /// are labels only (ticket cfb63b58).
     /// </summary>
     public static class CaAgentIdentity
     {
-        private const string NamePrefix = "CA";
+        public const string ClaudePrefix  = "CA";
+        public const string CopilotPrefix = "CP";
+        public const string CodexPrefix   = "CX";
+
+        /// <summary>CP for Copilot, CX for Codex, and CA for Claude or anything unrecognised.</summary>
+        public static string PrefixForBackend(string backend)
+        {
+            if (string.Equals(backend, "Copilot", StringComparison.OrdinalIgnoreCase)) return CopilotPrefix;
+            if (string.Equals(backend, "Codex",   StringComparison.OrdinalIgnoreCase)) return CodexPrefix;
+            return ClaudePrefix;
+        }
 
         /// <summary>
         /// The lowest-numbered CA1, CA2, CA3, ... that <paramref name="isTaken"/> does not
@@ -32,12 +44,23 @@ namespace ClarionAssistant.Services
         /// </summary>
         public static string NextFreeName(Func<string, bool> isTaken)
         {
+            return NextFreeName(ClaudePrefix, isTaken);
+        }
+
+        /// <summary>
+        /// The lowest-numbered <paramref name="prefix"/>1, 2, 3, ... that
+        /// <paramref name="isTaken"/> does not reject. Each prefix numbers on its own, so a
+        /// Copilot tab opened beside CA1 is CP1, not CP2.
+        /// </summary>
+        public static string NextFreeName(string prefix, Func<string, bool> isTaken)
+        {
+            if (string.IsNullOrEmpty(prefix)) prefix = ClaudePrefix;
             for (int n = 1; n < 1000; n++)
             {
-                string candidate = NamePrefix + n;
+                string candidate = prefix + n;
                 if (isTaken == null || !isTaken(candidate)) return candidate;
             }
-            return NamePrefix + "-" + Guid.NewGuid().ToString("N").Substring(0, 6);
+            return prefix + "-" + Guid.NewGuid().ToString("N").Substring(0, 6);
         }
 
         /// <summary>
@@ -54,7 +77,32 @@ namespace ClarionAssistant.Services
             return agentName + " · " + context;
         }
 
+        /// <summary>
+        /// The context part of the label of a tab that follows the IDE's solution (TerminalTab.FollowsIdeSolution):
+        /// the name of <paramref name="ideSolutionPath"/>, or <paramref name="plainName"/> (the tab's "Terminal N")
+        /// while the IDE has no solution open - which TabLabel shows as the agent name alone (ticket 9e1bd280).
+        ///
+        /// WHY: every tool in a tab answers for the solution open in the IDE, so a tab opened on v61POSitive that
+        /// kept saying "CA1 · v61POSitive" after the IDE opened UltimateSQLTest named a solution none of its tools
+        /// served. Live test F4 (2026-10-19): the rule used to follow only a tab opened ON a solution, so a New
+        /// Chat tab - by far the common one - showed bare "CA1" while demoleg was open and stayed "CA1" after the
+        /// switch to UltimateSQLTest, though its tools had followed. Which tabs follow is the caller's flag; a tab
+        /// opened on a project or class keeps its own context. Only the context moves; the agent name (CA1) is the
+        /// tab's MultiTerminal identity and never changes here.
+        /// </summary>
+        public static string IdeSolutionContext(string plainName, string ideSolutionPath)
+        {
+            string name = null;
+            if (!string.IsNullOrEmpty(ideSolutionPath))
+            {
+                try { name = System.IO.Path.GetFileNameWithoutExtension(ideSolutionPath.Trim()); }
+                catch { name = null; }
+            }
+            return string.IsNullOrWhiteSpace(name) ? plainName : name;
+        }
+
         private const string ExitTitlePrefix = "ca-assistant-exited:";
+        private const string RunningTitle = "Clarion Assistant";
 
         /// <summary>
         /// Wrap the backend invocation so the tab learns when the assistant has ended.
@@ -73,7 +121,12 @@ namespace ClarionAssistant.Services
         public static string WrapWithExitSignal(string invocation, string tabId)
         {
             int split = ExitTitlePrefix.Length / 2;
-            return "try { " + invocation + " } finally { "
+            // Reset the title first, so the finally's marker is always a CHANGE. Setting a title
+            // to the value it already has may produce no title-change sequence at all, and a tab
+            // relaunched in the same console would then never see its exit (Codex adversary gate,
+            // ticket cfb63b58).
+            return "$Host.UI.RawUI.WindowTitle = '" + RunningTitle + "'; "
+                + "try { " + invocation + " } finally { "
                 + "Remove-Item Env:MULTITERMINAL_NAME -ErrorAction SilentlyContinue; "
                 + "$Host.UI.RawUI.WindowTitle = '" + ExitTitlePrefix.Substring(0, split) + "' + '"
                 + ExitTitlePrefix.Substring(split) + EscapeForPowerShellSingleQuote(tabId) + "' }";
