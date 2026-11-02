@@ -153,6 +153,144 @@ static class EmbedSaveOrderSourceScan
         Ok("the page's mirror-mode refusal still tells the host (embed mode)",
             gate > ds && gateEnd > gate && page.Substring(gate, gateEnd - gate).Contains("postToHost({ action: 'save'"));
 
+        // ---- GH #179 (254e4353): the save journal outlives ok=True ----
+        int rtj = view.IndexOf("private void RunSaveRoundTripCore(", StringComparison.Ordinal);
+        int rtjEnd = rtj >= 0 ? view.IndexOf("private bool IsStillLive()", rtj, StringComparison.Ordinal) : -1;
+        string rtBody = rtj >= 0 && rtjEnd > rtj ? view.Substring(rtj, rtjEnd - rtj) : "";
+        int bj = rtBody.IndexOf("BeginSaveJournal(current);", StringComparison.Ordinal);
+        int firstSave = rtBody.IndexOf("ModernEmbeditorSaver.Save", StringComparison.Ordinal);
+        Ok("the journal is written before ANY native save in the round-trip", bj > 0 && firstSave > bj,
+            "journal@" + bj + " firstSave@" + firstSave);
+        // Nothing on the success path retires it: the Generator faults AFTER refreshPadSources DONE. The only retires
+        // in the round-trip are on a failure that left the text in the editor.
+        Ok("the round-trip never touches the journal file directly", !rtBody.Contains("EmbedSaveJournal.Retire(") &&
+            !rtBody.Contains("EmbedSaveJournal.Archive("));
+        bool retiresGuarded = true;
+        int nRetire = 0;
+        for (int i = rtBody.IndexOf("RetireSaveJournal(", StringComparison.Ordinal); i >= 0;
+             i = rtBody.IndexOf("RetireSaveJournal(", i + 1, StringComparison.Ordinal))
+        {
+            nRetire++;
+            string before = rtBody.Substring(Math.Max(0, i - 220), Math.Min(220, i));
+            bool failureOnly = before.Contains("else if (editorIntact)") || rtBody.Substring(Math.Max(0, i - 10), Math.Min(10, i)).Contains("if (!ok) ");
+            if (!failureOnly) retiresGuarded = false;
+        }
+        Ok("the round-trip retires the journal ONLY on a failure that left the text in the editor (never on ok=True)",
+            retiresGuarded && nRetire == 2, "retires=" + nRetire);
+        // A journal file is deleted without writing a copy only where its text is safe elsewhere: the failure that
+        // left it in the editor, the persisted-at-open retire, and (live test 2026-10-19) after the open has
+        // already written a copy for slots it could not place: the not-placeable toast and the two offer answers.
+        Ok("the journal file is deleted (no new copy) in exactly five places",
+            Count(view, "EmbedSaveJournal.Retire(") == 5, "found " + Count(view, "EmbedSaveJournal.Retire("));
+        int hso = view.IndexOf("private void HandleSavedEditsOffer(", StringComparison.Ordinal);
+        int hsoEnd = hso >= 0 ? view.IndexOf("private void BeginSaveJournal(", hso, StringComparison.Ordinal) : -1;
+        string hsoBody = hso >= 0 && hsoEnd > hso ? view.Substring(hso, hsoEnd - hso) : "";
+        Ok("both offer buttons keep a dated copy (Archive, or just Retire when the offer already wrote the copy)",
+            Count(hsoBody, "EmbedSaveJournal.Archive(") == 2 && Count(hsoBody, "EmbedSaveJournal.Retire(") == 2 &&
+            Count(hsoBody, "copy != null && Services.EmbedSaveJournal.Retire(") == 2);
+        Ok("the next open checks the journal", view.Contains("CheckSaveJournal();   // a save that did not survive the Generator"));
+        int ose = page.IndexOf("msg.type === 'offerSavedEdits'", StringComparison.Ordinal);
+        int oseEnd = ose >= 0 ? page.IndexOf("} else if (msg.type", ose + 10, StringComparison.Ordinal) : -1;
+        string oseBody = ose >= 0 && oseEnd > ose ? page.Substring(ose, oseEnd - ose) : "";
+        int restoreBtn = oseBody.IndexOf("label: 'Restore'", StringComparison.Ordinal);
+        int applyAt = oseBody.IndexOf("applyOrParkSlots(", StringComparison.Ordinal);
+        Ok("the page OFFERS the lost save (restored only from the Restore button, never on arrival)",
+            oseBody.Contains("showActionToast(") && restoreBtn > 0 && applyAt > restoreBtn &&
+            !oseBody.Contains("restoreSlotContents(") && oseBody.Contains("label: 'Discard (a copy is kept)'"), "restore@" + restoreBtn + " apply@" + applyAt);
+        Ok("the offer's buttons are exactly 'Restore' and 'Discard (a copy is kept)'",
+            Count(oseBody, "label: '") == 2 && oseBody.Contains("label: 'Restore'") && oseBody.Contains("label: 'Discard (a copy is kept)'"));
+        Ok("restoreSlots and the offer share applyOrParkSlots", page.Contains("function applyOrParkSlots(slots)") &&
+            Count(page, "applyOrParkSlots(") == 3);
+
+        // ---- pipeline run 1 ----
+        int cj = view.IndexOf("private void CheckSaveJournal()", StringComparison.Ordinal);
+        int cjEnd = cj >= 0 ? view.IndexOf("private void HandleSavedEditsOffer(", cj, StringComparison.Ordinal) : -1;
+        string cjBody = cj >= 0 && cjEnd > cj ? view.Substring(cj, cjEnd - cj) : "";
+        // Live test 2026-10-19: the process start time joins the pid, so a recycled pid is not "this session". The
+        // bare verdict is read only for the log line; it never branches.
+        // Live test 2026-10-19 G1: ... and the .app's last write, so a Persisted entry read back after Clarion's Recover
+        // is retired only once the .app was saved after it (Keep otherwise, with the reason in the log).
+        Ok("the open decides with the session rule (EmbedSaveJournal.Decide + pid + process start + .app write), not the bare verdict",
+            cjBody.Contains("EmbedSaveJournal.Decide(e, _originalSlotTexts, MyPid(), MyStart(), appWrite)") &&
+            Count(cjBody, "EmbedSaveJournal.Decide(") == 1 &&
+            Count(cjBody, "verdict") == 2 && cjBody.Contains("\" -> \" + verdict + \" -> \" + act"));
+        Ok("G1: the .app time is read BEFORE Decide, and a Keep logs its reason",
+            cjBody.IndexOf("appWrite = File.GetLastWriteTimeUtc(JournalApp())", StringComparison.Ordinal) > 0 &&
+            cjBody.IndexOf("appWrite = File.GetLastWriteTimeUtc(JournalApp())", StringComparison.Ordinal) <
+                cjBody.IndexOf("EmbedSaveJournal.Decide(", StringComparison.Ordinal) &&
+            cjBody.Contains("EmbedSaveJournal.KeepReason(e, MyPid(), MyStart(), appWrite)"));
+        // ---- pipeline run 2 (PM ruling) ----
+        Ok("the offer's wording uses the .app's last-write time (it never decides whether to offer)",
+            cjBody.Contains("appWrite = File.GetLastWriteTimeUtc(JournalApp())") &&
+            cjBody.Contains("EmbedSaveJournal.OfferMessage(e, appWrite, _originalSlotTexts, plan, copy, current)") && !cjBody.Contains("IsSuperseded") &&
+            !cjBody.Contains("AppWrittenSince"));
+        // Every use of the .app time in the open check is its read, the log line, the offer's wording, or Decide (whose
+        // unit tests pin that it only decides Retire vs Keep for a Persisted entry, G1): nothing here may branch on it
+        // (a later write is the #179 reporter's crash, and it must still be offered).
+        string badUse = null;
+        foreach (var line in cjBody.Split('\n'))
+        {
+            if (!line.Contains("appWrite")) continue;
+            if (line.Contains("DateTime? appWrite = null;") || line.Contains("appWrite = File.GetLastWriteTimeUtc(JournalApp())") ||
+                line.Contains("EmbedSaveJournal.Decide(e, _originalSlotTexts, MyPid(), MyStart(), appWrite);") ||
+                line.Contains("? \" (\" + Services.EmbedSaveJournal.KeepReason(e, MyPid(), MyStart(), appWrite) + \")\" : \"\"));") ||
+                line.Contains("(appWrite.HasValue ? appWrite.Value.ToLocalTime().ToString(") || line.Contains("OfferMessage(e, appWrite, _originalSlotTexts, plan, copy, current)")) continue;
+            badUse = line.Trim();
+        }
+        Ok("the .app time never decides whether a lost save is offered", badUse == null, badUse);
+        // ---- pipeline run 3 ----
+        int arcB = cjBody.IndexOf("OpenDecision.Archive)", StringComparison.Ordinal);
+        int arcEnd = arcB >= 0 ? cjBody.IndexOf("return;", arcB, StringComparison.Ordinal) : -1;
+        string arcBody = arcB >= 0 && arcEnd > arcB ? cjBody.Substring(arcB, arcEnd - arcB) : "";
+        Ok("a changed-since entry is archived silently (log line, no toast)",
+            arcBody.Contains("EmbedSaveJournal.Archive(") && arcBody.Contains("MonacoSpikeLog.Write(") && !arcBody.Contains("PostJson("),
+            arcBody.Length == 0 ? "archive branch not found" : null);
+        // ---- live test 2026-10-19 ----
+        int offB = arcEnd > 0 ? cjBody.IndexOf("PlanRestore(e, _originalSlotTexts)", arcEnd, StringComparison.Ordinal) : -1;
+        string offBody = offB > 0 ? cjBody.Substring(offB) : "";
+        int wc = offBody.IndexOf("EmbedSaveJournal.WriteCopy(", StringComparison.Ordinal);
+        int np = offBody.IndexOf("NotPlaceableMessage(e, copy)", StringComparison.Ordinal);
+        int offer = offBody.IndexOf("\\\"offerSavedEdits\\\"", StringComparison.Ordinal);
+        Ok("the offer is placed by PlanRestore; slots it can't place get a copy BEFORE anything is shown, named in the toast",
+            offB > 0 && wc > 0 && np > wc && offer > wc && offBody.Contains("ser.Serialize(plan.Slots)") &&
+            !offBody.Contains("RestoredSlots("), "plan@" + offB + " copy@" + wc + " notPlaceable@" + np + " offer@" + offer);
+        Ok("nothing placeable: the journal is retired only AFTER the copy exists, and a toast names it",
+            np > 0 && offBody.LastIndexOf("EmbedSaveJournal.Retire(", np, StringComparison.Ordinal) > wc &&
+            offBody.Substring(wc, np - wc).Contains("\\\"toast\\\""));
+        // ---- review F2 (rulings F2-2, F2-3) ----
+        int wcc = offBody.IndexOf("EmbedSaveJournal.WriteCurrentCopy(e, _originalSlotTexts, plan)", StringComparison.Ordinal);
+        int wccFail = wcc > 0 ? offBody.IndexOf("return;", wcc, StringComparison.Ordinal) : -1;
+        Ok("F2-2: the current text Restore replaces is copied BEFORE the offer is posted, and a failed copy offers nothing",
+            wcc > np && offer > wcc && wccFail > wcc && wccFail < offer &&
+            offBody.Substring(wcc, wccFail - wcc).Contains("catch (Exception"), "currentCopy@" + wcc + " offer@" + offer);
+        int ms = view.IndexOf("private static DateTime? MyStart()", StringComparison.Ordinal);
+        string msBody = ms >= 0 ? view.Substring(ms, Math.Min(400, view.Length - ms)) : "";
+        Ok("F2-3: the process start is compared in UTC", msBody.Contains("StartTime.ToUniversalTime()"));
+        Ok("F2-3: the .app time is read in UTC", !cjBody.Contains("File.GetLastWriteTime(JournalApp())"));
+        int sw = view.IndexOf("private static void SweepStaleJournalsOnce()", StringComparison.Ordinal);
+        string swBody = sw >= 0 ? view.Substring(sw, Math.Min(1400, view.Length - sw)) : "";
+        Ok("the once-per-session sweep also prunes old recovery copies",
+            swBody.Contains("EmbedRecovery.PruneOlderThan(Services.EmbedSaveJournal.MaxAge, DateTime.Now)"));
+        Ok("the first open of a session sweeps stale journals before reading this one",
+            cjBody.IndexOf("SweepStaleJournalsOnce();", StringComparison.Ordinal) >= 0 &&
+            cjBody.IndexOf("SweepStaleJournalsOnce();", StringComparison.Ordinal) < cjBody.IndexOf("EmbedSaveJournal.Read(", StringComparison.Ordinal) &&
+            view.Contains("EmbedSaveJournal.SweepStale(DateTime.Now)"));
+        int ja = view.IndexOf("private string JournalApp()", StringComparison.Ordinal);
+        string jaBody = ja >= 0 ? view.Substring(ja, Math.Min(300, view.Length - ja)) : "";
+        Ok("the journal key is the launcher-captured app, never the 'current app' guess",
+            jaBody.Contains("EmbedAppFile") && !jaBody.Contains("TryGetCurrentAppKey"));
+        string launcher = File.ReadAllText(Path.Combine(root, "Services", "ModernEmbeditorLauncher.cs"));
+        Ok("both launcher paths capture the embed's own app and hand it to the view",
+            Count(launcher, "appTree.GetOpenEmbedAppFileName()") == 2 &&
+            launcher.Contains("view.EmbedAppFile = capApp;") && launcher.Contains("overlay.EmbedAppFile = capApp;"));
+
+        // ---- GH #179: every monaco-spike.log line names its process ----
+        string spike = File.ReadAllText(Path.Combine(root, "MonacoClarionSourceEditor.cs"));
+        Ok("MonacoSpikeLog.Write tags each line with the pid, after the timestamp",
+            spike.Contains("ToString(\"yyyy-MM-dd HH:mm:ss.fff\") + \"  \" + PidTag + message"));
+        string cfgDir = File.ReadAllText(Path.Combine(root, "Services", "ClarionConfigDirectory.cs"));
+        Ok("ClarionConfigDirectory.LogOnce writes the same [pid N] shape", cfgDir.Contains("\"  [pid \" +"));
+
         Console.WriteLine(fail == 0 ? "all passed" : fail + " failed");
         return fail == 0 ? 0 : 1;
     }

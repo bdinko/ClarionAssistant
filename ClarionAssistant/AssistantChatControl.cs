@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
@@ -1079,6 +1079,11 @@ namespace ClarionAssistant
                     SyncVersionWithIde();
                 }
 
+                // Every poll, not just on a switch (F4, 9e1bd280): the IDE closing its solution, or reopening the
+                // one CA already had, is no OnSolutionChanged, yet the tabs that follow must drop or regain the
+                // name. A no-op while the labels already match.
+                RetitleSolutionTabs(slnPath);
+
                 // Backstop: keep the LSP up whenever a solution is known. Idempotent and
                 // guarded (no-op if already running), this covers the startup-restore case
                 // where no solution "change" is ever detected, so the LSP comes up within
@@ -1134,6 +1139,11 @@ namespace ClarionAssistant
             DetectFromIde();
             if (!string.Equals(_currentSlnPath, path, StringComparison.OrdinalIgnoreCase)) return;
 
+            // 9e1bd280: the tabs' tools follow the IDE (the standalone servers read this record), so publish the
+            // switch now - the refresh button reaches here between polls - and relabel the tabs to match.
+            Services.IdeSolutionRecord.Publish(path);
+            RetitleSolutionTabs(path);
+
             // Auto-index in the background when a solution is opened (ticket 7f1c67b2).
             // RunIndexAutomatic, not RunIndex: this run is a consequence of opening a
             // solution rather than something the developer asked for, so it gets no
@@ -1146,6 +1156,50 @@ namespace ClarionAssistant
                 RunIndexAutomatic(false); // full index
             else
                 RunIndexAutomatic(true); // incremental update
+        }
+
+        /// <summary>
+        /// The IDE has <paramref name="newPath"/> open (null: none): every tab that follows the IDE's solution
+        /// (New Chat, or opened on a solution) shows it - "CA1 · UltimateSQLTest", or "CA1" alone with none
+        /// (ticket 9e1bd280, live test F4). Its tools already answer for the IDE's solution - the standalone server
+        /// follows IdeSolutionRecord, and the in-process tools (Copilot, Codex) read _currentSlnPath - so a label
+        /// naming another solution, or none while one is open, misleads. Only the context part moves: CA1 is the
+        /// tab's MultiTerminal identity, and a tab opened on a project or class keeps its name. Claude, Copilot and
+        /// Codex tabs alike. Idempotent (RenameTab skips an unchanged name): PollForSolutionChange calls it on every
+        /// poll, OnSolutionChanged on a switch, OnNewChat for the new tab. UI thread.
+        /// </summary>
+        private void RetitleSolutionTabs(string newPath)
+        {
+            if (_tabManager == null) return;
+            foreach (var tab in _tabManager.Tabs)
+                if (!tab.IsHome) RetitleFollowingTab(tab, newPath);
+        }
+
+        /// <summary>One tab of <see cref="RetitleSolutionTabs"/>; a tab that does not follow is left alone.</summary>
+        private void RetitleFollowingTab(TerminalTab tab, string newPath)
+        {
+            if (!tab.FollowsIdeSolution) return;
+            if (string.IsNullOrEmpty(newPath)) newPath = null;
+            string followed = Services.CaAgentIdentity.IdeSolutionContext(tab.DefaultName, newPath);
+            if (string.IsNullOrEmpty(followed)) return;
+
+            if (!string.Equals(tab.SolutionPath, newPath, StringComparison.OrdinalIgnoreCase))
+            {
+                tab.SolutionPath = newPath;
+                if (newPath != null) tab.VersionConfig = _currentVersionConfig;
+            }
+            // BaseName is captured at the first launch; before it, the tab's name is still the bare context.
+            if (tab.BaseName == null)
+            {
+                _tabManager.RenameTab(tab, followed);
+                return;
+            }
+            tab.BaseName = followed;
+            // The same labels the launch and ReleaseAgentName build: "CA1 · name" while an agent name is held,
+            // else the name with its backend suffix ("name CP").
+            _tabManager.RenameTab(tab, tab.AgentName != null
+                ? Services.CaAgentIdentity.TabLabel(tab.AgentName, followed)
+                : ApplyBackendSuffix(followed, tab.AssistantBackend ?? tab.RequestedBackend));
         }
 
         /// <summary>The IDE has a solution open that is not CA's: a switch OnSolutionChanged must handle.</summary>
@@ -1499,11 +1553,60 @@ namespace ClarionAssistant
             catch { }
         }
 
+        // GH #279: what the last run in this IDE did, for the solution it ran on: "Up to date", "Updated",
+        // "Rebuilt" - or, since review D7a, "Error: ..." / "Index cancelled", which stay until the next run instead
+        // of being painted over at once. Kept with the database's stamp (D7d): once something else writes the
+        // database (index_codegraph, the standalone server) the line no longer describes it and is dropped.
+        private readonly Services.IndexOutcomeMemo _indexOutcome = new Services.IndexOutcomeMemo();
+        // Review D7e: an automatic check for ANOTHER solution asked for while a run is in flight runs after it.
+        private readonly Services.IndexFollowUp _indexFollowUp = new Services.IndexFollowUp();
+        // The solution the in-flight run indexes (null when none).
+        private string _indexRunSlnPath;
+
+        /// <summary>Review D6: OutOfProcessIndexer.OnModeDecided, carried through BackgroundWorker.ReportProgress.</summary>
+        private sealed class IndexModeNotice
+        {
+            public readonly bool Incremental;
+            public IndexModeNotice(bool incremental) { Incremental = incremental; }
+        }
+
+        /// <summary>
+        /// GH #279: an AUTOMATIC incremental run (Work With Solution, the IDE opening a solution) starts as a
+        /// quiet check: header text, no spinner, no window. A manual Reindex/Update, an MCP run and an
+        /// automatic FULL run (no database yet - certain to be real work) say "Indexing..."/"Updating..." at once.
+        /// </summary>
+        internal static bool IsQuietIndexCheck(bool showsWindow, bool incremental)
+        {
+            return !showsWindow && incremental;
+        }
+
+        /// <summary>
+        /// GH #279: the header's line for a finished run, so an up-to-date check reads differently from a run
+        /// that changed something. Null for no result (the header falls back to the database's time).
+        /// </summary>
+        internal static string IndexOutcomeText(ClarionCodeGraph.Graph.IndexResult result, DateTime when)
+        {
+            if (result == null) return null;
+            string at = when.ToString("MMM d HH:mm");
+            if (result.Incremental && result.UpToDate)
+                return "Up to date (checked " + at + ")";
+            if (result.Incremental)
+                return "Updated: " + at;
+            if (result.RequestedIncremental && result.UpgradedFromFeatureLevel > 0)
+                return "Rebuilt (index upgrade): " + at;
+            return "Indexed: " + at;
+        }
+
         private void UpdateIndexStatus()
         {
             if (!_header.IsReady) return;
             string dbPath = CurrentDbPath;
-            if (!string.IsNullOrEmpty(dbPath) && File.Exists(dbPath))
+            string outcomeText, outcomeStyle;
+            if (_indexOutcome.TryGet(_currentSlnPath, Services.IndexOutcomeMemo.StampOf(dbPath), out outcomeText, out outcomeStyle))
+            {
+                _header.SetIndexStatus(outcomeText, outcomeStyle);
+            }
+            else if (!string.IsNullOrEmpty(dbPath) && File.Exists(dbPath))
             {
                 var fi = new FileInfo(dbPath);
                 _header.SetIndexStatus("Indexed: " + fi.LastWriteTime.ToString("MMM d HH:mm"));
@@ -1599,6 +1702,7 @@ namespace ClarionAssistant
             var renderer = new WebViewTerminalRenderer { Dock = DockStyle.Fill };
             var tab = _tabManager.CreateTerminalTab(name, renderer);
             tab.SolutionPath = slnPath;
+            tab.FollowsIdeSolution = true;   // its label follows the IDE's solution from here on (9e1bd280)
             tab.WorkingDirectory = Path.GetDirectoryName(slnPath);
             tab.VersionConfig = _currentVersionConfig;
 
@@ -2397,25 +2501,57 @@ namespace ClarionAssistant
                     return;
                 }
                 // Automatic run, and another is already running: the work is in hand. Saying so
-                // out loud is exactly the error 7f1c67b2 exists to remove.
-                if (!showProgressWindow) return;
+                // out loud is exactly the error 7f1c67b2 exists to remove. But only when it is the SAME
+                // solution (review D7e): Work With Solution on A and then quickly on B must still check B,
+                // so B's check is queued and runs when A's run ends.
+                if (!showProgressWindow)
+                {
+                    _indexFollowUp.Queue(_indexRunSlnPath, _currentSlnPath);
+                    return;
+                }
                 MessageBox.Show("An index run is already in progress.", "Index",
                     MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
 
             _header.SetIndexButtonsEnabled(false);
-            _header.SetIndexStatus(incremental ? "Updating..." : "Indexing...", "active");
+            // GH #279: an AUTOMATIC incremental run starts as a quiet check. Work With Solution runs one on
+            // every open, and on an up-to-date solution it finds nothing to do - but a spinner reading
+            // "Updating..." told the developer the index was being rebuilt every time. The spinner appears
+            // only once the run is known to be real work (see showRealWork below), which an up-to-date check
+            // never is.
+            bool quietCheck = IsQuietIndexCheck(showProgressWindow, incremental);
+            bool realWorkSeen = false;
+            bool? effectiveIncremental = null;   // what the indexer says it runs, once it says (review D6)
+            if (quietCheck)
+                _header.SetIndexStatus(Services.IndexHeaderText.Checking, "");
+            else
+                _header.SetIndexStatus(Services.IndexHeaderText.WorkText(incremental, null), "active");
 
             string slnPath = _currentSlnPath;
+            // Review D6 / D7b: the spinner for a run known to do real work, worded for what it runs ("Rebuilding
+            // index..." for an incremental request that runs full). Painted only while the header still shows THIS
+            // run's solution: a run for A must not put its spinner on B's header after the developer switched.
+            Action showRealWork = () =>
+            {
+                realWorkSeen = true;
+                if (string.Equals(slnPath, _currentSlnPath, StringComparison.OrdinalIgnoreCase))
+                    _header.SetIndexStatus(Services.IndexHeaderText.WorkText(incremental, effectiveIncremental), "active");
+            };
 
             // Index against the IDE's CURRENT Build > Set Clarion Version (16d140e9): re-check it now rather
             // than trust the .red loaded at the last solution change.
             SyncVersionWithIde();
+            // GH #261: and re-read the .red when it (or a file it {include}s) changed since it was loaded:
+            // an edit to the redirection must show in the next index, not after an IDE restart.
+            if (_redFileService != null && _redFileService.IsStale()) LoadRedFile();
 
             // Build library paths from RED file .inc search paths
             List<string> libPaths = BuildIndexLibraryPaths();
             var activeRed = _redFileService;
+            // GH #245: resolve through the build configuration's .red sections, as resolve_red_path does. Read
+            // here, on the UI thread, where the IDE's active configuration can be asked.
+            string buildConfiguration = ClarionAssistant.Services.McpToolRegistry.BuildConfigurationForIndex(slnPath);
 
             _header.ClearIndexLog();
 
@@ -2449,58 +2585,86 @@ namespace ClarionAssistant
             // Which Clarion version (and which source chose it) this run's .red and libraries come from.
             if (_versionSelection != null) runLog.WriteLine(_versionSelection.Describe());
 
-            // Built for every run, SHOWN only when asked (ticket 7f1c67b2). Constructing it
-            // unconditionally is deliberate: it keeps one completion path instead of
-            // null-guarding a dozen call sites, and it means a silent run that FAILS can
-            // simply show the window it already has, fully populated with what went wrong.
-            var progressForm = new Dialogs.IndexProgressForm(
-                Path.GetFileNameWithoutExtension(slnPath), runLog.LogPath, lastRunMs);
-            try
-            {
-                // Full project inventory up front (cheap .sln text parse) so every app is
-                // visible as Pending before the first file parses.
-                var slnProjects = new ClarionCodeGraph.Parsing.SolutionParser().Parse(slnPath);
-                var projectNames = new List<string>();
-                foreach (var p in slnProjects) projectNames.Add(p.Name);
-                progressForm.SetProjects(projectNames);
-            }
-            catch { }
-
             // Cooperative cancel: the form's Cancel sets the flag; the indexer polls it at
             // file boundaries. Interlocked because the poll happens on the worker thread.
             int cancelFlag = 0;
-            progressForm.CancelClicked += () => System.Threading.Interlocked.Exchange(ref cancelFlag, 1);
-            if (showProgressWindow) ShowIndexProgress(progressForm);
+
+            // The progress window. A manual run (and an MCP run) builds and shows it now, as always.
+            // An AUTOMATIC run never shows it except on failure (ticket 7f1c67b2), and since GH #279
+            // does not even BUILD it until that failure: an up-to-date check on Work With Solution
+            // constructs no window at all. Its progress events are kept meanwhile, so a window that
+            // has to appear for a failure is replayed to the state the run reached before failing.
+            Dialogs.IndexProgressForm progressForm = null;
+            var deferredEvents = showProgressWindow ? null : new List<ClarionCodeGraph.Graph.IndexProgressEvent>();
+            Func<Dialogs.IndexProgressForm> ensureProgressForm = () =>
+            {
+                if (progressForm != null) return progressForm;
+                progressForm = new Dialogs.IndexProgressForm(
+                    Path.GetFileNameWithoutExtension(slnPath), runLog.LogPath, lastRunMs);
+                try
+                {
+                    // Full project inventory up front (cheap .sln text parse) so every app is
+                    // visible as Pending before the first file parses.
+                    var slnProjects = new ClarionCodeGraph.Parsing.SolutionParser().Parse(slnPath);
+                    var projectNames = new List<string>();
+                    foreach (var p in slnProjects) projectNames.Add(p.Name);
+                    progressForm.SetProjects(projectNames);
+                }
+                catch { }
+                progressForm.CancelClicked += () => System.Threading.Interlocked.Exchange(ref cancelFlag, 1);
+                if (deferredEvents != null)
+                {
+                    foreach (var dev in deferredEvents)
+                        try { progressForm.OnEvent(dev); } catch { }
+                    deferredEvents.Clear();
+                }
+                return progressForm;
+            };
+            if (showProgressWindow) ShowIndexProgress(ensureProgressForm());
 
             var worker = new BackgroundWorker();
             worker.WorkerReportsProgress = true;
             bool wasCancelled = false;
             bool partialDbDeleted = false;
+            bool ranIncremental = incremental;   // what actually ran (see the feature-level check in IndexSolution)
+            string fallbackWarning = null;       // set only when clarion-indexer.exe was missing (in-process fallback)
             worker.DoWork += (s, e) =>
             {
                 // The editor's completion holds a read-only connection to this db (SymbolIndex, 1c685f2e);
-                // drop it before the write open, so a cancelled full run's delete below is not blocked.
+                // drop it before the child's write open, so a cancelled full run's delete below is not blocked.
                 SymbolIndex.Release(dbPath);
-                var db = new ClarionCodeGraph.Graph.CodeGraphDatabase();
-                db.Open(dbPath);
+                // 583abdec: the index runs in clarion-indexer.exe (64-bit), NOT in Clarion.exe - a 32-bit process
+                // already ~1.5 GB at idle that ran out of memory on a large solution's relationship pass. Same
+                // inputs, same progress channels, same cancel semantics; the IndexResult comes back as JSON.
+                var indexer = new ClarionAssistant.Services.OutOfProcessIndexer();
+                indexer.CancelRequested = () =>
+                    System.Threading.Interlocked.CompareExchange(ref cancelFlag, 0, 0) == 1;
+                indexer.OnProgress += msg =>
+                {
+                    runLog.WriteLine(msg);
+                    ((BackgroundWorker)s).ReportProgress(0, msg);
+                };
+                indexer.OnProgressEvent += ev =>
+                {
+                    // Percent is deliberately 0 on both channels — routing happens on the
+                    // UserState type below, and a fake number invites someone to read it.
+                    ((BackgroundWorker)s).ReportProgress(0, ev);
+                };
+                // Review D6: what the run does, before its first message (child and in-process fallback alike).
+                indexer.OnModeDecided += inc => ((BackgroundWorker)s).ReportProgress(0, new IndexModeNotice(inc));
+                runLog.WriteLine("Indexer process: " + (indexer.ExePath ?? "(addin folder unknown)"));
                 try
                 {
-                    var indexer = new ClarionCodeGraph.Graph.CodeGraphIndexer(db);
-                    indexer.RedService = activeRed; // the IDE's ACTIVE .red — version file + local override
-                    indexer.CancelRequested = () =>
-                        System.Threading.Interlocked.CompareExchange(ref cancelFlag, 0, 0) == 1;
-                    indexer.OnProgress += msg =>
+                    var result = indexer.Run(new ClarionAssistant.Services.IndexRunRequest
                     {
-                        runLog.WriteLine(msg);
-                        ((BackgroundWorker)s).ReportProgress(0, msg);
-                    };
-                    indexer.OnProgressEvent += ev =>
-                    {
-                        // Percent is deliberately 0 on both channels — routing happens on the
-                        // UserState type below, and a fake number invites someone to read it.
-                        ((BackgroundWorker)s).ReportProgress(0, ev);
-                    };
-                    var result = indexer.IndexSolution(slnPath, incremental, libPaths);
+                        SlnPath = slnPath,
+                        DbPath = dbPath,
+                        Incremental = incremental,
+                        Red = activeRed,                         // the IDE's ACTIVE .red — version file + local override
+                        BuildConfiguration = buildConfiguration, // GH #245: the configuration's .red sections
+                        LibraryPaths = libPaths
+                    });
+                    fallbackWarning = indexer.FallbackWarning;
                     e.Result = result;
                 }
                 catch (OperationCanceledException)
@@ -2509,7 +2673,9 @@ namespace ClarionAssistant
                 }
                 finally
                 {
-                    db.Close();
+                    // ef2fd2a9: an incremental request on a database below the current feature level runs FULL
+                    // (it clears the database first), so a cancel of it must be handled as a full cancel.
+                    ranIncremental = indexer.EffectiveIncremental;
                 }
 
                 // A cancelled FULL index cleared the database up front, so what's on disk is
@@ -2518,21 +2684,59 @@ namespace ClarionAssistant
                 // data plus a partial update — and the status line says not to trust it yet.)
                 // The delete is VERIFIED — claiming deletion that a held handle prevented
                 // would be the exact silent lie this window exists to remove.
-                if (wasCancelled && !incremental)
+                if (wasCancelled && !ranIncremental)
                 {
                     SymbolIndex.Release(dbPath);   // a completion may have reopened it mid-run
                     try { File.Delete(dbPath); } catch { }
                     partialDbDeleted = !File.Exists(dbPath);
+                    // A child KILLED after the cancel grace (583abdec) never closed the database, so its WAL and
+                    // shared-memory files are still there. Without the database they describe nothing - and a WAL
+                    // left beside the next run's new file of the same name is what SQLite warns corrupts it.
+                    if (partialDbDeleted)
+                    {
+                        try { File.Delete(dbPath + "-wal"); } catch { }
+                        try { File.Delete(dbPath + "-shm"); } catch { }
+                    }
                 }
             };
             worker.ProgressChanged += (s, e) =>
             {
+                // Review D6: the first moment a run is known to be real work. An incremental request the indexer
+                // runs FULL (the first Work With Solution after an update that raised the feature level) is a
+                // rebuild of minutes - say so at once, not at Pass 2, and say "Rebuilding index...".
+                var mode = e.UserState as IndexModeNotice;
+                if (mode != null)
+                {
+                    effectiveIncremental = mode.Incremental;
+                    if (incremental && !mode.Incremental) showRealWork();
+                    return;
+                }
                 var ev = e.UserState as ClarionCodeGraph.Graph.IndexProgressEvent;
                 if (ev != null)
                 {
+                    // GH #279: the indexer sends no structured event before it starts parsing, and an
+                    // up-to-date incremental run returns before that. So the first one means real work
+                    // (changed projects, or an upgrade to full) - a backstop for the signals above.
+                    if (quietCheck && !realWorkSeen) showRealWork();
                     // The window is closable once a cancel is in flight — late posts from the
                     // still-unwinding worker must not touch a disposed form.
-                    if (!progressForm.IsDisposed)
+                    if (progressForm == null)
+                    {
+                        // Kept coalesced: the window's state is the last event per phase and project, so
+                        // an event replaces the previous one of the same phase and project. That holds the
+                        // buffer to about one entry per project, not one per file, inside a 32-bit IDE.
+                        if (deferredEvents != null)
+                        {
+                            int last = deferredEvents.Count - 1;
+                            if (last >= 0
+                                && string.Equals(deferredEvents[last].Phase, ev.Phase, StringComparison.Ordinal)
+                                && string.Equals(deferredEvents[last].ProjectName, ev.ProjectName, StringComparison.OrdinalIgnoreCase))
+                                deferredEvents[last] = ev;
+                            else
+                                deferredEvents.Add(ev);
+                        }
+                    }
+                    else if (!progressForm.IsDisposed)
                         progressForm.OnEvent(ev);
                     if (externalProgress != null)
                         try { externalProgress(ev); } catch { }
@@ -2540,7 +2744,11 @@ namespace ClarionAssistant
                 }
                 string msg = e.UserState as string;
                 if (msg != null)
+                {
+                    // Review D6: "N of M projects have changes" with N > 0 comes before any parsing.
+                    if (quietCheck && !realWorkSeen && Services.IndexHeaderText.MessageSignalsWork(msg)) showRealWork();
                     _header.AppendIndexLog(msg);
+                }
             };
             worker.RunWorkerCompleted += (s, e) =>
             {
@@ -2552,34 +2760,54 @@ namespace ClarionAssistant
                 try
                 {
                     _header.SetIndexButtonsEnabled(true);
-                    bool formAlive = !progressForm.IsDisposed;
+                    // An automatic run has no window until it needs one (GH #279): null here is normal.
+                    bool formAlive = progressForm != null && !progressForm.IsDisposed;
+
+                    if (e.Error != null || wasCancelled)
+                        _indexOutcome.Clear();   // GH #279: a failed or cancelled run must not keep "Up to date"
 
                     if (e.Error != null)
                     {
-                        externalSummary = "Error indexing solution: " + e.Error.Message;
+                        // 583abdec review L3: an MCP caller (index_solution) gets the short form naming the run log;
+                        // the log and the progress window get the whole message.
+                        externalSummary = ClarionAssistant.Services.OutOfProcessIndexer.McpFailureReply(e.Error, runLog.LogPath);
                         runLog.WriteLine("FAILED: " + e.Error.Message);
                         runLog.Dispose();
+                        // An automatic run stayed hidden while it was working; a FAILED one
+                        // must not (ticket 7f1c67b2). Removing the window removed the only
+                        // place errors were shown, and a background index that quietly stops
+                        // updating is worse than the popup this change exists to suppress —
+                        // every later query would answer from a stale graph, silently.
+                        // Since GH #279 an automatic run builds its window only here, replayed
+                        // to where the run got before it failed.
+                        if (!showProgressWindow && progressForm == null)
+                        {
+                            try { ensureProgressForm(); } catch { }
+                            formAlive = progressForm != null && !progressForm.IsDisposed;
+                        }
                         if (formAlive)
                         {
                             progressForm.RunFailed(e.Error.Message);
-                            // An automatic run stayed hidden while it was working; a FAILED one
-                            // must not (ticket 7f1c67b2). Removing the window removed the only
-                            // place errors were shown, and a background index that quietly stops
-                            // updating is worse than the popup this change exists to suppress —
-                            // every later query would answer from a stale graph, silently.
                             if (!showProgressWindow && !progressForm.Visible)
                             {
                                 ShowIndexProgress(progressForm);
                             }
                         }
-                        _header.SetIndexStatus("Error: " + e.Error.Message, "error");
+                        // The child's failure message carries the end of its stderr on later lines (583abdec):
+                        // the window and the log show all of it, the one-line header only the first.
+                        string headline = e.Error.Message ?? "";
+                        int nl = headline.IndexOfAny(new[] { '\r', '\n' });
+                        // Review D7a: the error IS the header's line until the next run (UpdateIndexStatus used to
+                        // paint over it at once), and it is this run's solution's line, not whichever is shown now.
+                        _indexOutcome.Record(slnPath, "Error: " + (nl >= 0 ? headline.Substring(0, nl) : headline), "error",
+                            Services.IndexOutcomeMemo.StampOf(dbPath));
                         UpdateIndexStatus();
                         return;
                     }
 
                     if (wasCancelled)
                     {
-                        string disposition = incremental
+                        string disposition = ranIncremental
                             ? "The database keeps its previous contents plus a partial update — re-run the index before trusting queries."
                             : (partialDbDeleted
                                 ? "The partial database was deleted — run the index again to rebuild it."
@@ -2588,15 +2816,14 @@ namespace ClarionAssistant
                         runLog.WriteLine("CANCELLED. " + disposition);
                         runLog.Dispose();
                         if (formAlive) progressForm.RunCancelled(disposition);
-                        _header.SetIndexStatus("Index cancelled", "error");
+                        _indexOutcome.Record(slnPath, "Index cancelled", "error", Services.IndexOutcomeMemo.StampOf(dbPath));
                         UpdateIndexStatus();
                         return;
                     }
 
                     var result = e.Result as ClarionCodeGraph.Graph.IndexResult;
                     externalSummary = result != null
-                        ? string.Format(
-                            "CodeGraph indexed successfully:\n" +
+                        ? result.Headline + "\n" + string.Format(
                             "  Solution: {0}\n" +
                             "  Projects: {1}\n" +
                             "  Files: {2}\n" +
@@ -2608,25 +2835,42 @@ namespace ClarionAssistant
                             "  Log: {8}",
                             Path.GetFileName(slnPath), result.ProjectCount, result.FileCount,
                             result.SymbolCount, result.RelationshipCount, result.DurationMs, dbPath,
-                            incremental ? "incremental" : "full",
+                            result.ModeText,
                             runLog.LogPath ?? "(no log written — another index run may hold the log file)")
+                            + "\n" + result.CoverageText()
+                            + (fallbackWarning != null ? "\n  " + fallbackWarning : "")
                         : "Error: index returned no result.";
                     runLog.Dispose();
                     if (formAlive)
                     {
                         if (result != null)
-                            progressForm.RunCompleted(result, incremental);
+                            progressForm.RunCompleted(result, result.Incremental);
                         else
                             // A run that neither erred nor cancelled but returned nothing must not
                             // leave the window ticking forever in its running state.
                             progressForm.RunFailed("Index returned no result.");
                     }
+                    // GH #279: the header says what the run DID, and keeps saying it for this solution,
+                    // so an up-to-date check reads differently from an update or an upgrade to full.
+                    string outcome = IndexOutcomeText(result, DateTime.Now);
+                    if (outcome != null)
+                        _indexOutcome.Record(slnPath, outcome, "", Services.IndexOutcomeMemo.StampOf(dbPath));
+                    else
+                        _indexOutcome.Clear();
                     UpdateIndexStatus();
                 }
                 finally
                 {
                     _indexRunInProgress = false;
+                    _indexRunSlnPath = null;
                     ClarionAssistant.Services.IndexRunGate.Exit(dbPath);
+                    // Review D7e: the automatic check another solution asked for while this run was in flight -
+                    // run it now if that solution is still the one shown. Posted, so it starts after this handler.
+                    if (_indexFollowUp.Take(_currentSlnPath) != null)
+                    {
+                        try { BeginInvoke(new Action(() => RunIndexAutomatic(File.Exists(CurrentDbPath ?? "")))); }
+                        catch { }
+                    }
                     // Idempotent — the branches dispose on their normal paths; this catches
                     // a UI throw that would otherwise leak the per-solution log handle for
                     // the process lifetime (pipeline debugger, run 2).
@@ -2636,7 +2880,7 @@ namespace ClarionAssistant
                     // (ticket 7f1c67b2). Deliberately checks Visible rather than the flag:
                     // the failure branch above SHOWS the window on purpose, and that one is
                     // the developer's to close.
-                    if (!showProgressWindow && !progressForm.IsDisposed && !progressForm.Visible)
+                    if (!showProgressWindow && progressForm != null && !progressForm.IsDisposed && !progressForm.Visible)
                     {
                         try { progressForm.Dispose(); } catch { }
                     }
@@ -2665,7 +2909,7 @@ namespace ClarionAssistant
                 runLog.WriteLine("REFUSED: " + indexHolder + " holds " + dbPath);
                 runLog.Dispose();
                 _header.SetIndexButtonsEnabled(true);
-                if (!progressForm.IsDisposed)
+                if (progressForm != null && !progressForm.IsDisposed)
                     progressForm.RunFailed("An index of this solution's database is already in progress.");
                 if (externalCompleted != null)
                     try { externalCompleted(held); } catch { }
@@ -2676,11 +2920,16 @@ namespace ClarionAssistant
                 // This is the dialog 7f1c67b2 was reported for. A refusal is not a failure — the
                 // indexing the developer needs is already underway. Dispose the window nobody
                 // ever saw, or an automatic run leaks a hidden form on every refusal.
-                if (!showProgressWindow && !progressForm.IsDisposed && !progressForm.Visible)
+                // (Since GH #279 an automatic run has not built one yet, so there is normally none.)
+                if (!showProgressWindow && progressForm != null && !progressForm.IsDisposed && !progressForm.Visible)
                     try { progressForm.Dispose(); } catch { }
+                // A run that never ran must not leave "Checking for changes..." or a spinner in the header -
+                // a refused manual or MCP run no more than a quiet check (review D7c).
+                UpdateIndexStatus();
                 return;
             }
             _indexRunInProgress = true;
+            _indexRunSlnPath = slnPath;
             try
             {
                 worker.RunWorkerAsync();
@@ -2688,7 +2937,9 @@ namespace ClarionAssistant
             catch
             {
                 _indexRunInProgress = false;
+                _indexRunSlnPath = null;
                 ClarionAssistant.Services.IndexRunGate.Exit(dbPath);
+                UpdateIndexStatus();
                 throw;
             }
 
@@ -3426,9 +3677,10 @@ namespace ClarionAssistant
 
             // Annotate the tab with the backend abbreviation so the tab strip
             // makes it obvious at a glance which assistant is driving each tab.
-            // Built from the undecorated name, so a relaunch never stacks labels. A Claude
-            // tab is relabelled again with its MultiTerminal name once that is resolved, and
-            // drops the CC suffix then (every registered tab is Claude, so it says nothing).
+            // Built from the undecorated name, so a relaunch never stacks labels. Each builder
+            // relabels the tab again with its short name once that is resolved - CA<n> (Claude,
+            // also its MultiTerminal name), CP<n> (Copilot) or CX<n> (Codex) - which carries the
+            // backend itself, so the suffix is dropped then (ticket cfb63b58).
             // Captured as is, not stripped: nothing has decorated the name before the first
             // launch, so stripping could only eat real text (a solution named "Billing CO").
             if (tab.BaseName == null) tab.BaseName = tab.Name;
@@ -3447,7 +3699,7 @@ namespace ClarionAssistant
         {
             if (string.Equals(backend, "Claude",  StringComparison.OrdinalIgnoreCase)) return "CC";
             if (string.Equals(backend, "Copilot", StringComparison.OrdinalIgnoreCase)) return "CP";
-            if (string.Equals(backend, "Codex",   StringComparison.OrdinalIgnoreCase)) return "CO";
+            if (string.Equals(backend, "Codex",   StringComparison.OrdinalIgnoreCase)) return "CX";
             return "";
         }
 
@@ -3461,11 +3713,12 @@ namespace ClarionAssistant
             return StripBackendSuffix(currentName) + " " + suffix;
         }
 
-        /// <summary>The tab name without a trailing backend suffix (" CC", " CP", " CO").</summary>
+        /// <summary>The tab name without a trailing backend suffix (" CC", " CP", " CX", and
+        /// " CO", Codex's suffix before ticket cfb63b58, so an older label is cleaned up too).</summary>
         private static string StripBackendSuffix(string name)
         {
             if (string.IsNullOrEmpty(name)) return name;
-            foreach (string prior in new[] { " CC", " CP", " CO" })
+            foreach (string prior in new[] { " CC", " CP", " CX", " CO" })
                 if (name.EndsWith(prior, StringComparison.Ordinal))
                     return name.Substring(0, name.Length - prior.Length);
             return name;
@@ -3487,7 +3740,7 @@ namespace ClarionAssistant
                 var built = BuildClaudeCommand(tab, ctx);
                 if (built == null) return; // abort already handled inside the builder
 
-                StartTabTerminal(tab, ctx, built.Cmd, "Claude Code running", "[LaunchClaude]");
+                StartTabTerminal(tab, ctx, built.LaunchCmd, "Claude Code running", "[LaunchClaude]");
 
                 // Clean up temp prompt files after Claude Code has read them
                 if (built.TempFiles.Count > 0)
@@ -3521,7 +3774,7 @@ namespace ClarionAssistant
                 var built = BuildCopilotCommand(tab, ctx);
                 if (built == null) return; // abort already handled inside the builder
 
-                StartTabTerminal(tab, ctx, built.Cmd, "Copilot CLI running", "[LaunchCopilot]");
+                StartTabTerminal(tab, ctx, built.LaunchCmd, "Copilot CLI running", "[LaunchCopilot]");
             }
             catch (Exception ex)
             {
@@ -3544,7 +3797,7 @@ namespace ClarionAssistant
                 var built = BuildCodexCommand(tab, ctx);
                 if (built == null) return; // abort already handled inside the builder
 
-                StartTabTerminal(tab, ctx, built.Cmd, "Codex CLI running", "[LaunchCodex]");
+                StartTabTerminal(tab, ctx, built.LaunchCmd, "Codex CLI running", "[LaunchCodex]");
             }
             catch (Exception ex)
             {
@@ -3569,6 +3822,31 @@ namespace ClarionAssistant
         {
             public string Cmd;
             public System.Collections.Generic.List<string> TempFiles = new System.Collections.Generic.List<string>();
+            // "model X was retired; using Y" when GetLaunchModel swapped a retired id.
+            // Printed in the terminal itself, ahead of the CLI: the header no longer
+            // displays UpdateStatus text, so the status line would never show it. Then a
+            // short pause, because Copilot's and Codex's full-screen UIs clear the screen
+            // as they start (seen live 2026-10-08). The swap is saved, so this happens on
+            // one launch only.
+            public string ModelNotice;
+            private const int ModelNoticePauseSeconds = 5;
+
+            // Cmd, preceded by a yellow Write-Host of ModelNotice when there is one.
+            // Same sanitising as the Codex MCP warning: CR/LF and double quotes would
+            // break out of the outer pwsh -Command "..." payload; ' is doubled.
+            public string LaunchCmd
+            {
+                get
+                {
+                    if (string.IsNullOrEmpty(ModelNotice)) return Cmd;
+                    string text = ("Clarion Assistant: " + ModelNotice
+                            + ". Continuing in " + ModelNoticePauseSeconds + " seconds...")
+                        .Replace("\r", " ").Replace("\n", " ")
+                        .Replace("\"", "'").Replace("'", "''");
+                    return $"Write-Host '{text}' -ForegroundColor Yellow; "
+                        + $"Start-Sleep -Seconds {ModelNoticePauseSeconds}; " + Cmd;
+                }
+            }
         }
 
         /// <summary>
@@ -3865,9 +4143,11 @@ namespace ClarionAssistant
             string colorfgbg = _isDarkTheme ? "$env:COLORFGBG='15;0'" : "$env:COLORFGBG='0;15'";
 
             // Pass the user's selected model via --model. Empty value means "no
-            // override" — the CLI will use the account's default (Sonnet 4.6 on
-            // Pro, Opus 4.7 on Max). Single-quote any apostrophes for safety.
-            string claudeModelVal = (_settings.Get("Claude.Model") ?? "").Trim();
+            // override" — the CLI will use the account's default (Opus 5.5 on every
+            // plan as of 2026-10). A saved id the provider has retired is swapped for
+            // its replacement from models.json. Single-quote any apostrophes for safety.
+            string claudeModelNotice;
+            string claudeModelVal = GetLaunchModel("Claude", "Claude.Model", out claudeModelNotice);
             string claudeModelFlag = string.IsNullOrEmpty(claudeModelVal)
                 ? string.Empty
                 : $" --model '{claudeModelVal.Replace("'", "''")}'";
@@ -3934,7 +4214,7 @@ namespace ClarionAssistant
             string claudeCmd = $"cd '{ctx.SafeWorkDir}'; $env:CLARION_ASSISTANT_EMBEDDED='1'; {tabEnv}; {mtEnv}; {colorfgbg}; {updatePrefix}"
                 + Services.CaAgentIdentity.WrapWithExitSignal(claudeInvocation, tab.Id);
 
-            return new BuiltBackendCommand { Cmd = claudeCmd, TempFiles = tempFiles };
+            return new BuiltBackendCommand { Cmd = claudeCmd, TempFiles = tempFiles, ModelNotice = claudeModelNotice };
         }
 
         /// <summary>
@@ -3945,6 +4225,8 @@ namespace ClarionAssistant
         /// </summary>
         private BuiltBackendCommand BuildCopilotCommand(TerminalTab tab, LaunchContext ctx)
         {
+            AssignTabShortName(tab, "Copilot");
+
             string copilotHome = GetCopilotHomeDir();
             string mcpConfig = null;
             try
@@ -4004,7 +4286,8 @@ namespace ClarionAssistant
                 return null;
             }
 
-            string copilotModelVal = (_settings.Get("Copilot.Model") ?? "").Trim();
+            string copilotModelNotice;
+            string copilotModelVal = GetLaunchModel("Copilot", "Copilot.Model", out copilotModelNotice);
             string modelFlag = string.IsNullOrEmpty(copilotModelVal)
                 ? string.Empty
                 : $" --model '{copilotModelVal.Replace("'", "''")}'";
@@ -4033,11 +4316,7 @@ namespace ClarionAssistant
             // via the preceding `cd`, but `--add-dir` additionally puts the path
             // on Copilot's allowed-paths list for cross-directory tool operations.
             // The two are intentionally both set, not redundant.
-            string cmd =
-                $"cd '{ctx.SafeWorkDir}'; " +
-                "$env:CLARION_ASSISTANT_EMBEDDED='1'; " +
-                $"$env:COPILOT_HOME='{safeCopilotHome}'; " +
-                (string.IsNullOrEmpty(safeInstrDir) ? "" : $"$env:COPILOT_CUSTOM_INSTRUCTIONS_DIRS='{safeInstrDir}'; ") +
+            string copilotInvocation =
                 copilotBase +
                 $" --config-dir '{safeCopilotHome}'" +
                 mcpConfigArg +
@@ -4045,9 +4324,17 @@ namespace ClarionAssistant
                 modelFlag +
                 permissionFlags +
                 extraFlags;
+            // Wrapped like Claude's: the -NoExit shell outlives the CLI, so its end is signalled
+            // from the command and the tab's CP<n> name is released then (ticket cfb63b58).
+            string cmd =
+                $"cd '{ctx.SafeWorkDir}'; " +
+                "$env:CLARION_ASSISTANT_EMBEDDED='1'; " +
+                $"$env:COPILOT_HOME='{safeCopilotHome}'; " +
+                (string.IsNullOrEmpty(safeInstrDir) ? "" : $"$env:COPILOT_CUSTOM_INSTRUCTIONS_DIRS='{safeInstrDir}'; ") +
+                Services.CaAgentIdentity.WrapWithExitSignal(copilotInvocation, tab.Id);
 
             System.Diagnostics.Debug.WriteLine("[LaunchCopilot] mcpConfig=" + (mcpConfig ?? "(none)") + ", home=" + copilotHome);
-            return new BuiltBackendCommand { Cmd = cmd };
+            return new BuiltBackendCommand { Cmd = cmd, ModelNotice = copilotModelNotice };
         }
 
         // Build the --model flag for the Codex CLI.
@@ -4061,7 +4348,22 @@ namespace ClarionAssistant
         // Update CodexDefaultModelId together with the matching first entry in
         // Terminal\models.json when the recommended default shifts (Oracle DMs
         // John when this happens — see reference_oracle_model_watch memory).
-        private const string CodexDefaultModelId = "gpt-5.5";
+        private const string CodexDefaultModelId = "gpt-6.1-sol";
+
+        // The saved model for a backend, trimmed, with a retired id swapped for its
+        // replacement (saved back) so a model the provider has withdrawn doesn't leave
+        // the terminal failing to start. notice is the text announcing the swap, or null;
+        // the builder hands it on in BuiltBackendCommand.ModelNotice, which LaunchCmd
+        // prints in the terminal.
+        private string GetLaunchModel(string backend, string settingsKey, out string notice)
+        {
+            string retiredFrom;
+            string model = (_settings.GetModelRemappingRetired(backend, settingsKey, out retiredFrom) ?? "").Trim();
+            notice = retiredFrom == null ? null
+                : "model '" + retiredFrom + "' was retired; using "
+                    + (model.Length == 0 ? "Default" : "'" + model + "'");
+            return model;
+        }
 
         private static string BuildCodexModelFlag(string codexModelVal)
         {
@@ -4086,6 +4388,8 @@ namespace ClarionAssistant
         /// </summary>
         private BuiltBackendCommand BuildCodexCommand(TerminalTab tab, LaunchContext ctx)
         {
+            AssignTabShortName(tab, "Codex");
+
             // MCP wiring: write CA's HTTP endpoint + bearer token into ~/.codex/config.toml.
             // Best-effort — if the write fails or the server isn't running yet, Codex
             // launches in a bare shell. The terminal surfaces the specific reason so
@@ -4139,7 +4443,8 @@ namespace ClarionAssistant
                 }
             }
 
-            string modelFlag = BuildCodexModelFlag(_settings.Get("Codex.Model"));
+            string codexModelNotice;
+            string modelFlag = BuildCodexModelFlag(GetLaunchModel("Codex", "Codex.Model", out codexModelNotice));
 
             // Codex CLI takes -c / --config key=value pairs to override config.toml
             // entries at launch time. We use this to pin model_reasoning_effort when
@@ -4182,16 +4487,16 @@ namespace ClarionAssistant
                 mcpStatusMarker = $"Write-Host 'WARNING: {reason}' -ForegroundColor Yellow; ";
             }
 
+            // Wrapped like Claude's: the -NoExit shell outlives the CLI, so its end is signalled
+            // from the command and the tab's CX<n> name is released then (ticket cfb63b58).
             string cmd =
                 $"cd '{ctx.SafeWorkDir}'; " +
                 "$env:CLARION_ASSISTANT_EMBEDDED='1'; " +
                 mcpStatusMarker +
-                codexBase +
-                modelFlag +
-                effortFlag;
+                Services.CaAgentIdentity.WrapWithExitSignal(codexBase + modelFlag + effortFlag, tab.Id);
 
             System.Diagnostics.Debug.WriteLine("[LaunchCodex] codexConfig=" + (codexConfigPath ?? "(not written)") + ", workDir=" + ctx.WorkDir);
-            return new BuiltBackendCommand { Cmd = cmd };
+            return new BuiltBackendCommand { Cmd = cmd, ModelNotice = codexModelNotice };
         }
 
         /// <summary>
@@ -4258,6 +4563,16 @@ namespace ClarionAssistant
         /// </summary>
         private string ResolveUniqueAgentName(TerminalTab tab)
         {
+            return ResolveUniqueAgentName(tab, Services.CaAgentIdentity.ClaudePrefix);
+        }
+
+        /// <summary>
+        /// The lowest free <paramref name="prefix"/>&lt;n&gt; across every tab in this IDE. Only
+        /// CA names also check MultiTerminal's roster: Copilot (CP) and Codex (CX) tabs never
+        /// register there, so their names need only be unique here (ticket cfb63b58).
+        /// </summary>
+        private string ResolveUniqueAgentName(TerminalTab tab, string prefix)
+        {
             var taken = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             List<AssistantChatControl> pads;
             lock (_instances) { pads = new List<AssistantChatControl>(_instances); }
@@ -4269,19 +4584,35 @@ namespace ClarionAssistant
                         taken.Add(t.AgentName);
             }
 
-            try
+            if (prefix == Services.CaAgentIdentity.ClaudePrefix)
             {
-                var roster = new Services.MultiTerminalApiClient(timeoutMs: 1500).ListTerminals();
-                if (roster != null && roster.Success && roster.Data != null)
-                    foreach (var row in roster.Data)
-                        if (!string.IsNullOrEmpty(row.Name)) taken.Add(row.Name);
-            }
-            catch (Exception ex)
-            {
-                System.Diagnostics.Debug.WriteLine("[LaunchClaude] MT roster check skipped: " + ex.Message);
+                try
+                {
+                    var roster = new Services.MultiTerminalApiClient(timeoutMs: 1500).ListTerminals();
+                    if (roster != null && roster.Success && roster.Data != null)
+                        foreach (var row in roster.Data)
+                            if (!string.IsNullOrEmpty(row.Name)) taken.Add(row.Name);
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine("[ResolveAgentName] MT roster check skipped: " + ex.Message);
+                }
             }
 
-            return Services.CaAgentIdentity.NextFreeName(taken.Contains);
+            return Services.CaAgentIdentity.NextFreeName(prefix, taken.Contains);
+        }
+
+        /// <summary>
+        /// Give a Copilot or Codex tab its CP&lt;n&gt; / CX&lt;n&gt; name and label it like a Claude
+        /// tab ("CP1", or "CP1 · MySolution"), so the tab strip says which assistant is in each
+        /// terminal (ticket cfb63b58). Stored in tab.AgentName, so the exit signal and
+        /// ReleaseAgentName free it exactly as they do a CA name.
+        /// </summary>
+        private void AssignTabShortName(TerminalTab tab, string backend)
+        {
+            string name = ResolveUniqueAgentName(tab, Services.CaAgentIdentity.PrefixForBackend(backend));
+            tab.AgentName = name;
+            _tabManager.RenameTab(tab, Services.CaAgentIdentity.TabLabel(name, tab.BaseName));
         }
 
         private static int _dataRecvCount;
@@ -4294,8 +4625,9 @@ namespace ClarionAssistant
             if (renderer != null && !renderer.IsDisposed)
                 renderer.WriteToTerminal(data);
 
-            // Claude ended but the -NoExit shell lives on: the command's finally block retitles
-            // the console with this tab's exit marker (CaAgentIdentity.WrapWithExitSignal).
+            // The assistant (Claude, Copilot or Codex) ended but the -NoExit shell lives on: the
+            // command's finally block retitles the console with this tab's exit marker
+            // (CaAgentIdentity.WrapWithExitSignal).
             // ASCII decode: the marker is ASCII, and a multibyte character split across reads
             // must not throw or shift it.
             if (tab.AgentName != null)
@@ -4306,7 +4638,8 @@ namespace ClarionAssistant
                 if (exited)
                 {
                     tab.ExitSignalCarry = null;
-                    Action release = () => { ReleaseAgentName(tab); UpdateStatus("Claude Code exited"); };
+                    string exitedLabel = AssistantExitedLabel(tab.AssistantBackend);
+                    Action release = () => { ReleaseAgentName(tab); UpdateStatus(exitedLabel); };
                     if (InvokeRequired) BeginInvoke(release); else release();
                 }
             }
@@ -4354,6 +4687,13 @@ namespace ClarionAssistant
                 tab.Terminal.Resize(e.Columns, e.Rows);
         }
 
+        private static string AssistantExitedLabel(string backend)
+        {
+            if (string.Equals(backend, "Copilot", StringComparison.OrdinalIgnoreCase)) return "Copilot CLI exited";
+            if (string.Equals(backend, "Codex", StringComparison.OrdinalIgnoreCase)) return "Codex CLI exited";
+            return "Claude Code exited";
+        }
+
         private void OnTabTerminalProcessExited(TerminalTab tab)
         {
             tab.AssistantLaunched = false;
@@ -4364,13 +4704,7 @@ namespace ClarionAssistant
                 catch { }
             }
 
-            string label;
-            if (string.Equals(tab.AssistantBackend, "Copilot", StringComparison.OrdinalIgnoreCase))
-                label = "Copilot CLI exited";
-            else if (string.Equals(tab.AssistantBackend, "Codex", StringComparison.OrdinalIgnoreCase))
-                label = "Codex CLI exited";
-            else
-                label = "Claude Code exited";
+            string label = AssistantExitedLabel(tab.AssistantBackend);
             if (InvokeRequired)
                 BeginInvoke((Action)(() => { ReleaseAgentName(tab); UpdateStatus(label); }));
             else
@@ -4381,7 +4715,7 @@ namespace ClarionAssistant
         }
 
         /// <summary>
-        /// Give up the tab's CA&lt;n&gt; name and its label once no session holds it - an aborted
+        /// Give up the tab's CA&lt;n&gt; / CP&lt;n&gt; / CX&lt;n&gt; name and its label once no session holds it - an aborted
         /// launch, or the assistant exiting (ticket 7792e3e0). Without this a dead tab keeps
         /// showing CA2, so the developer is sent to message an address nobody answers; once the
         /// broker reaps the row another IDE can take CA2, and two tabs show one name. UI thread
@@ -4416,6 +4750,13 @@ namespace ClarionAssistant
             // Always open a new terminal tab so the user doesn't lose existing work
             var renderer = new WebViewTerminalRenderer { Dock = DockStyle.Fill };
             var tab = _tabManager.CreateTerminalTab(null, renderer);
+            // F4 (9e1bd280 live test): a New Chat tab's tools answer for the IDE's solution, so its label names it
+            // - "CA1 · demoleg" from the start, and on every switch or close after (RetitleSolutionTabs). It used to
+            // stay a plain "Terminal N", shown as bare "CA1", and was never retitled.
+            tab.FollowsIdeSolution = true;
+            string ideSln = null;
+            try { ideSln = EditorService.GetOpenSolutionPath(); } catch { }
+            RetitleFollowingTab(tab, ideSln);
             renderer.DataReceived += data => OnTabRendererDataReceived(tab, data);
             renderer.TerminalResized += (s, ev) => OnTabRendererResized(tab, ev);
             renderer.Initialized += (s, ev) => OnTabRendererInitialized(tab);
@@ -4716,19 +5057,12 @@ namespace ClarionAssistant
             return null;
         }
 
+        // GH #214: shared marketplace, then the active profile, then the newest cached version.
         private static string GetClarionAssistantPluginPath()
         {
-            string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-            string marketplacePath = Path.Combine(userProfile, ".claude", "plugins", "marketplaces",
-                "clarionassistant-marketplace", "plugins", "clarion-assistant");
-            if (Directory.Exists(marketplacePath))
-                return marketplacePath;
-            string cachePath = Path.Combine(userProfile, ".claude", "plugins", "cache",
-                "clarionassistant-marketplace", "clarion-assistant", "1.0.0");
-            if (Directory.Exists(cachePath))
-                return cachePath;
-            return null;
+            return ClaudePluginLocator.FindClarionAssistantPlugin();
         }
+
 
         private void UpdateStatus(string text)
         {

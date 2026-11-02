@@ -14,16 +14,41 @@ namespace ClarionAssistant.McpServer
     /// depend on it — the CodeGraph and solution family, including index_solution, which is what
     /// builds the graph a non-IDE editor would then query.
     ///
+    /// LAUNCHED BY AN IDE (--ide-pid), THE SOLUTION FOLLOWS THAT IDE (9e1bd280): whatever it has open now,
+    /// published through IdeSolutionRecord, with --solution only the starting value. See SolutionFollower.
+    ///
     /// EVERYTHING IS RESOLVED LAZILY AND CACHED. Detecting the Clarion install and parsing a .red
     /// costs real work, and a server that a client launches and then asks only query_docs must not
     /// pay for it. Resolution failures are recorded rather than thrown: "no solution" is a normal
     /// state that the tools already report properly, and killing the process over it would take
     /// the other 46 tools down with it.
     /// </summary>
-    internal sealed class StandaloneWorkspace : IWorkspaceContext, IVersionNoteSource
+    internal sealed class StandaloneWorkspace : IWorkspaceContext, IVersionNoteSource, ISolutionSourceInfo, ISolutionScopedWorkspace,
+                                                IServerLaunchInfo
     {
+        /// <summary>e1df6c2e: why the plugin launcher started this server, or null when it did not (set by Program).</summary>
+        public string ServerChosenBy { get; set; }
+
+        /// <summary>Pipeline run 3: the warning when this server is an older Clarion Assistant than it should be, or null (set by Program).</summary>
+        public string DowngradeWarning { get; set; }
+
+        /// <summary>The solution as resolved at launch (--solution or the working directory), not followed.</summary>
+        public string LaunchSolutionPath { get { return _solutionPath; } }
+
         private readonly object _lock = new object();
+
+        /// <summary>
+        /// The solution as resolved at launch (--solution, or the working directory's one .sln). Since 9e1bd280
+        /// only the STARTING value: <see cref="_follower"/> serves the IDE's open solution whenever the
+        /// launching IDE publishes one, and this when it never has.
+        /// </summary>
         private readonly string _solutionPath;
+
+        /// <summary>
+        /// What every member here asks "which solution" (9e1bd280). Built lazily, because the launching IDE's
+        /// pid (McpToolRegistry.IdeProcessId) is parsed after this object is resolved.
+        /// </summary>
+        private SolutionFollower _follower;
 
         /// <summary>Version name from --clarion-version, or null. Outranks every other tier.</summary>
         private readonly string _versionOverride;
@@ -152,40 +177,131 @@ namespace ClarionAssistant.McpServer
                 + "rather than have this server guess which you meant.");
         }
 
-        public string CurrentSolutionPath { get { return _solutionPath; } }
-
         /// <summary>
-        /// The solution the HOST believes is open — which here is simply the one this server was
-        /// told to use. THIS PROCESS IS THE HOST, so the two cannot diverge: there is no separate
-        /// IDE that might have closed a solution behind our back, which is the only thing the
-        /// distinction ever existed to express.
-        ///
-        /// RETURNING NULL HERE WOULD BREAK TWO TOOLS, and I had written into IWorkspaceContext
-        /// that null was correct because "callers fall back to CurrentSolutionPath". Reading the
-        /// callers showed otherwise:
-        ///
-        ///   build_solution      uses this as its ONLY fallback and never consults
-        ///                       CurrentSolutionPath — with null it fails "no solution is
-        ///                       currently loaded in the IDE" even when --solution was given.
-        ///   get_solution_info   treats "host says none, but a path is cached" as a STALE
-        ///                       selection and returns an early stub, suppressing the version,
-        ///                       .red and database fields that are the point of the tool.
-        ///
-        /// Both are correct in the addin, where a null genuinely means the IDE closed the
-        /// solution. Neither is correct here, where a null would be describing a staleness that
-        /// cannot happen.
+        /// The followed solution (9e1bd280): the one the launching IDE has open NOW, else --solution while no
+        /// IDE record exists, else null - including when the IDE closed its solution. Re-asked on every read
+        /// (one file stat while the record is unchanged), so everything keyed on it - the version, the .red,
+        /// the CodeGraph db, the index run, the LSP - re-resolves on a switch.
         /// </summary>
-        public string GetHostOpenSolutionPath() { return _solutionPath; }
+        public string CurrentSolutionPath { get { return Follower.CurrentPath; } }
 
-        public ClarionVersionConfig CurrentVersionConfig
+        /// <summary>The followed solution with where it came from and the last switch (get_solution_info).</summary>
+        public SolutionSourceSnapshot SolutionSource { get { return Follower.Current(); } }
+
+        /// <summary>The follower itself, for the hosts that must agree with the tools (the LSP, the heartbeat).</summary>
+        public SolutionFollower Follower
         {
             get
             {
-                string note;
-                var cfg = VersionConfigFor(_solutionPath, out note);
-                lock (_lock) { _versionConfig = cfg; _versionNote = note; }
-                return cfg;
+                lock (_lock)
+                {
+                    if (_follower == null)
+                    {
+                        _follower = new SolutionFollower(_solutionPath, () => McpToolRegistry.IdeProcessId);
+                        _follower.Changed = (was, now) =>
+                        {
+                            string line = "[StandaloneWorkspace] followed the IDE's solution: " + (was ?? "(none)")
+                                + " -> " + (now ?? "(none - the IDE has no solution open)");
+                            LspTrace.Write(line);
+                            try { Console.Error.WriteLine("clarion-mcp-server: " + line); } catch { }
+                            // Completion's held-open symbol DB connections belong to the old solution - released
+                            // here as the addin's OnSolutionChanged does, so its index run is not locked out.
+                            try { SymbolIndex.ReleaseAll(); } catch { }
+                        };
+                    }
+                    return _follower;
+                }
             }
+        }
+
+        /// <summary>
+        /// The solution the HOST believes is open. Since 9e1bd280 that is the followed solution, the same value
+        /// as <see cref="CurrentSolutionPath"/>: when this server follows an IDE, a null here really does mean
+        /// the IDE closed its solution - the staleness the distinction exists to express - and the two members
+        /// read one source, so they cannot diverge.
+        ///
+        /// NEVER NULL WHILE A SOLUTION IS SERVED: build_solution uses this as its ONLY fallback and
+        /// never consults CurrentSolutionPath, and get_solution_info reads "host says none, but a
+        /// path is cached" as a stale selection. Returning null beside a live --solution (as
+        /// IWorkspaceContext once advised) broke both; the follower answers null only when there
+        /// really is no solution, and then CurrentSolutionPath is null too.
+        /// </summary>
+        public string GetHostOpenSolutionPath() { return CurrentSolutionPath; }
+
+        public ClarionVersionConfig CurrentVersionConfig
+        {
+            get { return ResolveVersionFor(CurrentSolutionPath); }
+        }
+
+        /// <summary>
+        /// The version for <paramref name="solutionPath"/>, also recorded as the one <see cref="VersionNote"/> describes -
+        /// the single place CurrentVersionConfig and RedFileFor resolve it (9e1bd280 run 1).
+        /// </summary>
+        private ClarionVersionConfig ResolveVersionFor(string solutionPath)
+        {
+            return ResolveVersionFor(solutionPath, ReadIdeRecord());
+        }
+
+        private ClarionVersionConfig ResolveVersionFor(string solutionPath, IdeSolutionRecord.Details rec)
+        {
+            string note, settings;
+            var cfg = VersionConfigFor(solutionPath, rec, out note, out settings);
+            lock (_lock) { _versionConfig = cfg; _versionNote = note; _settingsNote = settings; }
+            return cfg;
+        }
+
+        /// <summary>The launching IDE's record (cached: one stat), or null when not launched by an IDE or none.</summary>
+        private static IdeSolutionRecord.Details ReadIdeRecord()
+        {
+            int? idePid = McpToolRegistry.IdeProcessId;
+            if (!idePid.HasValue) return null;
+            string recNote;
+            return IdeSolutionRecord.ReadDetailsCached(idePid.Value, out recNote);
+        }
+
+        /// <summary>
+        /// ISolutionScopedWorkspace (9e1bd280 run 1): ONE read of the followed solution and everything keyed on it -
+        /// the version from the SAME record read (so the IDE's choice for this solution survives a switch that lands
+        /// afterwards), that version's .red for the solution's folder, its library paths and its database. An operation
+        /// takes this once and uses nothing else, so a switch mid-operation cannot mix two solutions.
+        /// </summary>
+        public SolutionScope Snapshot()
+        {
+            var src = SolutionSource;
+            return ScopeOf(src.Path, src.Record, src);
+        }
+
+        /// <summary>ISolutionScopedWorkspace: the scope of a solution the caller named (run 2) - not necessarily the followed one.</summary>
+        public SolutionScope ScopeFor(string solutionPath)
+        {
+            // 583abdec review M1 (security): this is the standalone server's door for a CALLER-NAMED solution
+            // (index_codegraph's sln_path), and building a scope reads that path (its folder's .red, its version). The
+            // path policy judges it first, as index_codegraph itself does before it gets here - so no caller of this
+            // method can make the server touch a UNC path (NTLM) or a folder outside the allowed roots.
+            string canonical;
+            string refusal = McpPathGate.GatePath("index_codegraph", solutionPath, PathAccess.Read, this, out canonical);
+            if (refusal != null) throw new UnauthorizedAccessException(refusal);
+            return ScopeOf(canonical, ReadIdeRecord(), null);
+        }
+
+        /// <summary>Everything keyed on <paramref name="sln"/>, the version decided from the record <paramref name="rec"/>.</summary>
+        private SolutionScope ScopeOf(string sln, IdeSolutionRecord.Details rec, SolutionSourceSnapshot src)
+        {
+            string note, settings;
+            var cfg = VersionConfigFor(sln, rec, out note, out settings);
+            lock (_lock) { _versionConfig = cfg; _versionNote = note; _settingsNote = settings; }
+            var red = RedFileFor(sln, cfg);
+            return new SolutionScope
+            {
+                Source = src,
+                SolutionPath = sln,
+                Version = cfg,
+                VersionNote = note == null ? null : note.Replace("\r\n", " ").Replace("\r", " ").Replace("\n", " "),
+                SettingsNote = settings,
+                Red = red,
+                IndexLibraryPaths = LibraryPathsFrom(red),
+                DbPath = DbPathFor(sln)
+            };
         }
 
         /// <summary>
@@ -201,6 +317,15 @@ namespace ClarionAssistant.McpServer
         /// </summary>
         public ClarionVersionConfig VersionConfigFor(string solutionPath, out string note)
         {
+            string settings;
+            return VersionConfigFor(solutionPath, ReadIdeRecord(), out note, out settings);
+        }
+
+        /// <summary>As above, decided from the IDE record <paramref name="rec"/> the caller already read (9e1bd280 run 1).</summary>
+        private ClarionVersionConfig VersionConfigFor(string solutionPath, IdeSolutionRecord.Details rec, out string note,
+                                                      out string settingsNote)
+        {
+            settingsNote = null;
             lock (_lock)
             {
                 if (!_hostResolved)
@@ -221,67 +346,175 @@ namespace ClarionAssistant.McpServer
                     return null;
                 }
 
-                IdeSolutionRecord.Details rec = null;
-                int? idePid = McpToolRegistry.IdeProcessId;
-                if (idePid.HasValue)
-                {
-                    string recNote;
-                    rec = IdeSolutionRecord.ReadDetailsCached(idePid.Value, out recNote);
-                }
-                string recordKey = rec == null ? "-" : (rec.Solution + "|" + rec.VersionChoice + "|" + rec.ConfigDir);
+                // e1df6c2e: WHICH SETTINGS FOLDER, decided first - it is what the version is looked up in. Live IDEs on
+                // this solution: the launching one when its record is about it, else any (the plugin's server has no
+                // --ide-pid). Read before the cache check, because the folder is part of what the answer depends on.
+                var pin = SolutionClarionVersion.ReadPin(solutionPath);
+                var live = LiveRecordsFor(solutionPath, rec);
+                var dirChoice = StandaloneConfigDir.Resolve(live, _configDirArg, _configDirEnv, pin,
+                    _baseDir, null, null);
+
+                string recordKey = (rec == null ? "-" : (rec.Solution + "|" + rec.VersionChoice + "|" + rec.ConfigDir))
+                    + "|" + dirChoice.Source + "|" + dirChoice.Path + "|" + dirChoice.Error;
                 string cacheKey = (solutionPath ?? "").ToLowerInvariant();
 
                 CachedVersion cached;
                 if (_versionCache.TryGetValue(cacheKey, out cached) && cached.RecordKey == recordKey)
                 {
                     note = cached.Note;
+                    settingsNote = cached.SettingsNote;
                     return cached.Config;
+                }
+
+                if (dirChoice.Error != null)
+                {
+                    // Named but unusable: no version at all, said so - never the default folder in its place.
+                    note = "no Clarion version: " + dirChoice.Error;
+                    settingsNote = dirChoice.Error;
+                    _versionCache[cacheKey] = new CachedVersion { RecordKey = recordKey, Config = null, Note = note, SettingsNote = settingsNote };
+                    return null;
                 }
 
                 SolutionVersionChoice choice;
                 try
                 {
-                    string pinNote;
-                    string pinned = SolutionClarionVersion.Read(solutionPath, out pinNote);
                     var info = _hostInfo;
+                    Func<string, ClarionVersionConfig> findNamed;
+                    string prefsDir;
+                    if (dirChoice.Path != null)
+                    {
+                        // The relocated folder IS this Clarion's settings: detect from it, look names up in it and
+                        // nowhere else (a name it does not list is "matches nothing", not another folder's copy).
+                        info = ClarionVersionService.DetectInConfigDir(dirChoice.Path, _hostRoot);
+                        var inDir = info;
+                        findNamed = name => FindIn(inDir, name);
+                        prefsDir = Path.Combine(dirChoice.Path, "preferences");
+                    }
+                    else
+                    {
+                        // Every settings folder is searched, since a NAMED version needs no host Clarion to pick
+                        // the folder (#247); the copy in that entry's OWN folder beats this Clarion's (#244).
+                        var host = info;
+                        findNamed = name => ClarionVersionService.FindNamedVersion(host, name);
+                        prefsDir = info != null ? IdeSolutionPreferences.PreferencesDirFor(info.PropertiesXmlPath) : null;
+                    }
                     choice = SolutionVersionResolver.Resolve(new SolutionVersionInputs
                     {
                         SolutionPath = solutionPath,
                         CommandLineVersion = _versionOverride,
-                        PinnedVersion = pinned,
-                        PinNote = pinNote,
+                        PinnedVersion = pin.Version,
+                        PinNote = pin.Note,
                         IdeRecord = rec,
-                        PreferencesDir = info != null ? IdeSolutionPreferences.PreferencesDirFor(info.PropertiesXmlPath) : null,
+                        PreferencesDir = prefsDir,
                         HostInfo = info,
                         HostRoot = _hostRoot,
-                        // Every settings folder is searched, since a NAMED version needs no host Clarion to pick
-                        // the folder (#247); the copy in that entry's OWN folder beats this Clarion's (#244).
-                        FindNamed = name => ClarionVersionService.FindNamedVersion(info, name)
+                        FindNamed = findNamed
                     });
                 }
                 catch (Exception ex)
                 {
                     note = "no Clarion version: resolution failed - " + ex.Message;
-                    _versionCache[cacheKey] = new CachedVersion { RecordKey = recordKey, Config = null, Note = note };
+                    settingsNote = dirChoice.Note;
+                    _versionCache[cacheKey] = new CachedVersion { RecordKey = recordKey, Config = null, Note = note, SettingsNote = settingsNote };
                     return null;
                 }
 
-                note = (choice.Note ?? "").Replace("\r\n", " ").Replace("\r", " ").Replace("\n", " ");
+                note = OneLine(choice.Note);
+                settingsNote = OneLine(dirChoice.Note);
+                if (choice.Config != null && !string.IsNullOrEmpty(choice.Config.SourcePropertiesXml))
+                    settingsNote = "read " + choice.Config.SourcePropertiesXml + " - " + settingsNote;
                 string was = cached != null && cached.Config != null ? cached.Config.Name : null;
                 string now = choice.Config != null ? choice.Config.Name : null;
                 if (cached != null && !string.Equals(was, now, StringComparison.Ordinal))
                     LspTrace.Write("[StandaloneWorkspace] Clarion version for " + (solutionPath ?? "(no solution)")
                         + " changed: " + note);
-                _versionCache[cacheKey] = new CachedVersion { RecordKey = recordKey, Config = choice.Config, Note = note };
+                _versionCache[cacheKey] = new CachedVersion { RecordKey = recordKey, Config = choice.Config, Note = note, SettingsNote = settingsNote };
                 return choice.Config;
             }
         }
+
+        private static string OneLine(string s)
+        {
+            return (s ?? "").Replace("\r\n", " ").Replace("\r", " ").Replace("\n", " ");
+        }
+
+        /// <summary>Exact, then case-insensitive, as ClarionVersionService.FindIn - over a folder's own entries.</summary>
+        private static ClarionVersionConfig FindIn(ClarionVersionInfo info, string name)
+        {
+            if (info == null || info.Versions == null || string.IsNullOrEmpty(name)) return null;
+            return info.Versions.Find(v => v != null && v.Name == name)
+                ?? info.Versions.Find(v => v != null && string.Equals(v.Name, name, StringComparison.OrdinalIgnoreCase));
+        }
+
+        /// <summary>
+        /// e1df6c2e: the live IDE records for <paramref name="solutionPath"/> - the launching IDE's when it is about this
+        /// solution, else every live IDE's on it (scanned at most every few seconds per solution; one directory
+        /// listing). Empty when none.
+        /// </summary>
+        private List<IdeSolutionRecord.Details> LiveRecordsFor(string solutionPath, IdeSolutionRecord.Details rec)
+        {
+            var list = new List<IdeSolutionRecord.Details>();
+            if (string.IsNullOrEmpty(solutionPath)) return list;
+            if (rec != null && SolutionFollower.SamePath(rec.Solution, solutionPath))
+            {
+                list.Add(rec);
+                return list;
+            }
+            string key = solutionPath.ToLowerInvariant();
+            CachedLive c;
+            if (_liveCache.TryGetValue(key, out c) && (DateTime.UtcNow - c.At).TotalSeconds < 3) return c.Records;
+            var found = IdeSolutionRecord.FindLiveForSolution(solutionPath);
+            _liveCache[key] = new CachedLive { At = DateTime.UtcNow, Records = found };
+            return found;
+        }
+
+        private sealed class CachedLive
+        {
+            public DateTime At;
+            public List<IdeSolutionRecord.Details> Records;
+        }
+
+        private readonly Dictionary<string, CachedLive> _liveCache = new Dictionary<string, CachedLive>();
+
+        /// <summary>--clarion-config-dir, or null (e1df6c2e).</summary>
+        private string _configDirArg;
+        /// <summary>CLARION_CONFIG_DIR, or null (e1df6c2e).</summary>
+        private string _configDirEnv;
+        /// <summary>What a relative --clarion-config-dir / CLARION_CONFIG_DIR is relative to.</summary>
+        private string _baseDir;
+
+        /// <summary>
+        /// e1df6c2e: the settings folder named on the command line (--clarion-config-dir) and in the environment
+        /// (CLARION_CONFIG_DIR), relative ones anchored at <paramref name="baseDir"/>. Set before serving, by Program.
+        /// </summary>
+        public void SetConfigDirSources(string commandLine, string environment, string baseDir)
+        {
+            lock (_lock)
+            {
+                _configDirArg = string.IsNullOrWhiteSpace(commandLine) ? null : commandLine;
+                _configDirEnv = string.IsNullOrWhiteSpace(environment) ? null : environment;
+                _baseDir = baseDir;
+                _versionCache.Clear();
+            }
+        }
+
+        /// <summary>
+        /// e1df6c2e: which ClarionProperties.xml the current version came from and why that settings folder - the
+        /// line printed at startup and returned as get_solution_info's settingsChosenBy. Null until resolved.
+        /// </summary>
+        public string SettingsNote
+        {
+            get { lock (_lock) { return _settingsNote; } }
+        }
+
+        private string _settingsNote;
 
         private sealed class CachedVersion
         {
             public string RecordKey;
             public ClarionVersionConfig Config;
             public string Note;
+            public string SettingsNote;
         }
 
         private bool _hostResolved;
@@ -304,28 +537,49 @@ namespace ClarionAssistant.McpServer
             return cfg != null ? cfg.RootPath : null;
         }
 
+        /// <summary>The followed solution's .red - <see cref="RedFileFor"/> of one read of it.</summary>
         public RedFileService RedFile
         {
-            get
+            get { return RedFileFor(CurrentSolutionPath); }
+        }
+
+        /// <summary>
+        /// The .red for <paramref name="solutionPath"/>: its folder's own version-named one, else its version's
+        /// (9e1bd280 run 1). For a solution the caller snapshotted, so an operation derives its .red from the SAME
+        /// solution as everything else it uses. Cached for the last solution asked; a different one replaces it.
+        /// </summary>
+        public RedFileService RedFileFor(string solutionPath)
+        {
+            return RedFileFor(solutionPath, ResolveVersionFor(solutionPath));
+        }
+
+        /// <summary>The .red of <paramref name="solutionPath"/> on version <paramref name="cfg"/> (already resolved).</summary>
+        private RedFileService RedFileFor(string solutionPath, ClarionVersionConfig cfg)
+        {
+            // Re-loaded when the version moves (0ce0b5e2): the IDE's choice for the solution can change
+            // while this server runs, and the .red is that version's.
+            // 9e1bd280: and when the SOLUTION moves. Keyed on the version alone, a switch between two
+            // solutions on one Clarion kept the first one's .red - a solution-local .red is per folder.
+            string name = cfg != null ? cfg.Name : null;
+            lock (_lock)
             {
-                // Re-loaded when the version moves (0ce0b5e2): the IDE's choice for the solution can change
-                // while this server runs, and the .red is that version's.
-                var cfg = CurrentVersionConfig;
-                string name = cfg != null ? cfg.Name : null;
-                lock (_lock)
+                // GH #261: also when the .red (or a file it {include}s) changed on disk since it was read -
+                // an edit to it used to change nothing until this server restarted.
+                if (!_redResolved || !string.Equals(name, _redVersionName, StringComparison.Ordinal)
+                    || !SolutionFollower.SamePath(solutionPath, _redSolution)
+                    || (_redFile != null && _redFile.IsStale()))
                 {
-                    if (!_redResolved || !string.Equals(name, _redVersionName, StringComparison.Ordinal))
-                    {
-                        _redResolved = true;
-                        _redVersionName = name;
-                        _redFile = LoadRedFile(cfg);
-                    }
-                    return _redFile;
+                    _redResolved = true;
+                    _redVersionName = name;
+                    _redSolution = solutionPath;
+                    _redFile = LoadRedFile(cfg, solutionPath);
                 }
+                return _redFile;
             }
         }
 
         private string _redVersionName;
+        private string _redSolution;
 
         /// <summary>
         /// The addin distinguishes these because it resolves one per ACTIVE PROJECT, which can
@@ -336,15 +590,15 @@ namespace ClarionAssistant.McpServer
         /// </summary>
         public RedFileService ActiveRedFileService { get { return RedFile; } }
 
-        private RedFileService LoadRedFile(ClarionVersionConfig cfg)
+        private RedFileService LoadRedFile(ClarionVersionConfig cfg, string solutionPath)
         {
             if (cfg == null) return null;
 
             var svc = new RedFileService();
             string projectDir = null;
-            if (!string.IsNullOrEmpty(_solutionPath))
+            if (!string.IsNullOrEmpty(solutionPath))
             {
-                try { projectDir = Path.GetDirectoryName(_solutionPath); }
+                try { projectDir = Path.GetDirectoryName(solutionPath); }
                 catch { projectDir = null; }
             }
 
@@ -368,15 +622,26 @@ namespace ClarionAssistant.McpServer
         {
             get
             {
-                if (string.IsNullOrEmpty(_solutionPath)) return null;
-                return Path.Combine(Path.GetDirectoryName(_solutionPath),
-                    Path.GetFileNameWithoutExtension(_solutionPath) + ".codegraph.db");
+                // The followed solution's (9e1bd280), read once so the folder and the name agree.
+                return DbPathFor(CurrentSolutionPath);
             }
+        }
+
+        /// <summary>The CodeGraph database beside <paramref name="solutionPath"/>, or null.</summary>
+        private static string DbPathFor(string solutionPath)
+        {
+            if (string.IsNullOrEmpty(solutionPath)) return null;
+            return Path.Combine(Path.GetDirectoryName(solutionPath),
+                Path.GetFileNameWithoutExtension(solutionPath) + ".codegraph.db");
         }
 
         public List<string> BuildIndexLibraryPaths()
         {
-            var red = RedFile;
+            return LibraryPathsFrom(RedFile);
+        }
+
+        private static List<string> LibraryPathsFrom(RedFileService red)
+        {
             if (red == null) return null;
             try
             {
@@ -423,14 +688,20 @@ namespace ClarionAssistant.McpServer
                 if (onCompleted != null) { try { onCompleted(summary); } catch { } }
             };
 
-            string slnPath = _solutionPath;
+            // ONE read of the followed solution and everything keyed on it (9e1bd280; run 1: the .red, library
+            // paths and version too): the run indexes the solution it started on, into that solution's database,
+            // with that solution's .red, even if the IDE switches mid-run.
+            var scope = Snapshot();
+            var src = scope.Source;
+            string slnPath = scope.SolutionPath;
             if (string.IsNullOrEmpty(slnPath) || !File.Exists(slnPath))
             {
-                complete("Error: no solution is selected. " + (ResolutionNote ?? "Pass --solution <path.sln>."));
+                complete("Error: no solution is selected. " + (src.Source == SolutionSourceSnapshot.None
+                    ? src.Note : (ResolutionNote ?? "Pass --solution <path.sln>.")));
                 return;
             }
 
-            string dbPath = CurrentDbPath;
+            string dbPath = scope.DbPath;
 
             // The same gate the addin's entry points use. It now guards ACROSS PROCESSES as well
             // as within one, which this host is the reason for: the addin and this server can hold
@@ -454,43 +725,52 @@ namespace ClarionAssistant.McpServer
             // progress at all, measured.
             if (onProgress != null)
             {
-                var worker = new System.Threading.Thread(() => IndexHeld(slnPath, dbPath, incremental, onProgress, complete));
+                var worker = new System.Threading.Thread(() => IndexHeld(scope, incremental, onProgress, complete));
                 worker.IsBackground = true;
                 worker.Name = "clarion-mcp-index";
                 worker.Start();
                 return;
             }
 
-            IndexHeld(slnPath, dbPath, incremental, null, complete);
+            IndexHeld(scope, incremental, null, complete);
         }
 
         /// <summary>
-        /// Do the indexing. The caller ALREADY HOLDS the IndexRunGate claim for dbPath and this
-        /// method always releases it — including when it runs on a worker thread, which is why
+        /// Do the indexing. The caller ALREADY HOLDS the IndexRunGate claim for the scope's database and
+        /// this method always releases it — including when it runs on a worker thread, which is why
         /// the release is in a finally here rather than at the call site.
         /// </summary>
-        private void IndexHeld(string slnPath,
-                               string dbPath,
+        private void IndexHeld(SolutionScope scope,
                                bool incremental,
                                Action<ClarionCodeGraph.Graph.IndexProgressEvent> onProgress,
                                Action<string> complete)
         {
+            string slnPath = scope.SolutionPath;
+            string dbPath = scope.DbPath;
             IndexRunLog runLog = null;
             try
             {
                 try { runLog = new IndexRunLog(Path.GetFileNameWithoutExtension(slnPath)); }
                 catch { runLog = null; }
 
-                var libPaths = BuildIndexLibraryPaths();
-                var activeRed = ActiveRedFileService;
+                // 9e1bd280 run 1: the .red and library paths of the scope this run SNAPSHOTTED, never the followed
+                // solution re-read here - a switch between RunIndex and this line indexed A's db with B's .red.
+                IndexRunGate.PauseBeforeSetUpForTest();
+                var activeRed = scope.Red;
+                var libPaths = scope.IndexLibraryPaths;
+                if (runLog != null)
+                {
+                    try { runLog.WriteLine("Redirection file: " + (activeRed != null ? activeRed.RedFilePath : "(none)") + " (for " + slnPath + ")"); }
+                    catch { }
+                }
 
                 SymbolIndex.Release(dbPath);   // completion's read-only handle (1c685f2e) - never across a write open
-                var db = new ClarionCodeGraph.Graph.CodeGraphDatabase();
-                db.Open(dbPath);
-                try
                 {
-                    var indexer = new ClarionCodeGraph.Graph.CodeGraphIndexer(db);
-                    indexer.RedService = activeRed;
+                    // 583abdec: the same 64-bit child process the addin uses. This server is 32-bit too (it shares the
+                    // addin's x86 SQLite), so a large solution had the same address-space ceiling here; and one
+                    // indexing path for every host means one behaviour to test.
+                    var indexer = new OutOfProcessIndexer();
+                    if (runLog != null) { try { runLog.WriteLine("Indexer process: " + (indexer.ExePath ?? "(unknown)")); } catch { } }
                     indexer.OnProgress += msg =>
                     {
                         if (runLog != null) { try { runLog.WriteLine(msg); } catch { } }
@@ -503,22 +783,35 @@ namespace ClarionAssistant.McpServer
                         };
                     }
 
-                    var result = indexer.IndexSolution(slnPath, incremental, libPaths);
+                    var result = indexer.Run(new IndexRunRequest
+                    {
+                        SlnPath = slnPath,
+                        DbPath = dbPath,
+                        Incremental = incremental,
+                        Red = activeRed,
+                        BuildConfiguration = McpToolRegistry.BuildConfigurationForIndex(slnPath), // GH #245
+                        LibraryPaths = libPaths
+                    });
 
+                    // #244 item 3: a run that resolved little of the solution says so (status + coverage).
                     complete(string.Format(
-                        "Indexed {0}: {1} projects, {2} files, {3} symbols, {4} relationships in {5}ms. Database: {6}",
+                        "{7} Indexed {0}: {1} projects, {2} files, {3} symbols, {4} relationships in {5}ms. Database: {6}",
                         Path.GetFileName(slnPath), result.ProjectCount, result.FileCount,
-                        result.SymbolCount, result.RelationshipCount, result.DurationMs, dbPath));
-                }
-                finally
-                {
-                    try { db.Close(); } catch { }
+                        result.SymbolCount, result.RelationshipCount, result.DurationMs, dbPath,
+                        result.Status == ClarionCodeGraph.Graph.IndexResult.StatusOk ? "" :
+                            (result.IsPartial ? "PARTIAL INDEX." : "Indexed with warnings."))
+                        .TrimStart()
+                        // ef2fd2a9: an incremental request on an older database ran full - say so.
+                        + "\n  Mode: " + result.ModeText
+                        + "\n" + result.CoverageText()
+                        + (indexer.FallbackWarning != null ? "\n  " + indexer.FallbackWarning : ""));
                 }
             }
             catch (Exception ex)
             {
+                // 583abdec review L3: the full message to the run log; the MCP caller gets a short reply naming it.
                 if (runLog != null) { try { runLog.WriteLine("FAILED: " + ex.Message); } catch { } }
-                complete("Error indexing solution: " + ex.Message);
+                complete(OutOfProcessIndexer.McpFailureReply(ex, runLog != null ? runLog.LogPath : null));
             }
             finally
             {

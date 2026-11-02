@@ -37,6 +37,28 @@ namespace ClarionAssistant.Services
         private static readonly ConcurrentDictionary<string, FileStream> Held =
             new ConcurrentDictionary<string, FileStream>(StringComparer.OrdinalIgnoreCase);
 
+        /// <summary>Test seam (9e1bd280 run 1): names a pause file, see <see cref="PauseBeforeSetUpForTest"/>.</summary>
+        public const string PauseEnv = "CA_TEST_INDEX_SETUP_PAUSE";
+
+        /// <summary>
+        /// Test seam (9e1bd280 run 1). An index run calls this AFTER it snapshotted its solution and BEFORE it resolves
+        /// that solution's .red and library paths. When <see cref="PauseEnv"/> names an existing file, it creates
+        /// "&lt;file&gt;.reached" and waits (at most 60 s) until the file is deleted, so an end-to-end test can switch the
+        /// IDE's solution at exactly that moment. Unset in production: one environment read.
+        /// </summary>
+        public static void PauseBeforeSetUpForTest()
+        {
+            try
+            {
+                string pause = Environment.GetEnvironmentVariable(PauseEnv);
+                if (string.IsNullOrEmpty(pause) || !File.Exists(pause)) return;
+                File.Create(pause + ".reached").Dispose();
+                var until = DateTime.UtcNow.AddSeconds(60);
+                while (File.Exists(pause) && DateTime.UtcNow < until) System.Threading.Thread.Sleep(50);
+            }
+            catch { }
+        }
+
         /// <summary>Try to claim an index run on this database. False = a run already holds it.</summary>
         public static bool TryEnter(string dbPath)
         {
@@ -63,13 +85,27 @@ namespace ClarionAssistant.Services
 
             FileStream stream;
             string blockedBy;
-            LockResult result = TryAcquireFileLock(key, out stream, out blockedBy);
+            LockResult result = TryAcquireFileLock(key + HostLockSuffix, true, out stream, out blockedBy);
 
             if (result == LockResult.Blocked)
             {
                 byte unused;
                 Active.TryRemove(key, out unused);
                 holder = blockedBy ?? "an index run in another process";
+                return false;
+            }
+
+            // 583abdec review D1: the WRITER lock, which the clarion-indexer.exe child holds for its whole run, is held
+            // too. The lock above is the HOST's handle and dies with the host; a child whose host died keeps writing
+            // until its next cancel poll, and a run that claimed only the freed host lock would ClearAll() under it.
+            // Probed without writing a note (the holder's note is what a refusal reports).
+            string writer;
+            if (ProbeWriterLock(key, out writer))
+            {
+                if (stream != null) { try { stream.Dispose(); } catch { } }
+                byte unused;
+                Active.TryRemove(key, out unused);
+                holder = (writer ?? "an indexer process") + " is still writing this database (its host may have exited)";
                 return false;
             }
 
@@ -104,11 +140,43 @@ namespace ClarionAssistant.Services
             Active.TryRemove(key, out unused);
         }
 
-        private enum LockResult
+        /// <summary>The host's lock: &lt;db&gt;.lock, held by the process that STARTED a run (TryEnter/Exit).</summary>
+        public const string HostLockSuffix = ".lock";
+
+        /// <summary>
+        /// 583abdec review D1: the WRITER's lock, &lt;db&gt;.writer.lock, held by whichever process actually writes the
+        /// database - the clarion-indexer.exe child for its whole run, or the host itself on the in-process fallback.
+        /// Its own handle, never one inherited from the host: it lives exactly as long as the writer does.
+        /// </summary>
+        public const string WriterLockSuffix = ".writer.lock";
+
+        public enum LockResult
         {
             Acquired,
             Blocked,
             Unavailable
+        }
+
+        /// <summary>
+        /// Take the writer lock for <paramref name="dbPath"/> for as long as <paramref name="handle"/> stays open.
+        /// Blocked: another writer holds it, <paramref name="holder"/> says who. Unavailable (an unwritable folder, a
+        /// path limit): fails OPEN, as TryEnter does - <paramref name="handle"/> is null then.
+        /// </summary>
+        public static LockResult TryAcquireWriterLock(string dbPath, out IDisposable handle, out string holder)
+        {
+            FileStream fs;
+            LockResult r = TryAcquireFileLock(Normalize(dbPath) + WriterLockSuffix, true, out fs, out holder);
+            handle = fs;
+            return r;
+        }
+
+        /// <summary>True when a writer holds the writer lock now. Opens and closes it at once, writing nothing.</summary>
+        public static bool ProbeWriterLock(string dbPath, out string holder)
+        {
+            FileStream fs;
+            LockResult r = TryAcquireFileLock(Normalize(dbPath) + WriterLockSuffix, false, out fs, out holder);
+            if (fs != null) { try { fs.Dispose(); } catch { } }
+            return r == LockResult.Blocked;
         }
 
         /// <summary>
@@ -130,17 +198,18 @@ namespace ClarionAssistant.Services
         /// A SEPARATE FILE, not the database itself, because the cancelled-full-index path does
         /// File.Delete(dbPath) — locking the database would destroy the lock along with it.
         /// </summary>
-        private static LockResult TryAcquireFileLock(string dbPath, out FileStream stream, out string blockedBy)
+        private static LockResult TryAcquireFileLock(string lockPath, bool writeNote, out FileStream stream, out string blockedBy)
         {
             stream = null;
             blockedBy = null;
 
-            string lockPath = dbPath + ".lock";
             try
             {
                 // FileShare.Read, not None: a blocked contender must still be able to READ the
                 // file to report who holds it. Write access stays exclusive, which is the lock.
+                // Not FileShare.Inheritable: a child process must never carry this handle (583abdec D1).
                 var fs = new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
+                if (!writeNote) { stream = fs; return LockResult.Acquired; }
                 try
                 {
                     fs.SetLength(0);

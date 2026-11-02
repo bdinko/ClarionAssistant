@@ -32,12 +32,39 @@ namespace ClarionAssistant.Services
         public const string RecordDirEnv = "CA_IDE_RECORD_DIR";
         /// <summary>Test override for the expected IDE image name (production: "Clarion").</summary>
         public const string ImageNameEnv = "CA_IDE_IMAGE_NAME";
+        /// <summary>
+        /// b8f9431c review L2: <see cref="RecordDirEnv"/> and <see cref="ImageNameEnv"/> (and IdeSolutionRecord's use of
+        /// them) are honoured ONLY when this is also set to "1". Without it a stray CA_IDE_IMAGE_NAME in a user's
+        /// environment cannot make the trust rules accept a non-Clarion process, nor CA_IDE_RECORD_DIR point discovery
+        /// at another folder. The harnesses set it.
+        /// </summary>
+        public const string TestHooksEnv = "CA_TEST_HOOKS";
+
+        /// <summary>The value of a test-only environment hook, or null unless <see cref="TestHooksEnv"/>=1.</summary>
+        public static string TestHook(string name)
+        {
+            try
+            {
+                if (Environment.GetEnvironmentVariable(TestHooksEnv) != "1") return null;
+                return Environment.GetEnvironmentVariable(name);
+            }
+            catch { return null; }
+        }
+
+        /// <summary>
+        /// b8f9431c review L5: the IDE-tool forwarding protocol this add-in serves, written into its endpoint record as
+        /// "ideTools". 1 = every IdeOnly tool on the call-back endpoint, with the params._meta solution check. A record
+        /// without it is an add-in that serves no forwarded tools (only the call-backs, or a CA tab's pane).
+        /// </summary>
+        public const int IdeToolsProtocolVersion = 1;
 
         public sealed class Endpoint
         {
             public int Pid;
             public int Port;
             public string Token;
+            /// <summary>The record's "ideTools" (see <see cref="IdeToolsProtocolVersion"/>); 0 when absent (an older add-in).</summary>
+            public int IdeToolsProtocol;
             /// <summary>"pid:port", the only form that may appear in a log line.</summary>
             public string Label { get { return Pid + ":" + Port; } }
         }
@@ -46,7 +73,7 @@ namespace ClarionAssistant.Services
         {
             get
             {
-                string env = Environment.GetEnvironmentVariable(RecordDirEnv);
+                string env = TestHook(RecordDirEnv);
                 if (!string.IsNullOrEmpty(env)) return Path.Combine(env, "ide-endpoint");
                 return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                                     "ClarionAssistant", "ide-endpoint");
@@ -58,6 +85,9 @@ namespace ClarionAssistant.Services
         /// <summary>Addin side (McpServer.Start): publish this process's pane endpoint.</summary>
         public static void Publish(int port, string token)
         {
+            // GH #205 pipeline run 2: records (with their tokens) of IDEs that died without Stop - a deploy kill, a crash -
+            // used to linger until some standalone server happened to scan. Every publish sweeps them first.
+            SweepStale();
             try
             {
                 var me = Process.GetCurrentProcess();
@@ -69,7 +99,8 @@ namespace ClarionAssistant.Services
                     { "port", port },
                     { "token", token },
                     { "startTime", me.StartTime.ToUniversalTime().ToString("o") },
-                    { "writtenAt", DateTime.UtcNow.ToString("o") }
+                    { "writtenAt", DateTime.UtcNow.ToString("o") },
+                    { "ideTools", IdeToolsProtocolVersion }
                 };
                 string tmp = file + "." + Guid.NewGuid().ToString("N") + ".tmp";
                 File.WriteAllText(tmp, new JavaScriptSerializer().Serialize(rec), EncodingHelper.Utf8NoBom);
@@ -135,7 +166,7 @@ namespace ClarionAssistant.Services
 
             if (matches.Count == 0)
             {
-                reason = records == 0 ? "no IDE has a Clarion Assistant pane running" : "no IDE has this solution open";
+                reason = records == 0 ? "no Clarion with Clarion Assistant is running" : "no IDE has this solution open";
                 return null;
             }
             if (preferredPid.HasValue)
@@ -149,6 +180,72 @@ namespace ClarionAssistant.Services
             return null;
         }
 
+        /// <summary>
+        /// Delete every record whose IDE is provably gone: the pid is not running, is not the IDE, or was started at
+        /// another time than recorded (the same "stale" test <see cref="Discover"/> applies). A record that is only
+        /// unreadable (mid-replace) or unverifiable (access denied) is left alone. Returns how many were deleted. Never throws.
+        /// </summary>
+        public static int SweepStale(Action<string> log = null)
+        {
+            int deleted = 0;
+            try
+            {
+                string dir = DirectoryPath;
+                if (!Directory.Exists(dir)) return 0;
+                foreach (var file in Directory.GetFiles(dir, "*.json"))
+                {
+                    string why;
+                    if (ReadTrusted(file, out why) != null) continue;
+                    if (why == null || !why.StartsWith("stale", StringComparison.Ordinal)) continue;
+                    try { File.Delete(file); deleted++; Log(log, "[endpoint] deleted " + why + " (" + Path.GetFileName(file) + ")"); }
+                    catch { }
+                }
+            }
+            catch (Exception ex) { Debug.WriteLine("[IdeEndpointRecord] SweepStale: " + ex.Message); }
+            return deleted;
+        }
+
+        /// <summary>
+        /// GH #205: EVERY trusted IDE pane, whatever solution it has open, one per IDE process (several panes of one IDE
+        /// are one IDE). For write_file/append_to_file's open-tab check: a native tab in ANY IDE clobbers the file on its
+        /// next save, so the check is not limited to the IDE of this server's solution. The same trust rules as
+        /// <see cref="Discover"/> (stale records are deleted). Empty with <paramref name="reason"/> when there is none.
+        /// </summary>
+        public static List<Endpoint> DiscoverAll(out string reason, Action<string> log = null)
+        {
+            reason = null;
+            var all = new List<Endpoint>();
+            int records = 0;
+            try
+            {
+                string dir = DirectoryPath;
+                if (Directory.Exists(dir))
+                {
+                    foreach (var file in Directory.GetFiles(dir, "*.json"))
+                    {
+                        records++;
+                        string why;
+                        var ep = ReadTrusted(file, out why);
+                        if (ep == null)
+                        {
+                            if (why != null && why.StartsWith("stale", StringComparison.Ordinal))
+                            {
+                                try { File.Delete(file); } catch { }
+                                Log(log, "[tab-sync] deleted " + why + " (" + Path.GetFileName(file) + ")");
+                            }
+                            else Log(log, "[tab-sync] skipped " + Path.GetFileName(file) + ": " + why);
+                            continue;
+                        }
+                        if (!all.Exists(e => e.Pid == ep.Pid)) all.Add(ep);
+                    }
+                }
+            }
+            catch (Exception ex) { reason = "the IDE endpoint records could not be read: " + ex.Message; return new List<Endpoint>(); }
+            if (all.Count == 0)
+                reason = records == 0 ? "no Clarion with Clarion Assistant is running" : "no running IDE could be verified";
+            return all;
+        }
+
         // A record, or null with why ("stale ..." when it must be deleted).
         private static Endpoint ReadTrusted(string file, out string why)
         {
@@ -159,8 +256,22 @@ namespace ClarionAssistant.Services
             if (rec == null) { why = "empty"; return null; }
 
             object v;
-            int pid = rec.TryGetValue("pid", out v) && v != null ? Convert.ToInt32(v) : 0;
-            int port = rec.TryGetValue("port", out v) && v != null ? Convert.ToInt32(v) : 0;
+            // GH #205 pipeline run 3: parsed, never converted. Convert.ToInt32 threw on "abc" or 1e12 here, outside any try,
+            // and one bad record aborted discovery for EVERY IDE. An unparseable record is skipped, and deleted only when
+            // provably stale (its file name's pid is no longer running).
+            int pid, port;
+            bool pidOk = TryInt(rec, "pid", out pid), portOk = TryInt(rec, "port", out port);
+            if (!pidOk || !portOk)
+            {
+                string stem = Path.GetFileNameWithoutExtension(file);
+                int namePid;
+                int dash = stem.IndexOf('-');
+                if (dash > 0 && int.TryParse(stem.Substring(0, dash), out namePid) && namePid > 0 && !IsRunning(namePid))
+                    why = "stale: malformed record " + stem + " of a pid that is no longer running";
+                else
+                    why = "malformed record " + stem + " (pid/port not a number), skipped";
+                return null;
+            }
             string token = rec.TryGetValue("token", out v) ? v as string : null;
             DateTime start = DateTime.MinValue, written = DateTime.MinValue;
             bool hasStart = rec.TryGetValue("startTime", out v) && DateTime.TryParse(v as string, null,
@@ -182,7 +293,7 @@ namespace ClarionAssistant.Services
             try
             {
                 if (p.HasExited) { why = "stale: IDE " + pid + ":" + port + " has exited"; return null; }
-                string image = Environment.GetEnvironmentVariable(ImageNameEnv);
+                string image = TestHook(ImageNameEnv);
                 if (string.IsNullOrEmpty(image)) image = "Clarion";
                 if (!string.Equals(p.ProcessName, image, StringComparison.OrdinalIgnoreCase))
                 { why = "stale: pid " + pid + " is now '" + p.ProcessName + "', not the IDE (pid reused)"; return null; }
@@ -192,7 +303,26 @@ namespace ClarionAssistant.Services
             }
             catch (Exception ex) { why = "unverifiable (" + ex.GetType().Name + ")"; return null; }   // e.g. access denied: skip, keep
 
-            return new Endpoint { Pid = pid, Port = port, Token = token };
+            int ideTools;
+            if (!TryInt(rec, "ideTools", out ideTools) || ideTools < 0) ideTools = 0;
+            return new Endpoint { Pid = pid, Port = port, Token = token, IdeToolsProtocol = ideTools };
+        }
+
+        private static bool TryInt(Dictionary<string, object> rec, string key, out int value)
+        {
+            value = 0;
+            object v;
+            if (!rec.TryGetValue(key, out v) || v == null) return true;   // absent = 0: the "malformed" checks below judge it
+            if (v is int) { value = (int)v; return true; }
+            return int.TryParse(Convert.ToString(v, System.Globalization.CultureInfo.InvariantCulture),
+                                System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out value);
+        }
+
+        private static bool IsRunning(int pid)
+        {
+            try { using (var p = Process.GetProcessById(pid)) return !p.HasExited; }
+            catch (ArgumentException) { return false; }
+            catch { return true; }   // cannot tell (access denied): not provably gone
         }
 
         private static string Full(string path)

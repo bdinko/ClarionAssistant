@@ -41,7 +41,7 @@ static class EditorToolRouterTest
     }
 
     // ---- the page (Monaco's rules, in memory) ----
-    sealed class FakePage : IEditorOverlayChannel
+    class FakePage : IEditorOverlayChannel
     {
         public string Path;
         public string Text;
@@ -139,6 +139,14 @@ static class EditorToolRouterTest
         }
     }
 
+    // b8f9431c N1: the CA Embeditor's channel as the router sees it (ModernEmbeditorViewContent.EmbedChannel implements
+    // both interfaces); its FilePath is the .app the native view reports, or a description.
+    sealed class FakeEmbedPage : FakePage, IEmbedOverlayChannel
+    {
+        public string ProcedureName { get { return "BrowseCustomers"; } }
+        public IList<int[]> NativeRanges { get { return new List<int[]>(); } }
+    }
+
     // ---- an IWorkbenchWindow: SelectWindow displays the tab (it does NOT make it the active window) ----
     public sealed class FakeWorkbenchWindow
     {
@@ -156,8 +164,230 @@ static class EditorToolRouterTest
         return r.Run(tool, () => Native(tool), ov);
     }
 
+    // GH #262: the column rules replace_range / delete_range / select_range document, as EditorTextOps computes them for
+    // both editors, and the native caret after a replace_range whose new_text has LF-only line breaks.
+    static void ColumnRules()
+    {
+        Console.WriteLine("\nGH #262: range column rules (both editors) and the native caret after replace_range");
+        Check("end_col is exclusive: col L+1 is the end of a line of length L", EditorTextOps.ColumnIndex(6, 5) == 5 && EditorTextOps.ColumnIndex(5, 5) == 4);
+        Check("a column past the end clamps to the end (e.g. 999)", EditorTextOps.ColumnIndex(999, 5) == 5);
+        Check("a column below 1 clamps to the line's start", EditorTextOps.ColumnIndex(0, 5) == 0 && EditorTextOps.ColumnIndex(-3, 5) == 0);
+        Check("int.MinValue clamps to the start, not (wrapped) to the end", EditorTextOps.ColumnIndex(int.MinValue, 5) == 0, EditorTextOps.ColumnIndex(int.MinValue, 5).ToString());
+        Check("int.MaxValue (the omitted end_col) is the end of the line", EditorTextOps.ColumnIndex(int.MaxValue, 5) == 5);
+        string t = "\tab\r\nxy\r\n";
+        Check("columns count characters: a tab is 1", EditorTextOps.Offset(t, 1, 2) == 1 && t[EditorTextOps.Offset(t, 1, 2)] == 'a');
+        Check("end of a CRLF line stops before its \\r", EditorTextOps.Offset(t, 1, 999) == 3);
+        Check("a column below 1 never reaches the previous line's break", EditorTextOps.Offset(t, 2, 0) == 5);
+
+        // The reporter's case: an end_col one short leaves the last character behind.
+        string line = "  Resize:LockSize )";
+        int L = line.Length;
+        string shortEnd = line.Substring(0, EditorTextOps.Offset(line, 1, 3)) + "X" + line.Substring(EditorTextOps.Offset(line, 1, L));
+        string fullEnd = line.Substring(0, EditorTextOps.Offset(line, 1, 3)) + "X" + line.Substring(EditorTextOps.Offset(line, 1, L + 1));
+        Check("end_col = L keeps the last character; L+1 replaces it", shortEnd == "  X)" && fullEnd == "  X", shortEnd + " | " + fullEnd);
+
+        // Whole lines N-M: start_col 1, end_col omitted (999), new_text without a trailing break: line M's break survives.
+        string doc = "a\r\nb\r\nc\r\nd\r\n";
+        int s = EditorTextOps.Offset(doc, 2, 1), e = EditorTextOps.Offset(doc, 3, 999);
+        string whole = doc.Substring(0, s) + "X" + doc.Substring(e);
+        Check("whole lines 2-3 (cols omitted) become one line; the break after line 3 is kept", whole == "a\r\nX\r\nd\r\n", whole.Replace("\r\n", "|"));
+
+        int caret;
+        string inserted = EditorTextOps.ReplacementText("a\nb\nc", 10, out caret);
+        Check("native replace_range inserts the CRLF-normalized text", inserted == "a\r\nb\r\nc", inserted.Replace("\r\n", "|"));
+        Check("...and the caret lands after it (not one short per LF)", caret == 10 + inserted.Length, "caret " + caret + ", expected " + (10 + inserted.Length));
+        inserted = EditorTextOps.ReplacementText(null, 4, out caret);
+        Check("...a null new_text inserts nothing, caret at the start", inserted == "" && caret == 4);
+    }
+
+    // GH #262 on the CA Editor path: the extreme columns and the delete_range recipes the tool description gives, each
+    // on a fresh page. Max is the omitted end_col (McpToolRegistry's default).
+    static void RangeRecipes(EditorToolRouter router, FakeUi ui, string path)
+    {
+        Console.WriteLine("\nGH #262: extreme columns and the delete_range recipes, in the CA Editor");
+        const int Max = int.MaxValue;
+        Func<string, string, Func<OverlayEditorOps, object>, string> on = (seed, tool, op) =>
+        {
+            var p = new FakePage { Path = path, Text = seed, UiThreadId = ui.Thread.ManagedThreadId };
+            EditorToolRouter.ActiveOverlayResolver = () => p;
+            var r = router.Run(tool, () => Native(tool), op) as string;
+            return r != null && r.StartsWith("Error") ? r : p.Text;
+        };
+        Func<string, string> show = s => s.Replace("\r\n", "|");
+
+        string longLine = new string('x', 1200) + "END";
+        string t = on(longLine + "\r\nnext", "replace_range", ov => ov.ReplaceRange(1, 1, 1, Max, "Z"));
+        Check("omitted end_col (int.MaxValue) replaces a 1,203-character line to its end", t == "Z\r\nnext", show(t).Length > 60 ? show(t).Substring(0, 60) + "..." : show(t));
+        t = on(longLine + "\r\nnext", "replace_range", ov => ov.ReplaceRange(1, 1, 1, 999, "Z"));
+        Check("...(control: the old default 999 left the tail behind)", t.StartsWith("Z" + new string('x', 202) + "END"), show(t).Substring(0, Math.Min(40, t.Length)));
+        t = on("abc\r\n", "replace_range", ov => ov.ReplaceRange(1, int.MinValue, 1, int.MinValue, "X"));
+        Check("start_col/end_col int.MinValue insert at the line's start", t == "Xabc\r\n", show(t));
+
+        const string four = "l1\r\nl2\r\nl3\r\nl4";
+        t = on(four, "delete_range", ov => ov.DeleteRange(1, 1, 3, 1));
+        Check("delete lines 1-2 (start_line=1, end_line=3, end_col=1)", t == "l3\r\nl4", show(t));
+        t = on(four, "delete_range", ov => ov.DeleteRange(2, 1, 4, 1));
+        Check("delete lines 2-3 (a middle range)", t == "l1\r\nl4", show(t));
+        t = on(four, "delete_range", ov => ov.DeleteRange(4, 1, 5, 1));
+        Check("the M+1 recipe on the last line is refused (no line M+1)", t == "Error: Invalid line/column range", show(t));
+        t = on(four, "delete_range", ov => ov.DeleteRange(3, Max, 4, Max));
+        Check("delete the last line (start_line=N-1 past its end, end_line=M, end_col omitted)", t == "l1\r\nl2\r\nl3", show(t));
+        t = on(four, "delete_range", ov => ov.DeleteRange(2, Max, 4, Max));
+        Check("delete the last two lines the same way", t == "l1\r\nl2", show(t));
+        t = on(four, "delete_range", ov => ov.DeleteRange(1, 1, 4, Max));
+        Check("empty the whole document (start_line=1, end_line=last, columns omitted)", t == "", show(t));
+        t = on("only", "delete_range", ov => ov.DeleteRange(1, 1, 1, Max));
+        Check("delete the only line", t == "", show(t));
+        t = on("a\r\nb\r\n", "delete_range", ov => ov.DeleteRange(2, Max, 3, Max));
+        Check("delete an empty last line", t == "a\r\nb", show(t));
+    }
+
+    // b8f9431c N1 + N2. The gate stands in for McpPathGate.GatePath(..., PathAccess.Write): it refuses what the #266 policy
+    // refuses to write (here: anything under .vscode, and a path outside H:\Sol), and records what it was asked.
+    // OLD_ROUTER (fail-on-old proof, compiled against 21d0205's EditorToolRouter.cs): no gate parameter, no NoFileWrite.
+    static readonly List<string> GateAsked = new List<string>();
+    static string FakeWriteGate(string tool, string path)
+    {
+        lock (GateAsked) GateAsked.Add(path);
+        if (path.IndexOf(@"\.vscode\", StringComparison.OrdinalIgnoreCase) >= 0 || !path.StartsWith(@"H:\Sol\", StringComparison.OrdinalIgnoreCase))
+            return "Error: " + tool + " refused by the Clarion Assistant path policy (GH #266): '" + path + "' - write denied.";
+        return null;
+    }
+    static EditorToolRouter Gated(FakeUi ui, Func<string> native, Func<string, string, string> gate = null)
+    {
+#if OLD_ROUTER
+        return new EditorToolRouter(() => ui, native);
+#else
+        return new EditorToolRouter(() => ui, native, gate ?? FakeWriteGate);
+#endif
+    }
+    static EditorToolRouter.RouteOptions W(bool noFileWrite = false, string expected = null)
+    {
+        var o = new EditorToolRouter.RouteOptions { IsWrite = true, ExpectedPath = expected };
+#if !OLD_ROUTER
+        o.NoFileWrite = noFileWrite;
+#endif
+        return o;
+    }
+
+    static void WriteGate(FakeUi ui)
+    {
+        Console.WriteLine("\nb8f9431c N1: an edit or save on a file the path policy refuses to WRITE is refused, nothing changed");
+        const string tasks = @"H:\Sol\.vscode\tasks.json";
+        const string clw = @"H:\Sol\Main.clw";
+        const string seed = "{\r\n  \"version\": \"2.0.0\"\r\n}\r\n";
+        string nativeActive = tasks;
+        var router = Gated(ui, () => nativeActive);
+        var tp = new FakePage { Path = tasks, Text = seed, UiThreadId = ui.Thread.ManagedThreadId };
+        EditorToolRouter.ActiveOverlayResolver = () => tp;
+
+        var writes = new[]
+        {
+            new { Tool = "insert_text_at_cursor", Op = (Func<OverlayEditorOps, object>)(ov => ov.InsertTextAtCursor("X")) },
+            new { Tool = "replace_text", Op = (Func<OverlayEditorOps, object>)(ov => ov.ReplaceText("2.0.0", "evil")) },
+            new { Tool = "replace_range", Op = (Func<OverlayEditorOps, object>)(ov => ov.ReplaceRange(2, 1, 2, int.MaxValue, "evil")) },
+            new { Tool = "delete_range", Op = (Func<OverlayEditorOps, object>)(ov => ov.DeleteRange(1, 1, 2, 1)) },
+            new { Tool = "toggle_comment", Op = (Func<OverlayEditorOps, object>)(ov => ov.ToggleComment(1, 2)) },
+            new { Tool = "undo", Op = (Func<OverlayEditorOps, object>)(ov => ov.Undo()) },
+            new { Tool = "redo", Op = (Func<OverlayEditorOps, object>)(ov => ov.Redo()) },
+            new { Tool = "save_file", Op = (Func<OverlayEditorOps, object>)(ov => ov.Save()) },
+        };
+        foreach (var w in writes)
+        {
+            NativeCalls = 0; tp.Requests = 0;
+            var r = router.Run(w.Tool, () => Native(w.Tool), w.Op, W()) as string ?? "";
+            Check("CA Editor on .vscode\\tasks.json: " + w.Tool + " is refused by the path policy, the page never asked",
+                r.StartsWith("Error: " + w.Tool + " refused by the Clarion Assistant path policy") && tp.Requests == 0 && NativeCalls == 0 && tp.Text == seed, r);
+        }
+        var read = router.Run("get_line_text", () => Native("get"), ov => ov.GetLineText(2)) as string;
+        Check("...a READ of the same tab is not gated", read == "  \"version\": \"2.0.0\"", read);
+        NativeCalls = 0; tp.Requests = 0;
+        lock (GateAsked) GateAsked.Clear();
+        var closed = router.Run("close_file", () => Native("close_file"), ov => ov.Close(), W(noFileWrite: true)) as string;
+        Check("...close_file (writes nothing) still closes it, without asking the gate",
+            (closed ?? "").StartsWith("NATIVE:close_file") && GateAsked.Count == 0, closed + " gate asked " + GateAsked.Count);
+
+        EditorToolRouter.ActiveOverlayResolver = () => null;
+        NativeCalls = 0;
+        var nr = router.Run("replace_text", () => Native("rt"), ov => "OVERLAY", W()) as string ?? "";
+        Check("native editor on .vscode\\tasks.json: replace_text is refused, the native editor never called",
+            nr.StartsWith("Error: replace_text refused by the Clarion Assistant path policy") && NativeCalls == 0, nr);
+        nr = router.Run("save_file", () => Native("save"), ov => "OVERLAY", W()) as string ?? "";
+        Check("...and save_file", nr.StartsWith("Error: save_file refused by the Clarion Assistant path policy") && NativeCalls == 0, nr);
+        nativeActive = @"C:\Clarion12\template\win\ABC.tpl";
+        nr = router.Run("replace_range", () => Native("rr"), ov => "OVERLAY", W()) as string ?? "";
+        Check("...a template under the Clarion root (read-only to the tools) is refused too", nr.Contains("refused by the Clarion Assistant path policy") && NativeCalls == 0, nr);
+
+        nativeActive = clw;
+        lock (GateAsked) GateAsked.Clear();
+        nr = router.Run("replace_text", () => Native("rt"), ov => "OVERLAY", W()) as string ?? "";
+        Check("a generated .clw in the solution is written as before (the gate judged the ACTIVE file)",
+            nr.StartsWith("NATIVE:rt") && NativeCalls == 1 && GateAsked.Contains(clw), nr + " gate asked [" + string.Join(",", GateAsked) + "]");
+
+        nativeActive = null;
+        NativeCalls = 0;
+        nr = router.Run("replace_text", () => Native("rt"), ov => "OVERLAY", W()) as string ?? "";
+        Check("no active path (the IDE did not say which file) fails closed", nr.StartsWith("Error: replace_text refused") && NativeCalls == 0, nr);
+
+        int asks = 0;
+        var flip = Gated(ui, () => ++asks == 1 ? clw : tasks);
+        NativeCalls = 0;
+        nr = flip.Run("replace_text", () => Native("rt"), ov => "OVERLAY", W()) as string ?? "";
+        Check("a tab switch between the check and the write is refused (the write re-checks the active file on the UI thread)",
+            nr.StartsWith("Error: the active editor changed") && NativeCalls == 0, nr);
+
+        var throwing = Gated(ui, () => clw, (t, p) => { throw new InvalidOperationException("boom"); });
+        NativeCalls = 0;
+        nr = throwing.Run("replace_text", () => Native("rt"), ov => "OVERLAY", W()) as string ?? "";
+        Check("a gate that throws refuses (fail closed)", nr.StartsWith("Error: replace_text refused") && nr.Contains("boom") && NativeCalls == 0, nr);
+
+        Console.WriteLine("\nb8f9431c N1: embed writes are exempt (the document is the procedure, not a file)");
+        lock (GateAsked) GateAsked.Clear();
+        var emb = new FakeEmbedPage { Path = @"X:\Elsewhere\Inventory.app", Text = "  x = 1\r\n", UiThreadId = ui.Thread.ManagedThreadId };
+        EditorToolRouter.ActiveOverlayResolver = () => emb;
+        var er = router.Run("replace_text", () => Native("rt"), ov => ov.ReplaceText("x = 1", "x = 2"), W()) as string ?? "";
+        Check("CA Embeditor (an app outside every root): replace_text lands in the embed buffer, the gate never asked",
+            er.StartsWith("Text replaced successfully") && emb.Text == "  x = 2\r\n" && GateAsked.Count == 0, er + " gate asked " + GateAsked.Count);
+        emb.Path = "the CA Embeditor ('BrowseCustomers')";
+        er = router.Run("insert_text_at_cursor", () => Native("ins"), ov => ov.InsertTextAtCursor("!"), W()) as string ?? "";
+        Check("...and with no native path at all (FilePath is a description)", er.StartsWith("Text inserted successfully"), er);
+        EditorToolRouter.ActiveOverlayResolver = () => null;
+        nativeActive = @"X:\Elsewhere\Inventory.app";
+        NativeCalls = 0;
+        er = router.Run("replace_range", () => Native("rr"), ov => "OVERLAY", W()) as string ?? "";
+        Check("native (PWEE) embeditor of an .app outside every root: replace_range runs as before",
+            er.StartsWith("NATIVE:rr") && NativeCalls == 1 && GateAsked.Count == 0, er);
+        var plain = new FakePage { Path = @"X:\Elsewhere\Inventory.app.clw", Text = "a\r\n", UiThreadId = ui.Thread.ManagedThreadId };
+        EditorToolRouter.ActiveOverlayResolver = () => plain;
+        er = router.Run("replace_text", () => Native("rt"), ov => ov.ReplaceText("a", "b"), W()) as string ?? "";
+        Check("...but a CA Editor SOURCE tab is gated (only the embed channel is exempt)", er.StartsWith("Error: replace_text refused") && plain.Text == "a\r\n", er);
+
+        Console.WriteLine("\nb8f9431c N2: file_path is compared as TEXT, never resolved on disk or the network");
+        var same = typeof(EditorToolRouter).GetMethod("SamePath", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+        Func<string, string, bool> sp = (a, b) => (bool)same.Invoke(null, new object[] { a, b });
+        Check("same file, other case / separators / '.' and '..' segments: same", sp(@"H:\Sol\Main.clw", @"h:/sol/./x/../MAIN.clw"));
+        Check("another file: not the same", !sp(@"H:\Sol\Main.clw", @"H:\Sol\Main2.clw"));
+        EditorToolRouter.ActiveOverlayResolver = () => null;
+        nativeActive = clw;
+        foreach (var unc in new[] { @"\\192.0.2.1\s\A~1\x.clw", @"\\192.0.2.1\s\PROGRA~1\Main.clw" })
+        {
+            NativeCalls = 0;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var ur = router.Run("replace_text", () => Native("rt"), ov => "OVERLAY", W(expected: unc)) as string ?? "";
+            sw.Stop();
+            Check("file_path " + unc + " is refused as another file with no network I/O (" + sw.ElapsedMilliseconds + " ms)",
+                ur.StartsWith("Error: the active editor holds " + clw) && NativeCalls == 0 && sw.ElapsedMilliseconds < 1500, ur + " in " + sw.ElapsedMilliseconds + " ms");
+        }
+        var swd = System.Diagnostics.Stopwatch.StartNew();
+        bool uncSame = sp(@"\\192.0.2.1\s\A~1\x.clw", @"\\192.0.2.1\s\A~1\X.CLW");
+        swd.Stop();
+        Check("two spellings of the same UNC path compare equal as text, at once (" + swd.ElapsedMilliseconds + " ms)", uncSame && swd.ElapsedMilliseconds < 1500);
+        EditorToolRouter.ActiveOverlayResolver = null;
+    }
+
     static int Main()
     {
+        ColumnRules();
         var ui = new FakeUi();
         EditorToolRouter.UiThreadId = ui.Thread.ManagedThreadId;
         var router = new EditorToolRouter(() => ui);
@@ -165,9 +395,11 @@ static class EditorToolRouterTest
         string seed = "  MEMBER('app')\r\nP PROCEDURE\r\n  CODE\r\n  x = 1\r\n  y = 2\r\n";
         File.WriteAllText(tmp, seed);
         var page = new FakePage { Path = tmp, Text = seed, UiThreadId = ui.Thread.ManagedThreadId, CurLine = 4, CurCol = 3 };
-        EditorToolRouter.ActiveOverlayResolver = () => page;
         try
         {
+            RangeRecipes(router, ui, tmp);
+            EditorToolRouter.ActiveOverlayResolver = () => page;
+
             Console.WriteLine("\nWith a CA Editor up: writes land in Monaco's text, reads come from it, native untouched");
             NativeCalls = 0;
             var r = Run(router, "insert_text_at_cursor", ov => ov.InsertTextAtCursor("IF x = "));
@@ -384,6 +616,9 @@ static class EditorToolRouterTest
             r = orouter.OpenAndWait(@"C:\x\Inventory.app", () => "Opened app", null, 5000);
             Check("an .app (no text editor) returns at once", r as string == "Opened app" && sw.ElapsedMilliseconds < 500, r + " in " + sw.ElapsedMilliseconds + " ms");
             EditorToolRouter.OverlayExpectedFor = null;
+            EditorToolRouter.ActiveOverlayResolver = () => page;
+
+            WriteGate(ui);
             EditorToolRouter.ActiveOverlayResolver = () => page;
 
             Console.WriteLine("\nHostRequestBroker");

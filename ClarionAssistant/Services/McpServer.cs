@@ -140,8 +140,9 @@ namespace ClarionAssistant.Services
                     _listenerThread.Start();
 
                     // 44a1b10c: let the standalone clarion-mcp-server find this pane, to ask it for an open editor's
-                    // text (get_live_text). Removed in Stop.
-                    IdeEndpointRecord.Publish(port, _sessionToken);
+                    // text (get_live_text) and, GH #205, for its open tabs (editor_tab_sync). Removed in Stop. ONE record
+                    // per IDE: the first running server publishes, the others stand by (see JoinEndpoint).
+                    JoinEndpoint();
 
                     lock (_reclaimLock)
                     {
@@ -149,7 +150,7 @@ namespace ClarionAssistant.Services
                         _reclaimedPort = 0;
                         // The listener rides along as the timer state, so a tick can tell it belongs
                         // to this run and not to one a restart has since replaced.
-                        if (port != preferredPort)
+                        if (port != preferredPort && ReclaimPreferredPort)
                             _reclaimTimer = new System.Threading.Timer(TryReclaimPreferredPort, _listener,
                                                                        ReclaimIntervalMs, ReclaimIntervalMs);
                     }
@@ -362,6 +363,46 @@ namespace ClarionAssistant.Services
             return false;
         }
 
+        /// <summary>
+        /// When the preferred port is taken, keep retrying it (the chat pane: external clients are configured for
+        /// 19372). False for the IDE callback endpoint (IdeCallbackHost), whose port nobody is configured for.
+        /// </summary>
+        public bool ReclaimPreferredPort { get; set; } = true;
+
+        /// <summary>
+        /// b8f9431c: the raw "Mcp.UiToolTimeoutSeconds" setting for this server's UI-thread tool budget, when the server
+        /// was built with no SettingsService (IdeCallbackHost, which must not accept the external token that settings
+        /// would enable). Null: the settings passed to the constructor, else the 30 s default. Set before Start.
+        /// </summary>
+        public Func<string> UiTimeoutSettingReader { get; set; }
+
+        /// <summary>
+        /// b8f9431c review L6: the "Mcp.UiToolTimeoutSeconds" setting read FRESH from settings.txt (null when unset or
+        /// unreadable). The plugin's forwarder reads the file per call too, so the IDE and the client budget a forwarded
+        /// call from the same value even after a hand edit - the client never gives up before the IDE does.
+        /// </summary>
+        public static string ReadUiTimeoutSettingLive()
+        {
+            try { return new SettingsService().Get(McpUiTimeoutPolicy.SettingKey); }
+            catch { return null; }
+        }
+
+        // GH #205: ONE endpoint record per IDE process, whichever of its servers (the chat pane's, the always-on
+        // IdeCallbackHost's) is running. Both serve get_live_text and editor_tab_sync, so either answers the standalone
+        // server; publishing both would leave it two records for one IDE. The first running server publishes; when it
+        // stops, the record moves to another running one, so closing the chat pane never leaves the IDE unreachable.
+        private static readonly EndpointOwnership<McpServer> _endpoint = new EndpointOwnership<McpServer>();
+
+        /// <summary>The server whose record is published for this IDE, or null. For diagnostics.</summary>
+        internal static McpServer EndpointOwner { get { return _endpoint.Owner; } }
+
+        private static bool Serving(McpServer s) { return s._running && s._sessionToken != null; }
+        private static void PublishRecord(McpServer s) { IdeEndpointRecord.Publish(s._port, s._sessionToken); }
+        private static void WithdrawRecord(McpServer s) { IdeEndpointRecord.Remove(s._port); }
+
+        private void JoinEndpoint() { _endpoint.Join(this, Serving, PublishRecord); }
+        private void LeaveEndpoint() { _endpoint.Leave(this, Serving, PublishRecord, WithdrawRecord); }
+
         public void Stop()
         {
             bool wasRunning = _running;
@@ -372,7 +413,7 @@ namespace ClarionAssistant.Services
                 StopReclaimTimer();
                 _reclaimedPort = 0;
             }
-            if (wasRunning) IdeEndpointRecord.Remove(_port);   // 44a1b10c: withdraw the endpoint before the port closes
+            if (wasRunning) LeaveEndpoint();   // 44a1b10c: withdraw the endpoint before the port closes (GH #205: hand it on)
 
             // Close all SSE connections
             foreach (var kvp in _sseClients)
@@ -509,9 +550,10 @@ namespace ClarionAssistant.Services
             }
 
             // The editor-agnostic half, served by clarion-mcp-server.exe as its own stdio process
-            // (ticket d051fbd1). Together with the entry above this partitions all the tools (119 as of 44a1b10c;
-            // clarion-mcp-server --selftest prints the live split): clarion-assistant keeps the 58 that drive the
-            // IDE, including get_live_text, which the standalone's lsp_diagnostics calls back; clarion-tools serves the other 61.
+            // (ticket d051fbd1). Together with the entry above this partitions all the tools (120 as of GH #205;
+            // clarion-mcp-server --selftest prints the live split): clarion-assistant keeps the 59 that drive the
+            // IDE, including get_live_text, which the standalone's lsp_diagnostics calls back, and editor_tab_sync,
+            // which its write_file/append_to_file call back (GH #205); clarion-tools serves the other 61.
             //
             // --strict-mcp-config means the plugin's own clarion-tools entry never reaches this
             // pane, so declaring it here is not a duplicate - it is the ONLY way those tools arrive
@@ -623,20 +665,13 @@ namespace ClarionAssistant.Services
         /// what would make the change look correct, test clean, and only misbehave the day a second
         /// plugin is added. Flagged by Alice, who owns the MultiTerminal side (ticket c9285d2a).
         /// </summary>
+        ///
+        /// GH #214: resolved by ClaudePluginLocator, which keeps both rules above (manifest gate, the
+        /// plugin folder itself) and adds a shared marketplace root beside Clarion Assistant's, the
+        /// active profile (CLAUDE_CONFIG_DIR), and the newest cached version.
         public static string GetMultiTerminalPluginPath()
         {
-            try
-            {
-                string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-                if (string.IsNullOrEmpty(userProfile)) return null;
-
-                string pluginRoot = Path.Combine(userProfile, ".claude", "plugins", "marketplaces",
-                    "multiterminal-marketplace", "plugins", "multiterminal");
-                if (File.Exists(Path.Combine(pluginRoot, ".claude-plugin", "plugin.json")))
-                    return pluginRoot;
-            }
-            catch { }
-            return null;
+            return ClaudePluginLocator.FindMultiTerminalPlugin();
         }
 
         public string WriteMcpConfigFile()
@@ -847,10 +882,7 @@ namespace ClarionAssistant.Services
             // Encoding.Default (system ANSI / Windows-1252) when the request omits a charset, which most
             // MCP clients do — that decodes UTF-8 bytes as 1252 and mojibakes non-ASCII source (#44:
             // "på" -> "pÃ¥"). Force UTF-8 to match the response writer.
-            using (var reader = new StreamReader(request.InputStream, new UTF8Encoding(false)))
-            {
-                body = reader.ReadToEnd();
-            }
+            if (!TryReadBody(request, response, out body)) return;
 
             // Respond to the POST with 202 Accepted immediately
             response.StatusCode = 202;
@@ -876,6 +908,47 @@ namespace ClarionAssistant.Services
 
         #endregion
 
+        /// <summary>The largest JSON-RPC request body accepted (GH #266 security gate LOW: the body was read with no limit).</summary>
+        internal const int MaxRequestBodyBytes = 16 * 1024 * 1024;
+
+        /// <summary>
+        /// Read the request body as UTF-8 (BOM stripped, as StreamReader did), at most <see cref="MaxRequestBodyBytes"/>.
+        /// A larger Content-Length, or a body that turns out larger, is answered 413 and the request is dropped.
+        /// </summary>
+        private static bool TryReadBody(HttpListenerRequest request, HttpListenerResponse response, out string body)
+        {
+            body = null;
+            if (request.ContentLength64 > MaxRequestBodyBytes) { Reject413(response); return false; }
+            var ms = new MemoryStream();
+            var buf = new byte[81920];
+            int n;
+            while ((n = request.InputStream.Read(buf, 0, buf.Length)) > 0)
+            {
+                if (ms.Length + n > MaxRequestBodyBytes) { Reject413(response); return false; }
+                ms.Write(buf, 0, n);
+            }
+            // JSON-RPC bodies are UTF-8 by spec. HttpListenerRequest.ContentEncoding falls back to Encoding.Default
+            // (system ANSI) when the request omits a charset, which most MCP clients do - that mojibaked non-ASCII
+            // source (#44). Decode UTF-8 explicitly.
+            body = new UTF8Encoding(false).GetString(ms.GetBuffer(), 0, (int)ms.Length);
+            if (body.Length > 0 && body[0] == '\uFEFF') body = body.Substring(1);
+            return true;
+        }
+
+        private static void Reject413(HttpListenerResponse response)
+        {
+            try
+            {
+                byte[] err = Encoding.UTF8.GetBytes("{\"error\":\"request body too large\",\"limitBytes\":" + MaxRequestBodyBytes + "}");
+                response.StatusCode = 413;
+                response.ContentType = "application/json";
+                response.ContentLength64 = err.Length;
+                response.OutputStream.Write(err, 0, err.Length);
+                response.Close();
+            }
+            catch { }
+        }
+
         #region Streamable HTTP Transport
 
         private void HandleStreamableHttpPost(HttpListenerContext context)
@@ -891,10 +964,7 @@ namespace ClarionAssistant.Services
                 // Encoding.Default (system ANSI / Windows-1252) when the request omits a charset, which most
                 // MCP clients do — that decodes UTF-8 bytes as 1252 and mojibakes non-ASCII source (#44:
                 // "på" -> "pÃ¥"). Force UTF-8 to match the response writer.
-                using (var reader = new StreamReader(request.InputStream, new UTF8Encoding(false)))
-                {
-                    body = reader.ReadToEnd();
-                }
+                if (!TryReadBody(request, response, out body)) return;
 
                 // Determine or create session
                 string sessionId = request.Headers["Mcp-Session-Id"];
@@ -1043,8 +1113,14 @@ namespace ClarionAssistant.Services
                             "clarion-assistant",
                             "1.0.0");
                         // PR #198: an install can override the UI-thread tool budget (5-600s, never below a tool's declared minimum) (see McpUiTimeoutPolicy).
-                        _dispatcher.UiTimeoutSettingReader = () =>
-                            _settings != null ? _settings.Get(McpUiTimeoutPolicy.SettingKey) : null;
+                        // b8f9431c: a server built without settings (IdeCallbackHost: passing them would also turn on the
+                        // external token) supplies the reader on its own.
+                        // L6: a server WITH settings (the chat pane, also a forwarding target when it holds the endpoint
+                        // record) reads the file live too, falling back to its snapshot; none = the 30 s default.
+                        var reader = UiTimeoutSettingReader;
+                        _dispatcher.UiTimeoutSettingReader = reader ?? (() =>
+                            _settings == null ? null
+                                : (ReadUiTimeoutSettingLive() ?? _settings.Get(McpUiTimeoutPolicy.SettingKey)));
                     }
                     return _dispatcher;
                 }
@@ -1074,7 +1150,7 @@ namespace ClarionAssistant.Services
         /// from the wrong thread. Liveness belongs in BeginInvokeOnUi, below, where the fallback
         /// is inline execution of work that would otherwise simply be dropped.
         /// </summary>
-        private sealed class ControlUiDispatcher : IUiDispatcher
+        internal sealed class ControlUiDispatcher : IUiDispatcher
         {
             private readonly Control _control;
 

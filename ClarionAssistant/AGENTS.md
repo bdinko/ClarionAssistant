@@ -18,9 +18,9 @@ You have MCP tools that directly control the IDE the developer is using. ALWAYS 
 - `go_to_line` -**Navigate to a specific line** in the currently open file. USE THIS when pointing out issues, typos, or specific locations in code.
 - `insert_text_at_cursor` -Insert text at the current cursor position in the editor
 - `replace_text` -Find and replace ALL occurrences of a string in the active editor. Best for simple text substitutions.
-- `replace_range` -Replace text between specific line/column positions (1-based). Best for replacing a specific block of code.
-- `select_range` -Select/highlight a range of text in the editor (1-based line/col).
-- `delete_range` -Delete text between specific line/column positions (1-based).
+- `replace_range` -Replace text between specific line/column positions (1-based). Best for replacing a specific block of code. Columns count characters (a tab is 1); `end_col` is EXCLUSIVE (the character at it is kept), and omitting it replaces to the end of `end_line`. Whole lines N–M: `start_line=N`, `end_line=M`, omit both columns, and do not end `new_text` with a line break.
+- `select_range` -Select/highlight a range of text in the editor (1-based line/col). Same column rules as `replace_range` (the character at `end_col` is not selected).
+- `delete_range` -Delete text between specific line/column positions (1-based). Same column rules as `replace_range`. Whole lines N–M with their line breaks: `start_line=N`, `start_col=1`, `end_line=M+1`, `end_col=1`. If M is the last line and N>1: `start_line=N-1` with `start_col` past its end, `end_line=M`, `end_col` omitted. Whole document: `start_line=1`, `end_line`=last, columns omitted.
 - `undo` -Undo the last edit. Use after a bad edit to revert.
 - `redo` -Redo the last undone edit.
 - `save_file` -Save the active file. Use after making edits.
@@ -31,7 +31,7 @@ You have MCP tools that directly control the IDE the developer is using. ALWAYS 
 - `is_modified` -Check if the active file has unsaved changes.
 - `toggle_comment` -Toggle Clarion line comments (!) on a range of lines.
 
-**With the file open in the CA Editor** (the Monaco editor over a source tab), every tool above reads and edits THAT text: the text the developer sees, unsaved edits included. Your edits appear in the CA Editor, `undo`/`redo` use its undo stack, and `is_modified` reports its unsaved changes. `save_file` saves the CA Editor's text. `close_file` REFUSES while the CA Editor has unsaved changes: run `save_file` first, or ask the developer. If the CA Editor is still loading or does not answer, the tool returns an error and changes nothing; it never edits the hidden native editor underneath instead. `open_file` returns only once the file IS the active editor (and its CA Editor has loaded); if it returns an Error, do not edit yet. Every edit tool's result names the file and line it changed (e.g. `Text inserted successfully — PRM002130.clw:9256 (...)`): check it. The edit tools, `undo`, `redo`, `save_file` and `close_file` take an optional `file_path`: pass the file you mean, and the call is refused (nothing changed) if a different file is active.
+**With the file open in the CA Editor** (the Monaco editor over a source tab), every tool above reads and edits THAT text: the text the developer sees, unsaved edits included. Your edits appear in the CA Editor, `undo`/`redo` use its undo stack, and `is_modified` reports its unsaved changes. `save_file` saves the CA Editor's text. `close_file` REFUSES while the CA Editor has unsaved changes: run `save_file` first, or ask the developer. If the CA Editor is still loading or does not answer, the tool returns an error and changes nothing; it never edits the hidden native editor underneath instead. `open_file` returns only once the file IS the active editor (and its CA Editor has loaded); if it returns an Error, do not edit yet. Every edit tool's result names the file and line it changed (e.g. `Text inserted successfully — PRM002130.clw:9256 (...)`): check it. The edit tools, `undo`, `redo`, `save_file` and `close_file` take an optional `file_path`: pass the file you mean, and the call is refused (nothing changed) if a different file is active. The edit tools, `undo`, `redo` and `save_file` are also refused (nothing changed) when the active file is one the File System tools below may not write (e.g. `.vscode\tasks.json`, `CLAUDE.md`, a template under the Clarion root): tell the developer, and use your own Edit tool for it. Embed code in the embeditor is not affected.
 
 ### Application Tree (Clarion .app files)
 - `open_app` -Open a .app file in the IDE. Must load before listing procedures.
@@ -199,7 +199,7 @@ You do NOT need to save everything — only insights that would be useful in fut
 
 5. **Keep responses concise and action-oriented.** The developer is working -help them efficiently.
 
-6. **When the developer mentions a file or class by name**, use `list_directory` to find the exact path if needed, then act on it.
+6. **When the developer mentions a file or class by name**, find its exact path — for a Clarion file through the .red (rule 11) — then act on it.
 
 7. **When pointing out issues, errors, or typos**, use `go_to_line` to navigate the developer's cursor directly to the problematic line. Do not just say "line 42" -take them there.
 
@@ -217,6 +217,14 @@ You do NOT need to save everything — only insights that would be useful in fut
     - Ask the developer if they want you to apply it
     - Only use `insert_text_at_cursor`, `replace_range`, `replace_text`, `write_file`, `write_embed_content`, `save_and_close_embeditor`, or `generate_stubs`/`generate_clw` on these files AFTER the developer explicitly says yes
     - If the developer has already hand-coded your suggestion, do NOT write it again — acknowledge their work instead
+
+11. **ALWAYS find Clarion files through the active .red — never from memory, never by searching drives.** Files move and installs change; the .red is the only source of truth.
+    - `get_solution_info` gives the build's Clarion: `versionName`, `clarionRoot`, `activeRedFile`. Never take these from memory or from the IDE's own install folder: Build > Set Clarion Version can point the solution at a different Clarion.
+    - To locate ANY file the compiler or template engine would find (`.tpl`, `.tpw`, `.inc`, `.clw`, `.equ`, `.trn`, `.lib`, `.dll`, `.ico`, ...), call `resolve_red_path` first.
+    - To search INSIDE such files (e.g. which template writes X), call `get_red_search_paths` for the extension and Grep only its `absoluteSearchPaths`, in order: earlier folders take precedence.
+    - In a multi-project solution pass `project_name`: relative .red entries, and a project's own .red, are per project. If the answer has `alsoFoundIn`, the file resolves elsewhere under another configuration: say which one you used.
+    - Never recursively search drives or Clarion installs (`search_files`, `Get-ChildItem -Recurse`, `grep -r`): stale copies abound and give wrong answers.
+    - A path from memory, an earlier conversation or a previous answer is NEVER a file's location: re-resolve it every time. A memory that names a Clarion folder may be stale; check it against `get_solution_info`.
 
 ## Session Start
 

@@ -228,6 +228,11 @@ $Items = @(
     "Microsoft.Web.WebView2.WinForms.dll"
     "Microsoft.Web.WebView2.Wpf.dll"
     "WebView2Loader.dll"
+    # Everything SDK shim for search_files / search_files_advanced / search_content / find_duplicates, P/Invoked
+    # by EverythingService from BOTH the addin and clarion-mcp-server.exe (same folder). 5a5581e6: it was never in
+    # this list, so a dev-deployed root had it only if an installer had once put it there - every Clarion 11 dev
+    # deploy failed those tools with "Everything32.dll not found". The installer ships it per version too.
+    "Everything32.dll"
     # PdfPig — in-process PDF text extraction for DocGraph ingestion (#167). ALL of these ship:
     # the five System.*/Microsoft.Bcl shims are NOT inbox on .NET Framework 4.8, they arrive via
     # PdfPig's own package dependencies, and omitting any one of them fails at RUNTIME (the first
@@ -806,11 +811,15 @@ foreach ($ver in $TargetVersions) {
         }
 
         # --- Deploy indexer ---
+        # The indexer is 64-bit (ticket 583abdec): the addin and the standalone MCP server run every index in
+        # it as a child process, so it needs x64\SQLite.Interop.dll beside it (it loads the interop for its own
+        # bitness from x86\ or x64\ before System.Data.SQLite looks). Without x64\ every IDE reindex fails.
         $IndexerItems = @(
             "clarion-indexer.exe"
             "clarion-indexer.pdb"
             "System.Data.SQLite.dll"
             "x86"
+            "x64"
         )
 
         if (Test-Path $IndexerOutput) {
@@ -897,6 +906,22 @@ foreach ($ver in $TargetVersions) {
 
             if (-not (Test-Path "$LspSourceDir\out\server")) {
                 Write-Host "  SKIP  lsp-server (ClarionLSP build output not found)" -ForegroundColor DarkGray
+            }
+
+            # The server's own package.json, metadata only (GH #281). The server answers
+            # clarion/getServerVersion from the package.json three levels above out\server\src\server.js,
+            # i.e. lsp-server\package.json; without it the version reads "unknown" and lsp_debug_status
+            # cannot say which server runs. It has no "type" field, so node still loads server.js as CommonJS.
+            if (Test-Path "$LspSourceDir\package.json") {
+                try {
+                    New-Item -Path $LspDestDir -ItemType Directory -Force | Out-Null
+                    Copy-Item "$LspSourceDir\package.json" (Join-Path $LspDestDir "package.json") -Force
+                    Write-Host "  OK    lsp-server\package.json" -ForegroundColor Green
+                    $copied++
+                } catch {
+                    Write-Host "  FAIL  lsp-server\package.json - $($_.Exception.Message)" -ForegroundColor Red
+                    $failed++
+                }
             }
 
             # Copy bundled node.exe (so end users don't need Node.js installed).

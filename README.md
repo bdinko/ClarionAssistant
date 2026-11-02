@@ -1,4 +1,4 @@
-﻿<p align="center">
+<p align="center">
   <img src="installer/clarion-assistant-256.png" alt="Clarion Assistant" width="128" height="128">
 </p>
 
@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://github.com/ClarionLive/ClarionAssistant/releases/latest"><img src="https://img.shields.io/github/v/release/ClarionLive/ClarionAssistant?include_prereleases&label=download&style=for-the-badge" alt="Download"></a>
   <img src="https://img.shields.io/badge/Clarion-10%20%7C%2011%20%7C%2011.1%20%7C%2012-blue?style=for-the-badge" alt="Clarion 10 | 11 | 11.1 | 12">
-  <img src="https://img.shields.io/badge/version-6.0-blue?style=for-the-badge" alt="v6.0">
+  <img src="https://img.shields.io/badge/version-6.2-blue?style=for-the-badge" alt="v6.2">
 </p>
 
 <p align="center">
@@ -37,7 +37,7 @@ Ask it to write Clarion code, explain procedures, refactor classes, build COM co
 - **DocGraph** &mdash; instant search across 14,000+ indexed documentation chunks (Clarion core, CapeSoft, Icetips, and more)
 - **SchemaGraph** &mdash; database schema intelligence from Clarion dictionaries, SQL Server, SQLite, and PostgreSQL
 - **Source Control** &mdash; GitHub and Bitbucket integration with per-solution repo linking
-- **Build tools** &mdash; build solutions, individual apps, or C# COM controls without leaving the chat
+- **Build tools** &mdash; generate source for solutions or individual apps (generate only, no compile), or build C# COM controls, without leaving the chat
 - **Class intelligence** &mdash; parse CLASS definitions, sync .inc/.clw, generate method stubs
 - **Application tree** &mdash; open .app files, list procedures, navigate the embeditor
 - **Monaco source editor** &mdash; the default editor for Clarion `.clw`/`.inc` source: syntax highlighting, folding, F12/Ctrl+Click go-to-definition, inline diagnostics, and completion (toggleable under Options &rarr; Clarion Assistant &rarr; Editor Surfaces)
@@ -55,9 +55,313 @@ Ask it to write Clarion code, explain procedures, refactor classes, build COM co
 
 ---
 
-## What's New (Unreleased)
+## What's New in v6.2
 
-<!-- Entries for the next release go here, in the same shape as the release blocks below. -->
+6.2 lets MultiTerminal, VS Code and any other client that loads the clarion-assistant plugin use the Clarion IDE tools (embeds, the editor, the app tree) while Clarion is open on the same solution, moves the bundled language server to v1.0.9 with clickable attribute chips on controls, window headers and FILE declarations, ends hover cards in a bar with their location links and Open Structure Designer, and fixes CodeGraph's `.red` `{include %REDNAME%}` and `INCLUDE()` handling. It also adds a shared plugin location for people with several Claude profiles. Full notes: **[docs/releases/v6.2.0.md](docs/releases/v6.2.0.md)**.
+
+### Upgrade notes
+
+Do these once after installing this release:
+
+- **Update Clarion Assistant in the Clarion you open your solution in.** The IDE tools below reach only a Clarion running Clarion Assistant 6.2 or later; an older one is named in the error, with the folder to update.
+- **The first CodeGraph index after updating is a full rebuild**, which runs by itself: the indexer now reads `INCLUDE()` differently, so an index made by 6.1 is upgraded (feature level 2 to 3), and the header reads **Rebuilding index...** while it runs. Re-index any solution whose `.red` ends `{include %BIN%\%REDNAME%}` ([#278](https://github.com/ClarionLive/ClarionAssistant/issues/278)) to pick up the ABC and third-party classes it was missing; that rebuild does it.
+- **The first language-server start after updating is slower once**: v1.0.9 rebuilds its saved caches.
+- **Close Claude Code and MultiTerminal sessions before running the installer**, or run `/mcp` to reconnect in each one afterwards: a running plugin server holds files in the install folder.
+
+<!-- release-docs: covered=ide-proxy,mcp-server,ide-tools -->
+### MultiTerminal, VS Code and other plugin clients can use the IDE tools while Clarion is open
+
+A Claude session outside a CA tab (a MultiTerminal or VS Code terminal with the clarion-assistant plugin, or any other client that loads it) used to get only the tools that work without the IDE: documentation, CodeGraph, LSP, schema, file and search. It now gets the IDE tools too (opening and editing embed points, driving the editor, reading the app tree and dictionary, building), the same ones a CA tab has, whenever Clarion is open on the same solution as the client. The plugin's server sends each call to that Clarion and returns its answer, so these tools behave as they do in a CA tab, inside the same file-access rules.
+
+- **The plugin's server starts without Clarion.** With Clarion closed, or open on a different solution, an IDE tool says so and tells you to open the solution in Clarion; every other tool works as before. A Clarion that has a different solution open is never used.
+- **One Clarion per solution.** If two Clarions have the same solution open, an IDE tool asks you to close one, or to set `CLARION_IDE_PID` to the one you mean, rather than guess which one to change.
+- **No CA tab needed.** Clarion serves these tools whether or not a Clarion Assistant pane is open. A CA tab itself is unchanged: its tools are not listed twice.
+- **`--capabilities` reports `ide-proxy=1`** for a server that can do this.
+- **The same file-access rules, for every path an IDE tool takes.** `open_file`, `export_txa`, `import_txa`, `export_dctx`, `import_dctx`, `show_diff`'s files and `build_app` / `generate_source`'s `app_path` / `project_path` are now checked like `read_file` / `write_file`, **in a CA tab too**: a network (`\\server\share`) path is refused before Clarion touches it, and so is a path outside the solution, the Clarion folders and your `Mcp.AllowedRoots`. An `export_dctx` with no path writes beside the dictionary only when that folder is inside the solution; otherwise pass a path in the solution. `build_app` / `generate_source` need only read access to the app: ClarionCL writes that app's own generated modules, in its own folder, as Clarion's Generate does.
+- **Editing and saving are checked against the file in the editor, in a CA tab too.** `insert_text_at_cursor`, `replace_text`, `replace_range`, `delete_range`, `toggle_comment`, `undo`, `redo` and `save_file` are refused, with nothing changed, when the active file is one the tools may not write: for example `.vscode\tasks.json`, `.git\config`, `CLAUDE.md`, `.mcp.json`, a `.sln` or `.red`, or a file under the Clarion folders, which are read-only to the tools. **This is a deliberate change:** a CA Editor tab on a Clarion template (`.tpl`/`.tpw` under the Clarion root) can no longer be edited through these tools; edit it yourself, or with your assistant's own Edit tool, which asks you first. Generated `.clw` modules in the solution, and embed code in the embeditor (native or CA), are edited as before; `close_file` is not affected. The save before `build_app` / `build_solution` / `generate_source` skips a CA Editor tab on such a file and names it in the result; the tab keeps its unsaved edits.
+- **Some diagnostics stay inside the IDE.** `execute_command` and `dump_object_api` are not offered outside a CA tab, and there `inspect_ide` takes only `active_view`, `editor_text`, `all_windows`, `all_pads` and `app_details`.
+- **Clarion checks again before it runs anything.** If Clarion has switched to another solution since the plugin's server picked it, the call says so and nothing is run. One IDE tool runs at a time across all clients: a call that arrives while another client's tool is running waits up to 10 s, then says Clarion is busy and that nothing was run.
+- **You can see changes made from outside.** Each editing, saving, importing or generating call from a plugin client writes `[ide-callback] <tool> from plugin client` to `monaco-spike.log` and shows a note in Clarion's status bar.
+- **Known limitation: one call at a time per client.** The plugin's server handles one request at a time, so a long IDE call (an embeditor open, a build) holds up that client's next call until it finishes, and cancelling the call in the client does not stop it in Clarion. Serving calls in parallel would let two calls from the same client reach Clarion out of order, so it was left out.
+
+<!-- release-docs: covered=red,index -->
+### A local `.red` that ends `{include %BIN%\%REDNAME%}` keeps the default search paths, by geircodes ([#278](https://github.com/ClarionLive/ClarionAssistant/issues/278), [PR #276](https://github.com/ClarionLive/ClarionAssistant/pull/276))
+
+`%REDNAME%` is a macro Clarion defines itself: the name of the version's redirection file, such as `Clarion100.red`. Clarion Assistant did not define it, so the line the IDE writes at the end of a new solution's `.red` was skipped, and every path of the default `.red` (`libsrc\win`, `Accessory\libsrc\win` and the rest) was missing. CodeGraph then indexed no ABC or third-party class, reported thousands of unresolved files, and `resolve_red_path` could not find `ABUTIL.INC` while `get_red_search_paths` could. The macro is now defined, so both tools and the index follow the include. The index log also names each `{include}` the `.red` could not follow, right after the redirection file it used, instead of leaving the cause in `get_solution_info` alone. The line says why: a file that does not exist (often an undefined `%MACRO%`), one nested too deep, or one that could not be read is a WARNING, because its search paths are missing. An `{include}` of a file already loaded (a `.red` that includes itself) is a harmless note, not a warning. A project's own version-named `.red` is reported the same way, with the project's name. Re-index after updating. Thanks to [@msarson](https://github.com/msarson) for the report and [@geircodes](https://github.com/geircodes) for the fix.
+
+<!-- release-docs: covered=codegraph,index -->
+### CodeGraph reads `INCLUDE()` the way the compiler does, by geircodes ([#271](https://github.com/ClarionLive/ClarionAssistant/issues/271), [PR #275](https://github.com/ClarionLive/ClarionAssistant/pull/275), [PR #268](https://github.com/ClarionLive/ClarionAssistant/pull/268))
+
+- **A commented-out INCLUDE is not followed.** `! INCLUDE('Old.inc')` used to count as a real include: a bogus "did not resolve" warning when the file was gone, and code that is never compiled in the index when it was still there.
+- **An INCLUDE inside a `COMPILE('t', expr)` or `OMIT('t', expr)` block is not counted as missing.** When it does not resolve and no unconditional route leads to it, it is recorded as `unresolved_conditional`, listed in the coverage summary and kept out of the warning: it is usually a file only another build of the same shared source has on its paths.
+  - **The include guard is not a condition.** Nearly every LibSrc `.inc` wraps itself in `OMIT('_EndOfInclude_',_UtilitiesPresent_)` with `_UtilitiesPresent_ EQUATE(1)` right after it (`ABUTIL.INC`). That block compiles on the file's first read, so a missing INCLUDE inside it is still reported as missing.
+  - **An `.inc` the `.cwproj` lists** is judged by how it is INCLUDEd, like any other: what it INCLUDEs counts as missing when the `.inc` itself is INCLUDEd unconditionally.
+  - **A `|` inside a comment is not a line continuation.** `! note |` no longer swallows the INCLUDE on the next line. A conditional block whose terminator sits inside an `OMIT('t')` block now ends there, so what follows it is not treated as conditional.
+- **The warning names the files.** `2 INCLUDE()d .inc file(s) did not resolve: Missing.inc (App.clw:5), ...` names up to ten, each with the file and line that INCLUDEs it, and the index log names every one. INCLUDEs in the PROGRAM file's global data are now stored too, so that file can be named.
+- **A data declaration labelled `Itemize`** (`Itemize LONG`, `Itemize EQUATE(3)`) no longer opens an ITEMIZE block that swallowed every declaration after it.
+- **A `.red` search folder that does not exist** (an old `%ROOT%\convsrc` line, for one) reads as harmless in the index log: it never affected the index.
+
+The first index after updating runs a full one by itself. Thanks to [@KevinErskine](https://github.com/KevinErskine) and [@msarson](https://github.com/msarson) for the reports and [@geircodes](https://github.com/geircodes) for the fixes.
+
+<!-- release-docs: covered=hover,lsp-bridge -->
+### Hover asks the language server for parameters, locals, routines and procedures, by geircodes ([PR #273](https://github.com/ClarionLive/ClarionAssistant/pull/273), [PR #277](https://github.com/ClarionLive/ClarionAssistant/pull/277), [PR #274](https://github.com/ClarionLive/ClarionAssistant/pull/274), [PR #272](https://github.com/ClarionLive/ClarionAssistant/pull/272), [PR #269](https://github.com/ClarionLive/ClarionAssistant/pull/269))
+
+In the CA Editor and CA Embeditor, hovering a parameter, a local variable, a routine (`DO RefreshList`) or a procedure call used to show Clarion Assistant's own quick card, which names the file but no line, and the language server was never asked. Those hovers now show the language server's card, which names the owning procedure and links the declaration. The quick card still appears when the server has nothing, is not running, or does not answer within 300 ms. For a procedure call this also fixes a wrong answer: with two libraries that both have a `Log_Write`, the card came from whichever the index found first, not from the prototype the file actually sees.
+
+- **In the CA Embeditor, a link to the procedure's own module stays in the embeditor.** The card's link reads *line 474* and a click goes to that line of the embeditor, where the routine is. It used to read `demoleg018.clw:474` and open the module's `.clw` at line 474, which is a line of the embeditor's text, not of the file on disk. A CodeGraph card's link, which is a line of the file on disk, still opens the `.clw`, as do links to other files. **Back** after clicking a card's link to the same embeditor or CA Editor file returns to the line you hovered, not to where the caret was before.
+- **A window labelled `Window`** (`Window  WINDOW('Details'),...`) shows the WINDOW keyword's card on the keyword, not the label's.
+- **When the language server has no answer**, the CodeGraph fallback for hover and Ctrl+Click looks at every row of that name instead of the first one, so another procedure's local no longer hides a global or equate the file can see, and the CodeGraph card links its declaration.
+
+<!-- release-docs: covered=codegraph-header -->
+### Work With Solution no longer looks like a re-index when nothing changed ([#279](https://github.com/ClarionLive/ClarionAssistant/issues/279))
+
+Opening a solution runs a quick check for changed files. The header used to show the "Updating..." spinner for that check every time, as if the index were being rebuilt. Now the CODEGRAPH line reads **Checking for changes...** with no spinner. As soon as the check finds changed projects it switches to **Updating...**. When an index made by an older indexer has to be rebuilt, it switches at once to **Rebuilding index...**, because that run takes minutes. When the run finishes, the line says what it did, and keeps saying it:
+
+- **Up to date (checked *time*)** means nothing had changed and nothing was re-parsed.
+- **Updated: *time*** means changed files were re-indexed.
+- **Rebuilt (index upgrade): *time*** means the index was rebuilt for the new indexer.
+- **Error: ...** or **Index cancelled** stays on the line until the next run.
+
+The line is dropped once something else writes the index, such as `index_codegraph` or another IDE. A run never paints its spinner over another solution's header. A run that is refused because another run holds the index restores the line. If you click Work With Solution for a second solution while the first is still being checked, the second solution is checked when the first finishes. The index window never opens for this automatic check. It still opens if the run fails, and **Reindex** and **Update** in the header show it as before.
+
+<!-- release-docs: covered=completion,codegraph -->
+### Completion no longer keeps showing a stale list, and Ctrl+Space asks again ([#280](https://github.com/ClarionLive/ClarionAssistant/issues/280), reported by geircodes)
+
+In the CA Editor and CA Embeditor, completion keeps the language server's answer for a word and filters it as you type the rest of that word, so each keystroke does not ask the server again. That answer was kept by line and column alone. A list that was incomplete or out of date (for example after the server re-read an `.inc`) was shown at that spot until the caret moved somewhere else: typing `SELF.` and then `I` showed nothing, deleting the `I` and typing it again still showed nothing, and Ctrl+Space answered "No suggestions" without asking the server. Now:
+
+- **Ctrl+Space always asks the language server again**, and its answer replaces the one that was kept. `monaco-spike.log` shows a new `[lsp-timing] action=completion` line for it.
+- **A change to the text before the word asks again.** Replacing `SELF.` with another name of the same length, or editing another line, gets a new answer. Typing on through the same word is still answered from the list already received, with no new request.
+- **A kept list with nothing for what you typed is not reused.** It asks the server again, at most once every half second, so typing a name the server does not know does not flood it.
+- **CodeGraph name lookups use the index.** The hover and Ctrl+Click fallbacks that look a symbol up by name compared `LOWER(name)`, which the case-insensitive index cannot serve, so each lookup read the whole symbol table. They now compare `COLLATE NOCASE` and get the same rows. On a 463,000-symbol database a lookup went from about 130 ms to under 0.1 ms.
+
+<!-- release-docs: covered=lsp,lsp-pin,hover,completion -->
+### The bundled language server is now v1.0.9, and attribute chips reach WINDOW headers and FILE declarations, by msarson and geircodes ([#281](https://github.com/ClarionLive/ClarionAssistant/issues/281))
+
+Re-pinned from v1.0.8 to [msarson/Clarion-Extension 1.0.9](https://github.com/msarson/Clarion-Extension/blob/master/CHANGELOG.md), released 2026-10-24. Its fifty changes reach the CA Editor and CA Embeditor, apart from five that only concern VS Code's solution opening and settings. Among them:
+
+- **Hover cards** for controls, WINDOW / APPLICATION / REPORT headers and FILE, KEY, INDEX, MEMO and BLOB declarations list the attributes they set and flag the ones the compiler rejects. IF, LOOP, CASE, EXECUTE, BEGIN and ACCEPT show what closes them, and a parameter's data type has a card.
+- **Completion** after a comma on a control or a header offers only the attributes it accepts. An attribute that takes a value, such as `TIP` or `FONT`, is inserted with its brackets and the value selected; Tab moves to the next value.
+- **Diagnostics** flag attributes a declaration does not accept, using compiler-checked lists, and drop false "discarded return value" and "indistinguishable overload" warnings.
+- **Includes resolve in more solutions**: redirection files named by full path, quoted paths, masks such as `rf*.inc`, and `SELF.InterfaceName`.
+
+What changed in Clarion Assistant for it:
+
+- **The attribute chips use the link form 1.0.9 sends.** The chips added in 6.1 ([#263](https://github.com/ClarionLive/ClarionAssistant/issues/263)) were built against a draft link form, and 1.0.9 sends the form that was agreed for [msarson/Clarion-Extension#731](https://github.com/msarson/Clarion-Extension/issues/731). Without this update the chips would have disappeared after the re-pin. They now appear on controls, on WINDOW, APPLICATION and REPORT headers, and on FILE, KEY, INDEX, MEMO and BLOB declarations. An attribute that takes a value (TIP, AT, MSG, OWNER...) is a chip too: clicking it inserts the attribute with its value selected, ready to type over. The safety checks are unchanged. An edit applies only if the lines still match the card, it is one undo step, and the card refreshes. Read-only files, text outside an embed point and the generated modules of an open app show plain names instead of chips.
+- **`lsp_debug_status` names the running server** (`serverVersion: "1.0.9"`, with its build date). Deploy and the installer now copy the server's `package.json` next to it, which is where it reads its version from.
+
+#### Upgrade notes
+
+- **The first start after updating is slower once.** 1.0.9 changed the stamp on its saved resolution caches, so the first start rebuilds them. After that they are warm again.
+
+<!-- release-docs: covered=installer,plugin -->
+### One copy of the Claude Code plugin for every Claude profile, requested by Mike Hanson ([#214](https://github.com/ClarionLive/ClarionAssistant/issues/214))
+
+If you keep more than one Claude Code profile (`CLAUDE_CONFIG_DIR`, e.g. `%USERPROFILE%\.claude-work`), the installer used to put the clarion-assistant plugin in `%USERPROFILE%\.claude` only. The installer now has a **Plugin Location** page:
+
+- **Default Claude profile** works as before, and stays the default.
+- **Shared folder** (suggested: `%LOCALAPPDATA%\ClarionLive\claude-plugins\marketplaces\clarionassistant-marketplace`) clones the marketplace there **once**, outside every profile. Setup then registers that folder as a local marketplace in `%USERPROFILE%\.claude`, in every `%USERPROFILE%\.claude-*` profile it finds (one with a `settings.json` or `plugins` folder), in `CLAUDE_CONFIG_DIR`, and in any other profile folders you list. Plain `claude` sessions in those profiles load the plugin too. Updating the shared folder (re-running setup, or `git pull` in it) updates every profile. Uninstalling removes the registration from each of those profiles, and deletes the folder if setup created it.
+
+Clarion Assistant's own terminals find the plugin in this order: the shared folder, then the active profile (`CLAUDE_CONFIG_DIR`, else `%USERPROFILE%\.claude`), then `%USERPROFILE%\.claude`. In each profile it looks at the marketplace first and then the plugin cache. In the cache it now takes the newest installed version, rather than looking only for a `1.0.0` folder that recent plugin versions never create. The MultiTerminal plugin is looked up the same way, and is also found in a `multiterminal-marketplace` folder next to the shared one. The chosen folder is kept in `HKCU\Software\ClarionAssistant`, value `PluginMarketplacePath`. `installer\sync-marketplace-to-profile.ps1` copies to that folder when it is set.
+
+An upgrade keeps a shared install shared: the page starts on the choice you made last time, and choosing the default profile on a machine whose default profile uses the shared folder leaves the shared folder in place rather than moving the plugin back without asking.
+
+**Known limitation:** uninstall cannot run as the original user, so it acts on the registry of the account that runs it. If you uninstall by elevating to an administrator account other than the one you work in, it finds nothing recorded there and leaves the shared folder and its registrations in place. Remove them by hand in that case: `claude plugin marketplace remove clarionassistant-marketplace` in each profile, then delete the shared folder and the `PluginMarketplace*` values under `HKCU\Software\ClarionAssistant`.
+
+<!-- release-docs: covered=hover -->
+### Hover cards end in a bar with their location links and Open Structure Designer, by geircodes ([#270](https://github.com/ClarionLive/ClarionAssistant/issues/270))
+
+In the CA Editor and CA Embeditor, a hover card now ends in a bar like the one Monaco draws under a problem hover (View Problem / Quick Fix): the status-bar background under a thin rule.
+
+- **The card's location links move into the bar**, so they are always in the same place. That is every line outside a code block that holds only `File.clw:12` links: a declaration → implementation pair, a 📍 line, or two link lines together. A link with other text on its line stays in the card, and a card with no such line looks as before. In the CA Embeditor a link to the procedure's own module still reads *line N* and stays in the embeditor, and Back after clicking it still returns to where you hovered.
+- **Control cards and WINDOW / REPORT header cards offer Open Structure Designer.** The label shows the key the Structure Designer command is on under your key profile (Ctrl+D, or Ctrl+Shift+D under the VS Code, Visual Studio and Notepad++ profiles). A click puts the cursor where you hovered, closes the card and does what that key does. It is not offered in a plain file without the designer overlay, while a designer is open, or on FILE, KEY, MEMO and APPLICATION cards.
+- **The bar stays visible on tall cards.** A routine card that shows the first lines of its body scrolls behind the bar.
+- **Attribute chips stay in the card** and work as before.
+
+### Thanks
+
+- **[@geircodes](https://github.com/geircodes)** &mdash; eight merged PRs: [#276](https://github.com/ClarionLive/ClarionAssistant/pull/276) (`%REDNAME%`), [#275](https://github.com/ClarionLive/ClarionAssistant/pull/275) and [#268](https://github.com/ClarionLive/ClarionAssistant/pull/268) (INCLUDE() and `Itemize` in CodeGraph), and [#273](https://github.com/ClarionLive/ClarionAssistant/pull/273), [#277](https://github.com/ClarionLive/ClarionAssistant/pull/277), [#274](https://github.com/ClarionLive/ClarionAssistant/pull/274), [#272](https://github.com/ClarionLive/ClarionAssistant/pull/272) and [#269](https://github.com/ClarionLive/ClarionAssistant/pull/269) (hover asks the language server); [#270](https://github.com/ClarionLive/ClarionAssistant/issues/270), the hover footer bar, its patch and tests, and the sticky fix for tall cards; [#280](https://github.com/ClarionLive/ClarionAssistant/issues/280), the diagnosis of the completion cache, down to the line that keyed it, and the direction for the fix; and in language server 1.0.9, the attribute cards for WINDOW, APPLICATION and REPORT headers and FILE declarations ([msarson/Clarion-Extension#745](https://github.com/msarson/Clarion-Extension/pull/745), [msarson/Clarion-Extension#746](https://github.com/msarson/Clarion-Extension/issues/746)) and the link form agreed with Mark in [msarson/Clarion-Extension#731](https://github.com/msarson/Clarion-Extension/issues/731).
+- **[Mark Sarson](https://github.com/msarson)** &mdash; [#281](https://github.com/ClarionLive/ClarionAssistant/issues/281): language server 1.0.9, the spec for the new attribute-edit links, and the reference client they were checked against; and [#278](https://github.com/ClarionLive/ClarionAssistant/issues/278), the `%REDNAME%` include that left ABC and third-party classes out of the index.
+- **[@KevinErskine](https://github.com/KevinErskine)** &mdash; [#279](https://github.com/ClarionLive/ClarionAssistant/issues/279), the log that showed the "update" on every open was only an up-to-date check; and [#271](https://github.com/ClarionLive/ClarionAssistant/issues/271), the "Library path not found" warnings.
+- **[Mike Hanson](https://github.com/BoxSoft)** &mdash; [#214](https://github.com/ClarionLive/ClarionAssistant/issues/214): the request for a shared plugin location, with the three duplicated lookups, the install paths that must not move, and the uninstall rules already worked out.
+
+## What's New in v6.1
+
+6.1 moves CodeGraph indexing out of Clarion into a 64-bit process, so large solutions no longer run Clarion out of memory, and closes the open GitHub issues from the 6.0 cycle: a path policy for every file tool, no more stale native editor tabs after Claude writes a file, recovery of a CA Embeditor save lost when Clarion stops, and CodeGraph coverage of CLASS MODULE/LINK files and INCLUDEd global data. Full notes: **[docs/releases/v6.1.0.md](docs/releases/v6.1.0.md)**.
+
+### Upgrade notes
+
+Do these once after installing this release:
+
+- **Update Clarion Assistant in every Clarion you use, not just the newest.** The add-in and the standalone `clarion-mcp-server` must be from the same release. A Clarion IDE still running an older add-in can't check its editor tabs before a write: writes go ahead with a note telling you to update it. The plugin also won't start an older server for a project that pins that Clarion in `clarion-assistant.json`; it uses the newest one and says why.
+- **Re-index CodeGraph** for each solution, to pick up class libraries reached through `MODULE()`/`LINK()` and globals from INCLUDEd files. Any re-index does it: **Update** (incremental) on an index made by an older indexer runs a full index by itself, and its result says *"Mode: full (upgraded from feature level 1 to 2 ...)"*. `list_codegraph_databases` marks an index made by an older indexer as STALE.
+- **Re-run `ingest_schema`** on your dictionary. Existing SchemaGraph databases get the new columns automatically, but they stay empty until you re-ingest.
+- **Check what the file and search tools may reach** (see the #266 entry below). They now stay inside your solution, its projects, the Clarion install and the `.red` folders. Add other folders, or a solution on a network drive, with `Mcp.AllowedRoots` in `%APPDATA%\ClarionAssistant\settings.txt`. `search_content` is off unless you set `Mcp.EverythingContentSearch=true`. Some files are never written by these tools, whatever the setting: edit those with your assistant's own Edit/Write tools, which ask you first.
+- **Settings and switches added in this release:** `Mcp.AllowedRoots`, `Mcp.DeniedPaths`, `Mcp.EverythingContentSearch` (and the `CLARION_MCP_ALLOWED_ROOTS` / `CLARION_MCP_DENIED_PATHS` environment variables); `configDir` and `allowOlderServer` in `clarion-assistant.json`; `--clarion-config-dir`, `CLARION_CONFIG_DIR`, `CLARION_ROOTS` and `--capabilities` for the standalone server.
+- **CA Embeditor recovery copies** in `%APPDATA%\ClarionAssistant\embed-recovery` older than 30 days are now deleted automatically.
+
+<!-- release-docs: covered=codegraph,index-ui -->
+### Reindex runs outside Clarion, so large solutions no longer run it out of memory
+
+**Reindex** and **Update** used to build the CodeGraph index inside Clarion, a 32-bit program limited to 2 GB of memory, much of which Clarion itself needs once apps are open. On a large solution the index ran out of memory partway through ("Rebuilding call relationships") and stopped. The index now runs in a separate 64-bit process, `clarion-indexer.exe` in the add-in folder, so Clarion's own memory stays flat however large the solution is. On the largest solution we test with, the indexer peaked at about 1.1 GB while Clarion did not grow at all, and in a side-by-side test the index came out identical to one built inside Clarion (410,097 symbols and 1,488,585 relationships either way). The `index_codegraph` and `index_solution` tools and the standalone server use the same process.
+
+- **The progress window, the run log and the result look and work as before.** When the run finishes, the window now wraps its summary and any warning onto several lines instead of cutting them off.
+- **Cancel stops the indexer**, and kills it if it hasn't stopped within 15 seconds. A cancelled full index deletes the partial database (and its `-wal`/`-shm` files), so a half-built graph can never pass for a complete one; the status line tells you to run it again. A cancelled **Update** keeps the database and says not to trust it until the next run.
+- **Update upgrades an old index by itself.** An incremental Update on a database made by an older indexer runs a full index instead, and its result says *"Mode: full (upgraded from feature level 1 to 2 ...)"*.
+- **Only one indexer writes a database at a time.** A second run on the same database, including one left running by an IDE that has since closed, is refused rather than allowed to write over it.
+- **`index_codegraph`'s `sln_path` is checked by the [#266](https://github.com/ClarionLive/ClarionAssistant/issues/266) path policy** before anything reads it: a network (UNC) path, or a solution outside the allowed roots, is refused. Add it to `Mcp.AllowedRoots` to index it. A solution named this way is indexed with its own `.red` and library paths, not those of the solution the IDE has open.
+- **If the indexer fails**, the error names it, gives its exit code and shows the last lines it printed. If `clarion-indexer.exe` is missing from the add-in folder or can't start, indexing still runs inside Clarion as before, and the result warns you to reinstall.
+
+<!-- release-docs: covered=solution,ide-record -->
+### Every tool in a tab follows the solution open in the IDE
+
+Open a different solution in the IDE and the header followed it, but an open tab (`CA1 · v61POSitive`) went on answering for the solution it was started on: `get_solution_info`, the Clarion version, the `.red`, the CodeGraph database and the language server all stayed on the old one until you opened a new tab. Every tool in a tab now follows the IDE's solution. On a switch the tab re-resolves the version, `.red` and CodeGraph database, restarts the language server on the new solution, and stops it when the IDE closes its solution, rather than carrying on with the old one. `get_solution_info` says where its answer came from (`solutionSource`: the IDE, the launch arguments, or none) and, after a switch, which solution it switched from and when. An index run that starts on one solution finishes on that solution's database and `.red`, even if the IDE switches part way through.
+
+The tab label follows too: a tab opened on a solution, and a **New Chat** tab, now read `CA1 · UltimateSQLTest` after the switch, and plain `CA1` while the IDE has no solution open. Tabs opened on a project, a class or Evaluate Code keep their own label. The terminal's MultiTerminal name (`CA1`) never changes. This applies to Claude, Copilot and Codex tabs alike.
+
+A solution record left behind by an IDE that has exited is ignored, even when Windows has since given its process ID to another program: the tab answers "no solution open" with the reason, instead of following a stale one.
+
+<!-- release-docs: covered=tabs -->
+### Closing a tab no longer leaves the tab strip stuck
+
+With several tabs open, closing one that wasn't the tab you were looking at left it drawn on the tab strip, and the other tabs' close buttons seemed to stop working until something refreshed the pane, such as opening Settings. The tab had in fact closed; only the strip hadn't been redrawn. It now redraws whenever a tab is closed or added.
+
+### Copilot and Codex terminals get short names too
+
+Claude terminals are already named **CA1**, **CA2** and so on. Copilot terminals are now **CP1**, **CP2**, ... and Codex terminals **CX1**, **CX2**, ..., instead of `Terminal 1 CP`, so the tab strip shows which assistant is in each terminal. Each kind is numbered on its own, so a Copilot terminal opened beside CA1 is CP1. Like a Claude tab, the tab keeps whatever it was opened on (`CP1 · MySolution`), and it gives its number back when the assistant in it exits.
+
+### Current models in Settings, and retired ones replaced for you
+
+The model lists in **Settings > Models** were last checked in April and had fallen well behind. They're now current as of October 2026:
+
+- **Claude** offers Opus 5.5, Sonnet 5.5, Haiku 5.5 and Fable 5.1, and lists the **Team** and **Enterprise** plans alongside Pro and Max. The separate 1M-context entries are gone: current models have the 1M window without them.
+- **Copilot** offers Claude Opus 5.5 and Sonnet 5.5 and the GPT-6 models, and adds the Max plan. Ten models Copilot has retired, including every Opus 4.x, are removed.
+- **Codex** defaults to GPT-6.1 Sol. Its previous default, GPT-5.5, is retired on 14 October 2026; before this release, a Codex terminal left on Default would have stopped starting that day.
+
+If your saved model is one the provider has retired, Clarion Assistant now switches it to its replacement when the terminal starts (Copilot's Opus 4.7 becomes Opus 5.5, for example) and says so in yellow in the terminal, pausing for a few seconds so you can read it before the assistant starts. Settings shows the same note. A model you typed in under **Custom...** is left alone unless it is one of those retired names.
+
+Each Claude model also needs a recent enough Claude Code. Settings now shows the version a model needs, and warns you when the Claude Code installed on your machine is older. A too-old Claude Code is why choosing Opus 5.5, even with `/model`, could fail to reach the AI. Run `claude update` and restart the terminal.
+
+<!-- release-docs: covered=skills -->
+### New bundled skill: session-viewer, by Dinko Bačun ([#41](https://github.com/ClarionLive/ClarionAssistant/issues/41))
+
+Ask *"show me my past sessions"* (or type `/session-viewer`) and Claude lists the earlier Claude Code sessions for the current project, newest first and numbered, with the date and the first thing you asked. Ask it to render one and you get that session as a readable conversation; ask it to resume one and it gives you the exact `claude --resume <id>` command to run, so you no longer have to pick the right thread out of the `/resume` list. It works in any project, Clarion or not. It is read-only and needs Python 3; if Python is missing, Claude says so and tells you how to install it.
+
+The skill is Dinko Bačun's ([@bdinko](https://github.com/bdinko)), from [bdinko/session-viewer](https://github.com/bdinko/session-viewer), MIT licence, bundled at Dinko's invitation. Thank you, Dinko. Our copy adds a few fixes that we are offering back upstream: the most visible one is that, when a project has no transcript folder of its own, it no longer shows the sessions of an unrelated project with a similar folder name.
+
+The README's skills list was also out of date: it said 22 skills and left out `clarion-appgen`, `clarion-solution` and `stringtheory`, which were already shipping. It now lists all 26.
+
+### The file and Everything search tools stay inside your solution ([#266](https://github.com/ClarionLive/ClarionAssistant/issues/266))
+<!-- release-docs: covered=security -->
+
+Claude Code's permission rules never apply to MCP tools, so `read_file`, `write_file`, `append_to_file` and `list_directory` accepted any path, and `search_files`, `search_files_advanced`, `search_content` and `find_duplicates` searched the whole Everything index: every drive and every user profile. They are now limited to the open solution and its projects, the Clarion root and the `.red` search folders, and **only the solution folder is writable**: the Clarion install and `.red` / project folders outside the solution are read-only. Everything results are checked one by one, so nothing in a query can widen the search, `max_results` is enforced at 1000, and `*` on its own is refused. `search_content` reads file contents, so it is now **off by default**; filename search stays on, because with its scope limited it has no reason to be opt-in.
+
+**Files the MCP tools never write** (they stay readable; edit them yourself, or with your assistant's own Edit/Write tools, which ask you):
+
+- **Instruction files** later sessions follow: `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, `AGENTS.override.md`, `GEMINI.md`, `.github\copilot-instructions.md` and `*.instructions.md` under `.github`, and anything in a `.claude` folder (except a checkout under `.claude\worktrees`).
+- **Git:** anything under `.git`, and `HEAD` / `config` / `packed-refs` / `hooks\` in a folder that looks like a bare repository (or new `objects\` / `refs\` beside a `HEAD`).
+- **Files that make other tools run commands:** `.gitattributes`, `.gitmodules`, `.mcp.json`, `.vscode\tasks.json`, `.vscode\settings.json`, `.vscode\launch.json` and `*.code-workspace`.
+- **Assistant and MCP config:** `.vscode\mcp.json`, everything in `.cursor\`, `.codex\` and `.gemini\`, `.cursorrules`, `.windsurfrules`, `.github\prompts\*.prompt.md`, `.github\agents\*.agent.md` and `.github\chatmodes\`.
+- **Files that decide the scope:** `*.sln`, `*.cwproj`, `*.red` and every file a `.red` includes, `clarion-assistant.json` and `ClarionProperties.xml`, so the assistant cannot widen its own reach.
+
+**Never read or written:**
+
+- **Token and credential stores:** Clarion Assistant's `settings.txt`, `mcp-*.json` / `mcp-config*.json`, `copilot\`, `%LOCALAPPDATA%\ClarionAssistant\ide-endpoint` and WebView2 profiles; `.credentials.json`, `.git-credentials`, `.npmrc`, `.netrc`; any `.ssh`, `.aws`, `.gnupg`, `.azure`, `.kube` or `.docker` folder; your Claude Code config (`%USERPROFILE%\.claude`, `.claude-*`, `.claude.json`, `CLAUDE_CONFIG_DIR`).
+- **Folders:** other users' profiles; device paths; network drives and shares unless you name them in `Mcp.AllowedRoots` (`get_solution_info` says so when that leaves your solution folder out). A root the solution files name is dropped if it would contain your profile, `AppData`, `ProgramData`, Windows, Program Files or a whole drive, and so is a project or `.red` folder inside `%APPDATA%`, `%LOCALAPPDATA%` or `%PROGRAMDATA%`. A link inside the solution that points outside it is never writable.
+
+A refused path returns an error. When a setting can lift the refusal, the error names `Mcp.AllowedRoots`; a built-in rule cannot be lifted, and the error says to use the assistant's own Edit/Write tools or ask you, never to work around it. Every gated path and query is recorded in `%APPDATA%\ClarionAssistant\mcp-path-audit.log`. Settings `Mcp.AllowedRoots`, `Mcp.DeniedPaths` and `Mcp.EverythingContentSearch` are described under [Path scope for the file and search tools](#path-scope-for-the-file-and-search-tools). Thanks to @oleendrebergerud for the detailed report.
+
+<!-- release-docs: covered=version,mcp-server,launcher -->
+### The standalone server reads `/ConfigDir` settings, and the plugin starts your project's Clarion ([#244](https://github.com/ClarionLive/ClarionAssistant/issues/244))
+
+- **Settings moved with `/ConfigDir=` are read.** A Clarion started with `/ConfigDir=<folder>` keeps its `ClarionProperties.xml` (versions, macros, redirection) in that folder. The standalone `clarion-mcp-server` has no Clarion command line to read it from, so it read the default `%APPDATA%\SoftVelocity\Clarion\<version>` folder instead, with the wrong macros. Name the folder in one of these places. The first one that applies wins:
+  1. an IDE that has the solution open and runs with `/ConfigDir` (Clarion Assistant reads it from the IDE, nothing to set);
+  2. `--clarion-config-dir <folder>` on the server's command line;
+  3. the `CLARION_CONFIG_DIR` environment variable;
+  4. `"configDir"` in the solution's `clarion-assistant.json`, a path relative to that file or using `%VARIABLES%`:
+
+     ```json
+     { "clarionVersion": "Clarion 11.0.13244", "configDir": "C:\\Clarion11\\Settings" }
+     ```
+
+  A folder you name that has no `ClarionProperties.xml` is reported as an error. The server never reads a different folder in its place.
+- **`get_solution_info` says which settings it read.** `settingsFile` is the `ClarionProperties.xml` the version came from, and `settingsChosenBy` says why that folder was used. The server also writes both to stderr at startup.
+- **The plugin launcher starts the server for your project's Clarion.** It used to start the newest installed Clarion's server, whatever the project. It now asks, in order: `--clarion-version`, `clarionVersion` in `clarion-assistant.json`, the Clarion your projects' `.Version` resources say generated them, then an IDE that has the solution open. Only when none of these applies does it start the newest server, and it says so. `get_solution_info` reports the choice as `serverChosenBy`. It never starts a server from an older Clarion Assistant than the one it asked: Clarion Assistant is installed per Clarion version, so the copy under your project's Clarion can be out of date. When the choice was only inferred (your projects' `.Version` resources, or an open IDE), it serves with the newer one instead and names both versions. A version you name yourself, with `--clarion-version` or `clarionVersion` in `clarion-assistant.json`, is a deliberate choice, so the older server runs. To refuse an older server even for the json's pin, add `"allowOlderServer": false` to `clarion-assistant.json` (any value other than `true` counts as `false`). There is also a floor that no file can lower. A server that can't show it has the [#266](https://github.com/ClarionLive/ClarionAssistant/issues/266) file-access protections, or whose version can't be read, is never started because of `clarion-assistant.json` or a guess: that file can come from someone else's repository. Only `--clarion-version` on your own command line, or `CLARION_MCP_SERVER`, can start one. Whenever an older server runs, the warning names both versions. It is written to the startup log and `serverChosenBy`, and it is also passed to Claude when it connects, with a request to tell you. Before a different server is given the connection, the launcher checks that it starts. If it doesn't, the launcher uses the server it asked, and says so. `CLARION_MCP_SERVER` still names a server outright, with a warning if it is older than another installed one. A new `CLARION_ROOTS` variable (folders separated by semicolons) adds Clarion installs outside `C:\ClarionXX` that the installer did not record.
+
+<!-- release-docs: covered=file-tools -->
+### `write_file` no longer loses to a stale Clarion editor tab ([#205](https://github.com/ClarionLive/ClarionAssistant/issues/205))
+
+A file Claude changed on disk while it was also open in a native Clarion editor tab kept the tab's old text, and the next save in that tab silently put the old text back. `write_file` and `append_to_file` now ask every running Clarion IDE first. If a native tab has the file open with no unsaved changes, they write it and reload the tab, keeping your caret, and Clarion doesn't also ask whether to reload a file changed outside the IDE. A change another program makes to that file in the same moment still gets Clarion's prompt, at most 30 seconds late. If the tab has unsaved changes, they refuse and write nothing, asking you to save or close it first; `overwrite_open_buffer: true` overrides that, with a warning that saving the tab will undo the write. Files open in the CA Editor behave as before: it shows *File changed on disk* with a Reload button. If no IDE can be asked, the result says the tabs could not be checked. Thanks to @oleendrebergerud.
+
+<!-- release-docs: covered=embeditor,embed-journal -->
+### A CA Embeditor save survives Clarion crashing right after it ([#179](https://github.com/ClarionLive/ClarionAssistant/issues/179))
+
+On large procedures, Clarion's Generator can crash a moment *after* the CA Embeditor has handed it your text and reported the save as done. Until now that text was gone with the process. Every save now writes the embeds you changed to a recovery file first, and keeps it until a later open of that procedure shows the text really arrived. If Clarion went down in between, the next time you open that procedure in the CA Embeditor a notice offers **Restore** and **Discard (a copy is kept)**. Closing the notice without choosing leaves the offer for the next open. Restore puts the text back as unsaved edits for you to review and save, and nothing is applied unless you choose it. If the `.app` was written after your save without it, the offer says when: Clarion may have stopped before saving it, or the procedure was changed or reverted since, and you decide. Either button keeps a dated copy in `%APPDATA%\ClarionAssistant\embed-recovery`, one per save however many times it is offered. The offer also comes up when the procedure now holds neither your saved text nor what it held before the save, for example after choosing **Last Saved** when Clarion offers to recover the app. If the `.app` was also saved after your CA save, the offer says plainly that the procedure was changed and saved since and that Restore replaces that text with your older CA save, and a dated copy of the current text is written before you choose, so neither version is lost. That copy's header now says it holds the procedure's text from before the restore, not unsaved edits. Clarion re-indenting your lines doesn't count as a change, so a save that Clarion's **Recover** brought back is recognised as saved. The recovery file is still kept after that, until the `.app` itself has been saved: Recover's text is only in Clarion's memory until then, so if Clarion stops again and you choose **Last Saved**, the save is offered back. A newer CA Embeditor save of the same procedure in the meantime carries the earlier save's embeds along with its own, so both come back together. An embed that is already there is never reported missing or put back twice. If the procedure's embed points changed since, a save counts as arrived only when each changed embed's text is found in exactly one embed, no other changed embed claims that same one, and it isn't text the procedure held before the save; anything less is offered. Each embed is put back only where it can be identified for certain, and the offer names the file holding any that can't be. Only when the embed was changed in the same Clarion session after your save (in Clarion's own embeditor, say) is nothing offered, and a dated copy is kept there instead. The same happens to a save that was never reopened within 30 days, and copies older than 30 days are cleared from that folder. `monaco-spike.log` lines now carry the process ID, so several IDEs writing to one log can be told apart. Thanks to @asantarelli for the measurements that pinned this down.
+
+<!-- release-docs: covered=hover -->
+### Click an attribute on the control hover card to add or remove it, by geircodes ([#263](https://github.com/ClarionLive/ClarionAssistant/issues/263))
+
+With a language server that supports it ([msarson/Clarion-Extension#731](https://github.com/msarson/Clarion-Extension/issues/731)), the hover card for a window or report control shows its flag attributes as chips: filled for the ones it sets, outlined for the ones it could take. Click one to add or remove it; the change is one undo step and the card refreshes. The edit is applied only if the lines are still what the card described, and plain names are shown instead of chips where the code can't be edited: read-only files, text outside an embed point, and the generated modules of an open app, where an edit would be lost on the next generate. Thanks to [@geircodes](https://github.com/geircodes) for the patch.
+
+<!-- release-docs: covered=build-tools -->
+### The build tools say what they did: generated, not compiled ([#204](https://github.com/ClarionLive/ClarionAssistant/issues/204))
+
+`build_app`, `build_solution` and `generate_source` run ClarionCL, which generates source but has no switch to compile it. They used to report **BUILD SUCCEEDED** anyway. Results now open with **GENERATION SUCCEEDED — NOT COMPILED: no .exe/.dll was produced by this call**, and name the project's real output file, resolved from the project's `OutputPath` for the active configuration or else the `.red`, as *existing output, not produced by this call*, with the time it was last written. They also tell an app-generated project from a hand-written one, from the `Generated` flag on its modules, a matching `.app` beside it, and the solution's Solution Items. A source project is refused with "nothing to generate" and the MSBuild command line that compiles it, instead of ClarionCL's misleading "no templates have been registered". Thanks to @oleendrebergerud.
+
+<!-- release-docs: covered=schemagraph -->
+### SchemaGraph keeps the dictionary attributes it was dropping ([#267](https://github.com/ClarionLive/ClarionAssistant/issues/267))
+
+A `.dctx` ingest now stores key case sensitivity (`keys.is_case_sensitive`, 0 = NOCASE) and external names, field initial values verbatim (`!` expressions included), `DerivedFrom`, `BaseType`, external names and the Binary, Password and ReadOnly flags, and the table's `Path`, memory-file names included. Two of these were bugs: the ingest read attribute names no `.dctx` contains, so `is_auto_increment` and `default_value` were empty in every database. `get_table` shows all of it. An existing `.schemagraph.db` gets the new columns automatically, but they stay empty until you re-run `ingest_schema` on your dictionary. Thanks to @KevinErskine.
+
+<!-- release-docs: covered=codegraph -->
+### CodeGraph follows class libraries and global objects ([#245](https://github.com/ClarionLive/ClarionAssistant/issues/245), [#246](https://github.com/ClarionLive/ClarionAssistant/issues/246), [#244](https://github.com/ClarionLive/ClarionAssistant/issues/244))
+
+- **Class implementations reached through `MODULE()`/`LINK()` are indexed.** For each project, CodeGraph walks what it INCLUDEs, as the compiler does, and resolves each `MODULE('x.clw')`/`LINK('x.clw')` through that project's `.red` and the active build configuration. Those files are parsed and their calls become edges. A library several apps share is indexed once; classes under the Clarion install itself are not followed. Each file reached this way is recorded in `indexed_files` with `pass='pass2c-module'`.
+- **Global objects link up.** Data declared in a file the PROGRAM INCLUDEs in its global data, nested includes too, is indexed as `scope='global'`, and calls through such an object (`ActiveThreads.Add(...)`) resolve to the class's method, or the inherited one when it isn't overridden.
+- **An index that mostly failed says so.** `index_codegraph` reports a status of ok, warning or partial, with projects resolved/unresolved and files parsed/unresolved/skipped, instead of always "indexed successfully".
+
+Re-index your solution after updating to pick these up. Thanks to @MarkGoldberg.
+
+<!-- release-docs: covered=red -->
+### CodeGraph and the tools find files through the `.red` the build uses ([#261](https://github.com/ClarionLive/ClarionAssistant/issues/261))
+
+- **`{include}` lines in a `.red` are followed.** A project-local `Clarion110.red` that starts with `{include %BIN%\clarion110.red}` and then adds its own `[Common]` lines resolved none of the app's generated modules: the include was skipped, so the default `*.clw = .\clw` entry never existed and CodeGraph reported hundreds of files "unresolved". Includes are now read in place, as Clarion does (macros expanded, relative to the including file), and a section named twice adds to the search order instead of replacing the first. A missing include, or one that includes itself, is skipped and listed in `get_solution_info` (`redIncludes`, `redSkippedIncludes`).
+- **A `.red` edited on disk takes effect.** The standalone server kept the `.red` it first read until the Clarion version changed; it now reloads it, and every file it includes, when one changes or appears. Reindex in the IDE checks the same before each run.
+- **`resolve_red_path` answers for the build you are running.** It used to try the Debug sections first whatever the IDE was set to. It now uses the IDE's active build configuration for the solution (its `<config>32` section, then `<config>`, then `[Common]`), and the project you name with `project_name`, whose own `.red` and folder then apply. Matches in other sections are listed as `alsoFoundIn`, never chosen. It takes bare file names only. `get_red_search_paths` walks the same sections in the same order and adds `absoluteSearchPaths`; `get_solution_info` adds `buildConfiguration` and the template search paths.
+- **Claude is told to find Clarion files through the `.red`**, never by searching whole drives or from a remembered path: `resolve_red_path` first, then only the `.red`'s own folders. Asked for a template like `UltimateSQL.tpl`, it no longer turns up sixty stale copies across a drive.
+
+Thanks to @KevinErskine for the report and the `.red` layout that showed it.
+
+<!-- release-docs: covered=editor -->
+### OMIT and COMPILE blocks are greyed out in the CA Editor and CA Embeditor ([#264](https://github.com/ClarionLive/ClarionAssistant/issues/264))
+
+Clarion's own editor shades code that `OMIT` or `COMPILE` leaves out of the build; the CA editors coloured it like live code. They now fade it the same way, from the directive line through its terminator line, and update as you type. A condition is worked out from numbers, `TRUE`/`FALSE` and EQUATEs declared earlier in the same file. Where it depends on something the editor can't see, such as a project define like `_DEBUG_` or an EQUATE from an included file, the code keeps its normal colours and gets a faint bar in the margin instead, so live code is never greyed by mistake. Terminators match case-sensitively, as the compiler does: after `OMIT('ENDX')`, a line holding `endx` does not end the block. Code folding follows the same rule. Thanks to @KevinErskine.
+
+### `replace_range`, `delete_range` and `select_range` say how columns count ([#262](https://github.com/ClarionLive/ClarionAssistant/issues/262))
+
+The range tools' descriptions gave no column rules, so Claude could leave part of the old text at the end of a line. They now say it: columns count characters (a tab is 1), `end_col` is exclusive, a column past the end of the line stops at the end, and leaving `end_col` out means the end of `end_line` with its line break kept; there are recipes for replacing or deleting whole lines. Leaving `end_col` out used to mean column 999, which left everything past it behind on a long line; it now really means the end of the line. In a native Clarion editor tab, the caret now lands after the inserted text when that text has bare line feeds, and a range given end-first no longer fails. Thanks to [@geircodes](https://github.com/geircodes) for the report.
+
+<!-- release-docs: covered=lsp-bridge -->
+### Hover and Ctrl+Click no longer answer with an unrelated library equate ([PR #257](https://github.com/ClarionLive/ClarionAssistant/pull/257), [PR #258](https://github.com/ClarionLive/ClarionAssistant/pull/258))
+
+In a module with nothing named `text` declared, `x LONG(text)` hovered as *Text EQUATE · cpxml.inc*, completion offered `Text`, and Ctrl+Click jumped into `cpxml.inc`, a file the module never includes. When the language server has no answer, the CA editors fall back to CodeGraph, and that lookup matched the bare name in any library. Two fixes, both by geircodes:
+
+- **The fallback is scoped to what the file includes** (PR #257), as the local hover layer already was, so a hover or Ctrl+Click that the language server rightly leaves empty stays empty.
+- **`ITEMIZE` members are indexed under their real names** (PR #258). A member of `ITEMIZE,PRE(XMLFieldFormat)` is `XMLFieldFormat:Text`, and that is now the name CodeGraph and the library database hold. Members written without a value (`Base64 EQUATE`, the usual auto-numbered form) were not indexed at all and now are. Re-index to pick this up.
+
+<!-- release-docs: covered=mcp -->
+### MultiTerminal and Claude Desktop reconnect after an IDE restart, by Jesper Z. Laugesen ([PR #260](https://github.com/ClarionLive/ClarionAssistant/pull/260))
+
+The IDE's MCP server listens on port 19372, the one MultiTerminal sessions and Claude Desktop are configured with. When a new Clarion started while the previous one was still shutting down and holding that port, the new server took 19373 and stayed there, so those clients could no longer connect, even after 19372 was free again, until you restarted Clarion or edited their config. Sessions the IDE launches itself were never affected. The server now retries 19372 every 10 seconds and, once it is free, answers on both ports. The status bar shows it as `MCP: port 19373 + 19372`, and the Settings dialog's external endpoint shows the stable port. Thanks to [Jesper Z. Laugesen](https://github.com/Aarhusdk) for the diagnosis and the patch.
+
+### Thanks
+
+- **[@geircodes](https://github.com/geircodes)** &mdash; the clickable hover chips ([#263](https://github.com/ClarionLive/ClarionAssistant/issues/263)), the client side of his [msarson/Clarion-Extension#731](https://github.com/msarson/Clarion-Extension/issues/731) proposal; two merged PRs, [#257](https://github.com/ClarionLive/ClarionAssistant/pull/257) (hover and Ctrl+Click fallbacks scoped to the file's includes) and [#258](https://github.com/ClarionLive/ClarionAssistant/pull/258) (`ITEMIZE` members under their real names); and [#262](https://github.com/ClarionLive/ClarionAssistant/issues/262), the range tools' missing column rules.
+- **[Jesper Z. Laugesen](https://github.com/Aarhusdk)** &mdash; [PR #260](https://github.com/ClarionLive/ClarionAssistant/pull/260): the MCP port lost after an upgrade, measured with the external token to rule out auth, and the fix.
+- **[@oleendrebergerud](https://github.com/oleendrebergerud)** &mdash; [#266](https://github.com/ClarionLive/ClarionAssistant/issues/266), [#205](https://github.com/ClarionLive/ClarionAssistant/issues/205) and [#204](https://github.com/ClarionLive/ClarionAssistant/issues/204).
+- **[Adrián Santarelli](https://github.com/asantarelli)** &mdash; [#179](https://github.com/ClarionLive/ClarionAssistant/issues/179), and the measurements that pinned it down.
+- **[@KevinErskine](https://github.com/KevinErskine)** &mdash; [#267](https://github.com/ClarionLive/ClarionAssistant/issues/267), [#261](https://github.com/ClarionLive/ClarionAssistant/issues/261) and [#264](https://github.com/ClarionLive/ClarionAssistant/issues/264).
+- **[@MarkGoldberg](https://github.com/MarkGoldberg)** &mdash; [#244](https://github.com/ClarionLive/ClarionAssistant/issues/244), [#245](https://github.com/ClarionLive/ClarionAssistant/issues/245) and [#246](https://github.com/ClarionLive/ClarionAssistant/issues/246).
+- **[Dinko Bačun](https://github.com/bdinko)** &mdash; the session-viewer skill ([#41](https://github.com/ClarionLive/ClarionAssistant/issues/41)).
 
 ## What's New in v6.0
 
@@ -569,6 +873,7 @@ documentation from a URL, GitHub operations, and the marketplace browser.
 
 **More than one installation of the same version?** That's supported &mdash; press the **`+`** button on that version's row and pick the extra folder. Each extra gets a copy of that row's addin once the install finishes, and the list is remembered for next time. Handy if you keep, say, two Clarion 12 trees side by side.
 
+**More than one Claude Code profile?** On the **Plugin Location** page choose **Shared folder**. Setup keeps one copy of the plugin marketplace outside every profile (by default `%LOCALAPPDATA%\ClarionLive\claude-plugins\marketplaces\clarionassistant-marketplace`) and registers it in each Claude profile it finds: `%USERPROFILE%\.claude`, every `%USERPROFILE%\.claude-*` that has a `settings.json` or `plugins` folder, and `CLAUDE_CONFIG_DIR`. Profiles kept elsewhere can be listed on the same page. The default, **Default Claude profile**, installs into `%USERPROFILE%\.claude` as before. Setup needs `git` for the shared folder; without it, or offline, it installs into the default profile instead and says so.
 > One trap worth knowing: never leave a spare or backup copy of the addin folder anywhere *inside* an `accessory\addins` tree. Clarion scans subfolders, and a duplicate makes startup fail with *"Identity name used by multiple addins."* Keep backups outside.
 
 ### What Gets Installed
@@ -579,7 +884,7 @@ documentation from a URL, GitHub operations, and the marketplace browser.
 | COM for Clarion addin | `{Clarion}\accessory\addins\ComForClarion\` | COM browser addin |
 | UltimateCOM template | `{Clarion}\accessory\template\win\` | .tpl, .inc, .clw, and template DLLs |
 | Documentation | `{Clarion}\accessory\resources\ComForClarionDocumentation\` | COM for Clarion docs |
-| Claude Code plugin | `%USERPROFILE%\.claude\plugins\...\clarion-assistant\` | 20+ Clarion-specific skills, hooks, and docs |
+| Claude Code plugin | `%USERPROFILE%\.claude\plugins\...\clarion-assistant\`, or the shared folder you chose (see below) | 25 Clarion skills, a session viewer, hooks, and docs |
 | Code quality agents | `%USERPROFILE%\.claude\agents\` | 6 agents (won't overwrite existing) |
 | ClarionCOM tooling | `%APPDATA%\ClarionCOM\` | Project templates and scripts |
 | DocGraph database | `%APPDATA%\ClarionAssistant\` | Pre-loaded Clarion 12 documentation index |
@@ -704,7 +1009,7 @@ Clarion Assistant exposes **108 MCP tools** that Claude uses to interact with th
 | `run_command` | Execute any command-line tool |
 | `execute_command` | Execute a shell command |
 
-### File System & Search (7 tools)
+### File System & Search (8 tools)
 | Tool | Description |
 |---|---|
 | `read_file` | Read file content from disk with optional line range |
@@ -713,7 +1018,41 @@ Clarion Assistant exposes **108 MCP tools** that Claude uses to interact with th
 | `list_directory` | List files in a directory with optional pattern filter |
 | `search_files` | Search for files by name |
 | `search_files_advanced` | Advanced file search with Everything integration (path, extension, size, date filters) |
-| `search_content` | Search file contents by text |
+| `search_content` | Search file contents by text (off by default, see below) |
+| `find_duplicates` | Find files with the same name |
+
+#### Path scope for the file and search tools
+
+Claude Code's permission rules (`Read(...)`, `Bash(...)` and so on) only apply to its built-in tools; they never see an MCP tool. So the seven tools above, and `find_duplicates`, enforce their own boundary on the server side ([#266](https://github.com/ClarionLive/ClarionAssistant/issues/266)):
+
+- **Allowed roots:** the open solution's folder and its project folders, the build's Clarion root and the IDE's install, every folder in the active `.red` and in each project's own `.red`, and `%APPDATA%\ClarionAssistant` (its logs).
+- **Writable:** only the solution folder (with the project and `.red` folders inside it) and your `Mcp.AllowedRoots`. The Clarion root, the IDE install, `.red` and project folders outside the solution, and `%APPDATA%\ClarionAssistant` are read-only. When roots nest, the most specific one decides: a solution under `C:\Clarion12\Examples` is writable, the rest of `C:\Clarion12` is not.
+- **Never written** by these tools, wherever they are (still readable; edit them yourself, or with your assistant's own Edit/Write tools, which ask you and which your permission rules govern):
+  - instruction files: `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, `AGENTS.override.md`, `GEMINI.md`, `.github\copilot-instructions.md`, `*.instructions.md` under a `.github` folder, and anything in a `.claude` folder (see below);
+  - git: anything under `.git` (`config`, `hooks`), `HEAD` / `config` / `packed-refs` / `FETCH_HEAD` / `ORIG_HEAD` / `hooks\` in a folder that looks like a bare repository (it has `objects\` and `refs\`, or a `HEAD` file), and new `objects\` or `refs\` beside a `HEAD`;
+  - files that make other tools run commands: `.gitattributes`, `.gitmodules`, `.mcp.json`, `.vscode\tasks.json`, `.vscode\settings.json`, `.vscode\launch.json`, `*.code-workspace`;
+  - assistant and MCP config: `.vscode\mcp.json`, everything in `.cursor\`, `.codex\` and `.gemini\`, `.cursorrules`, `.windsurfrules`, `.github\prompts\*.prompt.md`, `.github\agents\*.agent.md`, `.github\chatmodes\`;
+  - files that define the scope: `*.sln`, `*.cwproj`, `*.red`, every file a `.red` `{include}`s, `clarion-assistant.json`, `ClarionProperties.xml`.
+- **Links do not widen write access:** a project or `.red` folder inside the solution is writable only when its real location (through any junction or symlink) is inside the solution too.
+- **No automatic root may swallow a protected folder:** a project, `.red` entry or solution folder that is, or contains, your profile, `%APPDATA%`, `%LOCALAPPDATA%`, `%PROGRAMDATA%`, Windows, Program Files or a whole drive (also through a junction) is dropped and logged. So is a project or `.red` folder *inside* `%APPDATA%`, `%LOCALAPPDATA%` or `%PROGRAMDATA%`. A solution *inside* your profile (`%USERPROFILE%\source\...`) is fine, and so is one at the root of a `subst` drive. Only `Mcp.AllowedRoots` can name such a folder.
+- **Never read or written**, even inside an allowed root: device paths (`\\?\`, `\\.\`); UNC paths and network drives unless `Mcp.AllowedRoots` names them (`get_solution_info` reports a `pathPolicy` note when your solution folder is on one); path segments that end in a dot or a space; any `.ssh`, `.aws`, `.gnupg`, `.azure`, `.kube` or `.docker` folder, any `.credentials.json`, your own Claude Code config (`%USERPROFILE%\.claude`, `.claude-*`, `.claude.json` and `CLAUDE_CONFIG_DIR`: credentials and transcripts), other users' profiles, `.git-credentials`, `.npmrc`, `.netrc`, any `mcp-config*.json`, and Clarion Assistant's own `settings.txt`, `mcp-*.json`, `copilot\` folder, `%LOCALAPPDATA%\ClarionAssistant\ide-endpoint` (the IDE's bearer tokens) and WebView2 profiles.
+- **Any other `.claude` folder is read-only:** the assistant can read a project's `CLAUDE.md` and skills, but cannot write `.claude\settings*.json` to grant itself permissions or rewrite its own instructions. A checkout under `.claude\worktrees\<name>` (where Claude Code keeps git worktrees) is writable, but a `.claude` folder inside it is not.
+- **Exports:** `export_txa` and `export_dctx` should write to a subfolder of the solution that is in `.gitignore` (not under `.claude`), so the file can be read back and is not committed by accident. %TEMP% is not an allowed root, so a file exported there cannot be read back unless you add it to `Mcp.AllowedRoots`.
+- **Paths are checked once they are canonical,** and canonicalising is pure text: a share or mapped-drive path is refused before anything touches it, so a crafted `\\host\share\A~1` cannot make Windows contact the host (and send your NTLM credentials). `..` is resolved first, `C:\Sol` does not contain `C:\Solution2`, case does not matter, and 8.3 short names, junctions and symbolic links are followed to where they really point.
+- **Everything searches** are scoped to the same roots and every result is checked again before it is returned, so a `path:` or `|` in the query cannot widen them. `max_results` is capped at 1000, and a query that names nothing (`*`, `*.*`) is refused.
+- **With no solution open**, the Clarion roots, the `.red`'s absolute folders and your extra roots still apply.
+- **A refusal is an error, not an empty result.** When a setting can lift it (outside every root, a network location, a read-only root) it names `Mcp.AllowedRoots`; a built-in rule cannot be lifted by any setting. Every refusal tells the assistant to use its own Edit/Write tools (which ask you) or ask you, and never to work around it with `run_command`.
+- **Audit log:** every gated path and every Everything query is written, with its outcome, to `%APPDATA%\ClarionAssistant\mcp-path-audit.log`.
+
+Settings, in `%APPDATA%\ClarionAssistant\settings.txt`:
+
+| Setting | Effect |
+|---|---|
+| `Mcp.AllowedRoots=D:\Shared\Templates;\\nas\team\ClarionApps` | Extra allowed roots, separated by semicolons (readable and writable). The only way to allow a network drive or share, or a folder that contains a protected one. The environment variable `CLARION_MCP_ALLOWED_ROOTS` on the server adds to it. |
+| `Mcp.DeniedPaths=D:\Work\Customers;Invoices;*\*.pfx` | Extra denied paths. A full path covers that folder and everything below it, a bare name matches a folder or file of that name anywhere, and `*` is a wildcard over the full path. `CLARION_MCP_DENIED_PATHS` adds to it. A denied path always wins over an allowed root. |
+| `Mcp.EverythingContentSearch=true` | Turns `search_content` on. It searches file **contents**, so it is off by default. |
+
+To turn the Everything tools off completely, deny them in Claude Code's `permissions.deny`, e.g. `"mcp__clarion-tools__search_files"`, `"mcp__clarion-tools__search_files_advanced"`, `"mcp__clarion-tools__search_content"` and `"mcp__clarion-tools__find_duplicates"`. The prefix depends on how the server is registered: `mcp__clarion-assistant__` for the in-IDE server, `mcp__plugin_clarion-assistant_clarion-tools__` for the plugin.
 
 ### Project & IDE (4 tools)
 | Tool | Description |
@@ -751,7 +1090,7 @@ Clarion Assistant exposes **108 MCP tools** that Claude uses to interact with th
 
 ## Claude Code Skills
 
-The installer includes 22 Clarion-specific skills for Claude Code (installed as a plugin):
+The installer includes 26 skills for Claude Code (installed as a plugin): 25 for Clarion development, and one general-purpose skill, `session-viewer`, contributed by Dinko Bačun ([@bdinko](https://github.com/bdinko/session-viewer)).
 
 | Skill | Description |
 |---|---|
@@ -760,9 +1099,12 @@ The installer includes 22 Clarion-specific skills for Claude Code (installed as 
 | `clarion-analyze` | Analyze Clarion code generation traces for recurring failure patterns |
 | `clarion-benchmark` | Benchmark Clarion code generation quality |
 | `clarion-convert-driver` | Convert Clarion dictionaries between file drivers (e.g., TopSpeed to SQLite) |
+| `clarion-appgen` | Create a complete Clarion application from authored TXA (and optional .dctx) text, built headlessly with ClarionCL and MSBuild |
+| `clarion-solution` | Orient in a folder containing a Clarion solution: which solution, whether CodeGraph is indexed, which tools are available |
 | `evaluate-code` | Evaluate Clarion app code for issues and improvements |
 | `jfiles` | jFiles JSON serialization patterns for Clarion |
 | `lsp-diagnostics` | Run LSP diagnostics across all source files in the open solution with navigate-to-error support |
+| `stringtheory` | CapeSoft StringTheory patterns and gotchas: BLOB/MEMO handling, common method confusions, storage-aware serialization |
 | `ClarionCOM` | Interactive COM development assistant |
 | `clarioncom-build` | Build COM projects with MSBuild |
 | `clarioncom-config` | Manage ClarionCOM settings |
@@ -777,6 +1119,7 @@ The installer includes 22 Clarion-specific skills for Claude Code (installed as 
 | `clarioncom-webview2-create` | Create WebView2-based COM controls with HTML/CSS/JS |
 | `clarioncom-webview2-deploy` | Generate deployment artifacts for WebView2 COM controls |
 | `clarioncom-webview2-validate` | Validate WebView2 COM controls for RegFree compliance |
+| `session-viewer` | List, render and resume previous Claude Code sessions in any project (general purpose; needs Python 3). By [@bdinko](https://github.com/bdinko/session-viewer), MIT |
 
 ---
 

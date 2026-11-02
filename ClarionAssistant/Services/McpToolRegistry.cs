@@ -108,8 +108,24 @@ namespace ClarionAssistant.Services
         {
             return new EditorToolRouter.RouteOptions { IsWrite = true, ExpectedPath = McpJsonRpc.GetString(args, "file_path"), NativeLine = nativeLine };
         }
-        private const string WriteFilePathHelp = "Optional. Absolute path of the file you mean to change: refused (nothing changed) unless it is the active editor. Pass it after open_file.";
-        private EditorToolRouter EditorRouter { get { return _editorRouterField ?? (_editorRouterField = new EditorToolRouter(() => _ui, () => _editorService.GetActiveDocumentPath())); } }
+        private const string WriteFilePathHelp = "Optional. Absolute path of the file you mean to change: refused (nothing changed) unless it is the active editor. Pass it after open_file. " +
+            "Edits and saves are also refused when the active file is one the path policy does not let these tools write (e.g. .vscode\\tasks.json, CLAUDE.md, a file under the Clarion folders); embed code in the embeditor is not affected.";
+        // GH #262: the column rules replace_range / delete_range / select_range share (EditorTextOps.ColumnIndex, both editors).
+        private const string RangeColumnRules = "Columns count characters (a tab is 1). end_col is EXCLUSIVE: the character AT end_col is kept. " +
+            "Omit start_col for column 1. Omit end_col to go to the end of end_line (its line break is kept). " +
+            "Columns past a line's end are clamped to it.";
+        private const string RangeStartColHelp = "Start column (1-based, characters; a tab is 1). Default 1.";
+        private const string RangeEndColHelp = "End column, EXCLUSIVE (the character at end_col is kept). Default: end of end_line. Clamped to the line's end.";
+        private EditorToolRouter EditorRouter { get { return _editorRouterField ?? (_editorRouterField = new EditorToolRouter(() => _ui, () => _editorService.GetActiveDocumentPath(), ActiveDocumentWriteRefusal)); } }
+        // b8f9431c N1: the #266 WRITE gate on the ACTIVE document, for every editor write (edits, undo/redo, save) on a CA
+        // tab and on a forwarded call alike. open_file needs only the read gate, so without this a file the policy refuses
+        // to write (.vscode\tasks.json, .git\config, CLAUDE.md, .mcp.json, a .sln/.red, a template under the Clarion root)
+        // could be opened, edited and saved through the tools. The embeditor is exempt in the router (EmbedExemption).
+        private string ActiveDocumentWriteRefusal(string tool, string activePath)
+        {
+            string canonical;
+            return McpPathGate.GatePath(tool, activePath, PathAccess.Write, _workspace, out canonical);
+        }
         // 73bd1f03 fix (2): the embed tools, routed to the CA Embeditor's Monaco buffer while it holds the procedure.
         private EmbedToolRouter _embedRouterField;
         private EmbedToolRouter EmbedRouter { get { return _embedRouterField ?? (_embedRouterField = new EmbedToolRouter(() => _ui)); } }
@@ -207,6 +223,23 @@ namespace ClarionAssistant.Services
         }
 
         /// <summary>
+        /// b8f9431c: a registry that only READS the tool definitions (<see cref="IdeOnlyToolDefinitions"/>): it registers as
+        /// a host with an IDE would (HasIde true, IdeOnly tools only) but has no editor, app tree or probe, and its
+        /// handlers are never called. The self-test's GateProbeEditorService proves registration itself touches none of them.
+        /// </summary>
+        private McpToolRegistry(ClarionClassParser parser, bool definitionsOnly)
+        {
+            _definitionsOnly = definitionsOnly;
+            _ideToolsOnly = true;
+            _parser = parser;
+            _docGraph = new DocGraphService();
+            _traceService = new ClarionTraceService();
+            RegisterAllTools();
+        }
+
+        private readonly bool _definitionsOnly;
+
+        /// <summary>
         /// Supply the workspace ("which solution am I on") and the UI thread to marshal to.
         /// Was SetChatControl(AssistantChatControl); the control implements both interfaces, so
         /// the addin passes itself twice and nothing about its behaviour changes.
@@ -241,6 +274,174 @@ namespace ClarionAssistant.Services
         }
 
         public int GetToolCount() { return _tools.Count; }
+
+        /// <summary>
+        /// GH #205: keep only <paramref name="names"/> and drop every other tool. (IdeCallbackHost used it to serve only the
+        /// two call-backs; since b8f9431c it serves every IdeOnly tool, see <see cref="BuildIdeCallbackRegistry"/>.)
+        /// </summary>
+        public void RetainOnly(params string[] names)
+        {
+            var keep = new HashSet<string>(names ?? new string[0], StringComparer.OrdinalIgnoreCase);
+            foreach (var name in _tools.Keys.ToList())
+                if (!keep.Contains(name)) _tools.Remove(name);
+        }
+
+        /// <summary>The standalone server's own call-backs into the IDE (lsp_diagnostics, write_file/append_to_file).
+        /// IdeCallbackHost serves them, and since b8f9431c every other IdeOnly tool too.</summary>
+        public static readonly string[] IdeCallbackTools = { "get_live_text", "editor_tab_sync" };
+
+        /// <summary>
+        /// b8f9431c: IdeOnly tools the IDE call-back endpoint does NOT serve, each with the reason. The standalone server
+        /// forwards exactly the IdeOnly tools minus these, so a tool named here is neither listed nor forwarded there
+        /// (it stays available in a CA tab). None is here for missing state: every IdeOnly handler was checked for
+        /// chat-pane-only state. The five registry statics only the chat pane set (AppTreeFactory, IdeProbeFactory,
+        /// DiagnosticLog, CaEmbeditorLiveProbe, ActiveEditorCoveredProbe) are now set by IdeCallbackHost at addin start;
+        /// the diff tools get their own DiffService there (it is IDE-wide, not the pane's); open_procedure_embed's
+        /// instance-coordination conflict check gets a read-only InstanceCoordinationService there (never Start()ed: this
+        /// IDE does not register, it only reads which OTHER instance has the procedure open - review L3); build_app /
+        /// generate_source read only the solution, version and Clarion root, which IdeWorkspace answers. The entries are
+        /// excluded for what the tool CAN DO (review M1). tests\IdeProxy.SourceScan.ps1 fails if an IdeOnly tool is missing from the callback
+        /// registry without an entry here.
+        /// </summary>
+        public static readonly Dictionary<string, string> IdeCallbackExcludedTools =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                // b8f9431c review M1: excluded for what they can do, not for missing state.
+                { "execute_command", "it instantiates ANY loaded type by name and calls its public Run() - arbitrary code in "
+                    + "the IDE process, not an IDE tool; a CA tab keeps it" },
+                { "dump_object_api", "it walks NON-PUBLIC properties and fields from the App object, dumps their values and "
+                    + "INVOKES any no-argument method a path segment names (a mutating one included); a CA tab keeps it" },
+            };
+
+        /// <summary>
+        /// b8f9431c M1: the inspect_ide commands the IDE call-back endpoint serves (read-only, public state). Every other
+        /// command (probe_* native hooks, path:/embed_details/types/assemblies deep dumps) is refused there.
+        /// </summary>
+        public static readonly HashSet<string> CallbackInspectCommands = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            { "active_view", "editor_text", "all_windows", "all_pads", "app_details" };
+
+        /// <summary>
+        /// b8f9431c: the IdeOnly tools that CHANGE something - an editor buffer, the embeditor, the app or dictionary,
+        /// a file, generated source. When one arrives forwarded from a plugin client (outside the IDE) the IDE logs
+        /// "[ide-callback] &lt;tool&gt; from plugin client" and shows a status-bar note, so a change made from outside is
+        /// visible. tests\IdeProxy.SourceScan.ps1 pins that every IdeOnly tool is either here or in ReadOnlyIdeTools.
+        /// </summary>
+        public static readonly HashSet<string> IdeWriteTools = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "insert_text_at_cursor", "replace_text", "replace_range", "delete_range", "undo", "redo", "save_file",
+            "close_file", "toggle_comment", "write_embed_content", "apply_embed_edits", "save_and_close_embeditor",
+            "cancel_embeditor", "export_txa", "import_txa", "export_dctx", "import_dctx", "build_app", "generate_source",
+            "execute_command", "editor_tab_sync", "warmup_abc"
+        };
+
+        /// <summary>b8f9431c: the IdeOnly tools that only read or navigate (the complement of <see cref="IdeWriteTools"/>).</summary>
+        public static readonly HashSet<string> ReadOnlyIdeTools = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "get_active_file", "get_selected_text", "embeditor_get_selection", "get_word_under_cursor", "get_cursor_position",
+            "go_to_line", "select_range", "get_open_files", "get_line_text", "get_lines_range", "find_in_file", "is_modified",
+            "inspect_ide", "get_app_info", "get_app_dictionary", "list_procedures", "get_procedure_details",
+            "open_procedure_embed", "select_procedure", "get_embed_info", "open_embeditor_source", "next_embed", "prev_embed",
+            "next_filled_embed", "prev_filled_embed", "list_embeds", "find_embed", "get_embeditor_source",
+            "search_embeditor_source", "get_embed_content", "dump_object_api", "dump_appmain_api", "open_file",
+            "get_live_text", "show_diff", "get_diff_result", "get_diff_content"
+        };
+
+        /// <summary>True on the registry <see cref="BuildIdeCallbackRegistry"/> built (plugin clients outside the IDE).</summary>
+        private bool _callbackHost;
+
+        /// <summary>
+        /// b8f9431c review M1: the refusal for a call from OUTSIDE the IDE (the call-back registry, or a forwarded call
+        /// that reached the chat pane's server because it holds the endpoint record) of a tool or command that is not
+        /// served there, or null. McpDispatcher.ForwardedCallFilter points here, so the chat pane refuses the same.
+        /// </summary>
+        public static string ForwardedRefusal(string toolName, Dictionary<string, object> args)
+        {
+            string why;
+            if (toolName != null && IdeCallbackExcludedTools.TryGetValue(toolName, out why))
+                return "Error: " + toolName + " is not available to clients outside the Clarion IDE (" + why + "); nothing was run.";
+            if (string.Equals(toolName, "inspect_ide", StringComparison.OrdinalIgnoreCase))
+            {
+                string command = (McpJsonRpc.GetString(args, "command", "active_view") ?? "").Trim();
+                if (!CallbackInspectCommands.Contains(command))
+                    return "Error: inspect_ide '" + command + "' is not available to clients outside the Clarion IDE; "
+                        + "nothing was run. Commands available here: " + string.Join(", ", CallbackInspectCommands.OrderBy(c => c).ToArray())
+                        + ". (A Clarion Assistant tab inside the IDE has every command.)";
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// GH #205 pipeline run 2: the IDE call-back endpoint's registry, WITH a workspace. editor_tab_sync's check is
+        /// read-gated by the #266 path policy, which is built from the workspace (solution, project folders, Clarion
+        /// root, .red folders); with none, every solution file is "outside every allowed root" and every check fails.
+        /// The workspace and dispatcher are set on THIS registry only: unlike <see cref="SetWorkspace"/>, the shared
+        /// SharedLspBridge providers are left alone, so a call-back host started after the chat pane cannot rebind them.
+        ///
+        /// b8f9431c: it serves EVERY IdeOnly tool (minus <see cref="IdeCallbackExcludedTools"/>), so the standalone server
+        /// a plugin client (MultiTerminal, VS Code) runs can forward them to this IDE. The handlers are the same ones a
+        /// CA tab runs, with this IDE's workspace, so the #266 path policy (McpPathGate.BuildPolicy) and the 73bd1f03
+        /// overlay guard apply exactly as there. <paramref name="diffService"/> backs show_diff / get_diff_result /
+        /// get_diff_content (null: they answer "not initialized", as before).
+        /// </summary>
+        public static McpToolRegistry BuildIdeCallbackRegistry(IEditorService editorService, ClarionClassParser parser,
+                                                               IWorkspaceContext workspace, IUiDispatcher ui,
+                                                               IDiffService diffService = null,
+                                                               InstanceCoordinationService instanceCoord = null)
+        {
+            var registry = new McpToolRegistry(editorService, parser, true);   // ideToolsOnly: only the IdeOnly tools register
+            foreach (var name in IdeCallbackExcludedTools.Keys) registry._tools.Remove(name);
+            registry._workspace = workspace;
+            registry._ui = ui;
+            registry._diffService = diffService;
+            registry._instanceCoord = instanceCoord;   // L3: read-only use (open_procedure_embed's conflict check)
+            registry._callbackHost = true;
+            return registry;
+        }
+
+        /// <summary>
+        /// b8f9431c: the IdeOnly tools as a host with an IDE registers them - name, description, schema, UI-thread flag and
+        /// declared UI budget - for a host WITHOUT one (the standalone server) to list and forward. Built from the same
+        /// RegisterAllTools the addin runs, in a registry that only pretends to have an IDE: no handler of it is ever
+        /// invoked (the copies <see cref="AddForwardedIdeTools"/> registers have their own). Excludes
+        /// <see cref="IdeCallbackExcludedTools"/>.
+        /// </summary>
+        public static List<McpTool> IdeOnlyToolDefinitions()
+        {
+            var defs = new McpToolRegistry(new ClarionClassParser(), definitionsOnly: true);
+            return defs._tools.Values.Where(t => t.IdeOnly && !IdeCallbackExcludedTools.ContainsKey(t.Name))
+                                     .OrderBy(t => t.Name, StringComparer.Ordinal).ToList();
+        }
+
+        /// <summary>
+        /// b8f9431c, the standalone server: register every IdeOnly tool (<see cref="IdeOnlyToolDefinitions"/>) with its
+        /// REAL description and schema, and a handler that hands the call to <paramref name="forward"/> (which sends it to
+        /// a running Clarion IDE that has this solution open). <paramref name="descriptionNote"/> is appended to each
+        /// description. The copy runs OFF any UI thread here (RequiresUiThread false): the IDE marshals it. A name this
+        /// registry already serves is skipped (the split is a partition, so none is). Returns how many were added.
+        /// </summary>
+        public int AddForwardedIdeTools(Func<McpTool, Dictionary<string, object>, object> forward, string descriptionNote)
+        {
+            if (forward == null) throw new ArgumentNullException("forward");
+            int added = 0;
+            foreach (var def in IdeOnlyToolDefinitions())
+            {
+                if (_tools.ContainsKey(def.Name)) continue;
+                var meta = def;
+                _tools[def.Name] = new McpTool
+                {
+                    Name = def.Name,
+                    Description = string.IsNullOrEmpty(descriptionNote) ? def.Description : def.Description + " " + descriptionNote,
+                    InputSchema = def.InputSchema,
+                    IdeOnly = true,
+                    RequiresUiThread = false,
+                    UiTimeoutSeconds = def.UiTimeoutSeconds,
+                    Handler = args => forward(meta, args ?? new Dictionary<string, object>())
+                };
+                added++;
+            }
+            return added;
+        }
+
         public IAppTreeService GetAppTreeService() { return _appTree; }
 
         public bool RequiresUiThread(string toolName)
@@ -487,14 +688,17 @@ IdeOnly = true,
             {
                 Name = "replace_range",
 IdeOnly = true,
-                Description = "Replace text between two positions (line/column, 1-based) in the active editor. Use to replace a specific region of code.",
+                Description = "Replace text between two positions (line/column, 1-based) in the active editor. " + RangeColumnRules +
+                              " So to replace through the last character of a line of length L, end_col = L+1 (or omit it). " +
+                              "To replace whole lines N-M: start_line=N, end_line=M, omit start_col/end_col, and do not end new_text " +
+                              "with a line break (the line break after line M is kept).",
                 InputSchema = McpJsonRpc.BuildSchema(
                     new Dictionary<string, string>
                     {
                         { "start_line", "Start line (1-based)" },
-                        { "start_col", "Start column (1-based)" },
+                        { "start_col", RangeStartColHelp },
                         { "end_line", "End line (1-based)" },
-                        { "end_col", "End column (1-based)" },
+                        { "end_col", RangeEndColHelp },
                         { "new_text", "Replacement text (empty string to delete)" },
                         { "file_path?", WriteFilePathHelp }
                     },
@@ -505,7 +709,7 @@ IdeOnly = true,
                     int startLine = McpJsonRpc.GetInt(args, "start_line");
                     int startCol = McpJsonRpc.GetInt(args, "start_col", 1);
                     int endLine = McpJsonRpc.GetInt(args, "end_line");
-                    int endCol = McpJsonRpc.GetInt(args, "end_col", 999);
+                    int endCol = McpJsonRpc.GetInt(args, "end_col", int.MaxValue);   // GH #262: the end of ANY line (999 fell short of long ones)
                     string newText = McpJsonRpc.GetString(args, "new_text", "");
                     return EditorRouter.Run("replace_range", () =>
                     {
@@ -519,14 +723,15 @@ IdeOnly = true,
             {
                 Name = "select_range",
 IdeOnly = true,
-                Description = "Select a range of text in the active editor (line/column, 1-based). The selected text will be highlighted.",
+                Description = "Select a range of text in the active editor (line/column, 1-based). The selected text will be highlighted. " +
+                              RangeColumnRules + " (The character AT end_col is not selected.)",
                 InputSchema = McpJsonRpc.BuildSchema(
                     new Dictionary<string, string>
                     {
                         { "start_line", "Start line (1-based)" },
-                        { "start_col", "Start column (1-based)" },
+                        { "start_col", RangeStartColHelp },
                         { "end_line", "End line (1-based)" },
-                        { "end_col", "End column (1-based)" }
+                        { "end_col", RangeEndColHelp }
                     },
                     new[] { "start_line", "end_line" }),
                 RequiresUiThread = false,   // fc420c30: EditorRouter marshals
@@ -535,7 +740,7 @@ IdeOnly = true,
                     int startLine = McpJsonRpc.GetInt(args, "start_line");
                     int startCol = McpJsonRpc.GetInt(args, "start_col", 1);
                     int endLine = McpJsonRpc.GetInt(args, "end_line");
-                    int endCol = McpJsonRpc.GetInt(args, "end_col", 999);
+                    int endCol = McpJsonRpc.GetInt(args, "end_col", int.MaxValue);   // GH #262: the end of ANY line (999 fell short of long ones)
                     return EditorRouter.Run("select_range", () =>
                     {
                         var result = _editorService.SelectRange(startLine, startCol, endLine, endCol);
@@ -548,14 +753,18 @@ IdeOnly = true,
             {
                 Name = "delete_range",
 IdeOnly = true,
-                Description = "Delete text between two positions (line/column, 1-based) in the active editor.",
+                Description = "Delete text between two positions (line/column, 1-based) in the active editor. " + RangeColumnRules +
+                              " To delete whole lines N-M with their line breaks: start_line=N, start_col=1, end_line=M+1, end_col=1 " +
+                              "(omitting end_col instead keeps line M's line break, leaving an empty line). If M is the last line and N>1: " +
+                              "start_line=N-1 with start_col past its end (it clamps to the end of that line), end_line=M, end_col omitted. " +
+                              "To empty the whole document: start_line=1, end_line=last, columns omitted.",
                 InputSchema = McpJsonRpc.BuildSchema(
                     new Dictionary<string, string>
                     {
                         { "start_line", "Start line (1-based)" },
-                        { "start_col", "Start column (1-based)" },
+                        { "start_col", RangeStartColHelp },
                         { "end_line", "End line (1-based)" },
-                        { "end_col", "End column (1-based)" },
+                        { "end_col", RangeEndColHelp },
                         { "file_path?", WriteFilePathHelp }
                     },
                     new[] { "start_line", "end_line" }),
@@ -565,7 +774,7 @@ IdeOnly = true,
                     int startLine = McpJsonRpc.GetInt(args, "start_line");
                     int startCol = McpJsonRpc.GetInt(args, "start_col", 1);
                     int endLine = McpJsonRpc.GetInt(args, "end_line");
-                    int endCol = McpJsonRpc.GetInt(args, "end_col", 999);
+                    int endCol = McpJsonRpc.GetInt(args, "end_col", int.MaxValue);   // GH #262: the end of ANY line (999 fell short of long ones)
                     return EditorRouter.Run("delete_range", () =>
                     {
                         var result = _editorService.DeleteRange(startLine, startCol, endLine, endCol);
@@ -621,9 +830,16 @@ IdeOnly = true,
                 RequiresUiThread = false,   // fc420c30: EditorRouter marshals
                 // fc420c30: a CA Editor with unsaved edits is NOT closed (John, 2026-10-05). CloseWindow(true) skips the
                 // closing prompt, and the overlay's Dispose fallback would then write the edits silently.
-                Handler = args => EditorRouter.Run("close_file",
-                    () => _editorService.CloseActiveDocument() ? "File closed" : "Error: could not close",
-                    ov => ov.Close(), WriteOpts(args))
+                // b8f9431c N1: NoFileWrite - closing writes nothing (a dirty CA Editor refuses, a native close discards), so
+                // the write gate does not stop the developer's tab on, say, .vscode\tasks.json from being closed.
+                Handler = args =>
+                {
+                    var opts = WriteOpts(args);
+                    opts.NoFileWrite = true;
+                    return EditorRouter.Run("close_file",
+                        () => _editorService.CloseActiveDocument() ? "File closed" : "Error: could not close",
+                        ov => ov.Close(), opts);
+                }
             });
 
             Register(new McpTool
@@ -789,6 +1005,16 @@ Use this tool to discover IDE APIs and understand what's available for automatio
                 Handler = args =>
                 {
                     string command = McpJsonRpc.GetString(args, "command", "active_view");
+
+                    // b8f9431c M1: the IDE call-back endpoint (plugin clients outside the IDE) serves only the
+                    // read-only inspections. The probe_* spikes install native hooks and inject into menus
+                    // (NativeProbeService: SetWindowsHookEx), and path:/embed_details/types/assemblies dump
+                    // NON-PUBLIC members of whatever they reach. A CA tab still has every command.
+                    if (_callbackHost)
+                    {
+                        string notHere = ForwardedRefusal("inspect_ide", args);
+                        if (notHere != null) return notHere;
+                    }
 
                     switch (command.ToLower())
                     {
@@ -1498,11 +1724,14 @@ IdeOnly = true,
             {
                 Name = "export_txa",
 IdeOnly = true,
-                Description = "Export the ENTIRE current Clarion app to a TXA (Text Application) file. This always exports all procedures. To work with individual procedure code, use open_procedure_embed instead.",
+                Description = "Export the ENTIRE current Clarion app to a TXA (Text Application) file. This always exports all procedures. To work with individual procedure code, use open_procedure_embed instead. " +
+                              "Write the file to a subfolder of the solution that is in .gitignore (e.g. <solution>\\exports\\, not under .claude) " +
+                              "so read_file can open it afterwards and it is not committed by accident: %TEMP% is OUTSIDE the file tools' read " +
+                              "scope (GH #266) unless the developer adds it to Mcp.AllowedRoots.",
                 InputSchema = McpJsonRpc.BuildSchema(
                     new Dictionary<string, string>
                     {
-                        { "path", "Absolute path for the output TXA file" }
+                        { "path", "Absolute path for the output TXA file - in a git-ignored subfolder of the solution (not %TEMP%, not under .claude), so read_file can open it" }
                     },
                     new[] { "path" }),
                 RequiresUiThread = true,
@@ -1511,6 +1740,9 @@ IdeOnly = true,
                     string path = McpJsonRpc.GetString(args, "path");
                     if (string.IsNullOrEmpty(path))
                         return "Error: path is required";
+                    // b8f9431c H1: the #266 path policy, as write_file - BEFORE any I/O (a UNC path is never touched).
+                    string refusal = McpPathGate.GatePath("export_txa", path, PathAccess.Write, _workspace, out path);
+                    if (refusal != null) return refusal;
 
                     return _appTree.ExportTxa(path);
                 }
@@ -1534,6 +1766,9 @@ IdeOnly = true,
                     string path = McpJsonRpc.GetString(args, "path");
                     if (string.IsNullOrEmpty(path))
                         return "Error: path is required";
+                    // b8f9431c H1: the #266 path policy, as read_file - BEFORE any I/O (a UNC path is never touched).
+                    string refusal = McpPathGate.GatePath("import_txa", path, PathAccess.Read, _workspace, out path);
+                    if (refusal != null) return refusal;
 
                     string clashMode = McpJsonRpc.GetString(args, "clash_mode");
                     return _appTree.ImportTxa(path, clashMode);
@@ -1609,6 +1844,16 @@ IdeOnly = true,
                 Handler = args =>
                 {
                     string path = McpJsonRpc.GetString(args, "path");
+                    if (string.IsNullOrEmpty(path))
+                        return "Error: path is required";
+                    // b8f9431c H1: the #266 path policy, as read_file (get_active_file then returns the content), BEFORE
+                    // File.Exists: a UNC path is never touched (that would send this user's NTLM credentials to the host).
+                    // N6: from here on only the GATED canonical path is used (checked, opened, waited for): the caller's
+                    // own spelling is never handed to the IDE, so what opens is exactly what the policy judged.
+                    string gatedPath;
+                    string refusal = McpPathGate.GatePath("open_file", path, PathAccess.Read, _workspace, out gatedPath);
+                    if (refusal != null) return refusal;
+                    path = gatedPath;
                     if (!File.Exists(path))
                         return "Error: file not found: " + path;
 
@@ -1637,15 +1882,28 @@ IdeOnly = true,
             {
                 Name = "export_dctx",
 IdeOnly = true,
-                Description = "Export the currently open Clarion data dictionary to a .dctx text file. The dictionary must be open in the IDE (use open_dictionary first). The .dctx format is a human-readable text representation of the dictionary.",
+                Description = "Export the currently open Clarion data dictionary to a .dctx text file. The dictionary must be open in the IDE (use open_dictionary first). The .dctx format is a human-readable text representation of the dictionary. " +
+                              "Leave path empty, or write the file to a subfolder of the solution that is in .gitignore (e.g. <solution>\\exports\\, " +
+                              "not under .claude), so read_file can open it afterwards and it is not committed by accident: the default (the .dct's " +
+                              "own folder) is inside that scope when the dictionary lives in the solution. " +
+                              "%TEMP% is OUTSIDE the file tools' read scope (GH #266) unless the developer adds it to Mcp.AllowedRoots.",
                 InputSchema = McpJsonRpc.BuildSchema(
                     new Dictionary<string, string>
                     {
-                        { "path", "Absolute path for the output .dctx file (optional — defaults to same folder as the .dct with .dctx extension)" }
+                        { "path", "Absolute path for the output .dctx file (optional — defaults to same folder as the .dct with .dctx extension). Keep it in a git-ignored subfolder of the solution (not %TEMP%, not under .claude), so read_file can open it." }
                     }),
                 RequiresUiThread = true,
                 Handler = args =>
                 {
+                    // b8f9431c H1: a caller-named path goes through the #266 path policy (as write_file) before anything
+                    // else; the default beside the .dct is gated below once it is known.
+                    string outPath = McpJsonRpc.GetString(args, "path", "");
+                    if (!string.IsNullOrEmpty(outPath))
+                    {
+                        string callerRefusal = McpPathGate.GatePath("export_dctx", outPath, PathAccess.Write, _workspace, out outPath);
+                        if (callerRefusal != null) return callerRefusal;
+                    }
+
                     var dct = FindOpenDictionary();
                     if (dct == null)
                         return "Error: no dictionary is open in the IDE. Use open_dictionary first.";
@@ -1653,12 +1911,15 @@ IdeOnly = true,
                     var fileNameProp = dct.GetType().GetProperty("FileName",
                         System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
                     string dctPath = fileNameProp != null ? fileNameProp.GetValue(dct, null) as string : null;
-                    string outPath = McpJsonRpc.GetString(args, "path", "");
                     if (string.IsNullOrEmpty(outPath))
                     {
                         if (string.IsNullOrEmpty(dctPath))
                             return "Error: could not determine dictionary path and no output path provided";
                         outPath = Path.ChangeExtension(dctPath, ".dctx");
+                        // The default is gated too (a dictionary outside the solution folder is in a read-only root:
+                        // pass a path in the solution then).
+                        string refusal = McpPathGate.GatePath("export_dctx", outPath, PathAccess.Write, _workspace, out outPath);
+                        if (refusal != null) return refusal;
                     }
 
                     // Call ExportToText(string destination, bool quiet, out string errorMessage)
@@ -1692,13 +1953,16 @@ IdeOnly = true,
                 RequiresUiThread = true,
                 Handler = args =>
                 {
-                    var dct = FindOpenDictionary();
-                    if (dct == null)
-                        return "Error: no dictionary is open in the IDE. Use open_dictionary first.";
-
                     string importPath = McpJsonRpc.GetString(args, "path");
                     if (string.IsNullOrEmpty(importPath))
                         return "Error: path is required";
+                    // b8f9431c H1: the #266 path policy, as read_file - first, BEFORE File.Exists (a UNC path is never touched).
+                    string refusal = McpPathGate.GatePath("import_dctx", importPath, PathAccess.Read, _workspace, out importPath);
+                    if (refusal != null) return refusal;
+
+                    var dct = FindOpenDictionary();
+                    if (dct == null)
+                        return "Error: no dictionary is open in the IDE. Use open_dictionary first.";
                     if (!File.Exists(importPath))
                         return "Error: file not found: " + importPath;
 
@@ -1724,7 +1988,7 @@ IdeOnly = true,
             Register(new McpTool
             {
                 Name = "read_file",
-                Description = "Read content of a file from disk. Optionally specify start_line and end_line to read a specific line range (1-based, inclusive).",
+                Description = "Read content of a file from disk. Optionally specify start_line and end_line to read a specific line range (1-based, inclusive). " + PathScopeNote,
                 InputSchema = McpJsonRpc.BuildSchema(
                     new Dictionary<string, string>
                     {
@@ -1737,6 +2001,9 @@ IdeOnly = true,
                 Handler = args =>
                 {
                     string path = McpJsonRpc.GetString(args, "path");
+                    // GH #266: the policy BEFORE File.Exists, so a refused path's existence is not disclosed.
+                    string refusal = McpPathGate.GatePath("read_file", path, PathAccess.Read, _workspace, out path);
+                    if (refusal != null) return refusal;
                     if (!File.Exists(path))
                         return "Error: file not found: " + path;
 
@@ -1769,12 +2036,13 @@ IdeOnly = true,
                 Description = "Write content to a file on disk. Creates the file if it doesn't exist, overwrites if it does. " +
                               "Clarion source (.clw/.inc/.equ/.int/.trn/.tpw/.tpl) is written with CRLF, no BOM, and in the file's " +
                               "existing encoding (the ANSI code page for a new or all-ASCII file); a character that encoding cannot " +
-                              "hold is refused rather than written as '?'.",
+                              "hold is refused rather than written as '?'. " + OpenTabNote + " " + PathScopeNote,
                 InputSchema = McpJsonRpc.BuildSchema(
                     new Dictionary<string, string>
                     {
                         { "path", "Absolute path to write to" },
-                        { "content", "The content to write" }
+                        { "content", "The content to write" },
+                        { OpenTabGuard.OverrideArg, OpenTabOverrideArgNote }
                     },
                     new[] { "path", "content" }),
                 RequiresUiThread = false,
@@ -1782,29 +2050,40 @@ IdeOnly = true,
                 {
                     string path = McpJsonRpc.GetString(args, "path");
                     string content = McpJsonRpc.GetString(args, "content", "");
-                    string dir = Path.GetDirectoryName(path);
-                    if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
-                        Directory.CreateDirectory(dir);
-                    // Clarion source (.clw/.inc/.equ/.int/.trn/.tpw/.tpl) is forced to CRLF, no
-                    // BOM, and the file's own encoding, so LF-only / BOM content can't reach the
-                    // Clarion compiler (issue #34) and an ANSI file stays ANSI (GH #203).
-                    Encoding written;
-                    try { written = ClarionSourceText.WriteFile(path, content); }
-                    catch (ClarionEncodingException ex) { return "Error: " + ex.Message; }
-                    string crlfNote = written != null ? ", CRLF/no-BOM, " + written.WebName : "";
-                    return "File written: " + path + " (" + content.Length + " chars" + crlfNote + ")";
+                    string asked = path;   // GH #205: the caller's spelling, which the IDE also matches tabs against
+                    string refusal = McpPathGate.GatePath("write_file", path, PathAccess.Write, _workspace, out path);
+                    if (refusal != null) return refusal;
+                    // GH #205: never underneath a native editor tab's stale buffer. OpenTabGuard asks the IDE first:
+                    // a tab with unsaved changes refuses (nothing written, not even the folder); a clean one is
+                    // reloaded after the write; the result says what happened to any open tab.
+                    string target = path;
+                    return OpenTabGuard.Run(target, asked, OpenTabGuard.ParseFlag(args, OpenTabGuard.OverrideArg), () =>
+                    {
+                        string dir = Path.GetDirectoryName(target);
+                        if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                            Directory.CreateDirectory(dir);
+                        // Clarion source (.clw/.inc/.equ/.int/.trn/.tpw/.tpl) is forced to CRLF, no
+                        // BOM, and the file's own encoding, so LF-only / BOM content can't reach the
+                        // Clarion compiler (issue #34) and an ANSI file stays ANSI (GH #203).
+                        Encoding written;
+                        try { written = ClarionSourceText.WriteFile(target, content); }
+                        catch (ClarionEncodingException ex) { return "Error: " + ex.Message; }
+                        string crlfNote = written != null ? ", CRLF/no-BOM, " + written.WebName : "";
+                        return "File written: " + target + " (" + content.Length + " chars" + crlfNote + ")";
+                    });
                 }
             });
 
             Register(new McpTool
             {
                 Name = "append_to_file",
-                Description = "Append text to the end of an existing file, on a new line. A line break (CRLF) is inserted first only if the file is non-empty and does not already end with one; an empty file gets no leading break. Clarion source (.clw/.inc/...) keeps its own encoding and CRLF endings, no BOM.",
+                Description = "Append text to the end of an existing file, on a new line. A line break (CRLF) is inserted first only if the file is non-empty and does not already end with one; an empty file gets no leading break. Clarion source (.clw/.inc/...) keeps its own encoding and CRLF endings, no BOM. " + OpenTabNote + " " + PathScopeNote,
                 InputSchema = McpJsonRpc.BuildSchema(
                     new Dictionary<string, string>
                     {
                         { "path", "Absolute path to the file" },
-                        { "text", "Text to append" }
+                        { "text", "Text to append" },
+                        { OpenTabGuard.OverrideArg, OpenTabOverrideArgNote }
                     },
                     new[] { "path", "text" }),
                 RequiresUiThread = false,
@@ -1812,6 +2091,9 @@ IdeOnly = true,
                 {
                     string path = McpJsonRpc.GetString(args, "path");
                     string text = McpJsonRpc.GetString(args, "text", "");
+                    string asked = path;   // GH #205: the caller's spelling, which the IDE also matches tabs against
+                    string refusal = McpPathGate.GatePath("append_to_file", path, PathAccess.Write, _workspace, out path);
+                    if (refusal != null) return refusal;
                     if (!File.Exists(path))
                         return "Error: file not found: " + path;
                     // Appends DIRECTLY rather than through IEditorService. That indirection made
@@ -1826,22 +2108,28 @@ IdeOnly = true,
                     // Appended Clarion source is CRLF-normalized (issue #34) and encoded in the
                     // file's own encoding (GH #203): UTF-8 appended onto an ANSI file leaves one
                     // file in two encodings. Other files are appended exactly as before.
-                    try
+                    //
+                    // GH #205: the same open-tab guard as write_file (refuse under a dirty native tab, reload a clean one).
+                    string target = path;
+                    return OpenTabGuard.Run(target, asked, OpenTabGuard.ParseFlag(args, OpenTabGuard.OverrideArg), () =>
                     {
-                        ClarionSourceText.AppendFile(path, text);
-                        return "Text appended to " + path;
-                    }
-                    catch (Exception ex)
-                    {
-                        return "Error: " + ex.Message;
-                    }
+                        try
+                        {
+                            ClarionSourceText.AppendFile(target, text);
+                            return "Text appended to " + target;
+                        }
+                        catch (Exception ex)
+                        {
+                            return "Error: " + ex.Message;
+                        }
+                    });
                 }
             });
 
             Register(new McpTool
             {
                 Name = "list_directory",
-                Description = "List files in a directory with an optional search pattern (e.g., '*.inc')",
+                Description = "List files in a directory with an optional search pattern (e.g., '*.inc'). " + PathScopeNote,
                 InputSchema = McpJsonRpc.BuildSchema(
                     new Dictionary<string, string>
                     {
@@ -1854,9 +2142,18 @@ IdeOnly = true,
                 {
                     string path = McpJsonRpc.GetString(args, "path");
                     string pattern = McpJsonRpc.GetString(args, "pattern", "*");
+                    if (string.IsNullOrEmpty(pattern)) pattern = "*";
+                    // A pattern is a file NAME pattern: no separators, no "..", no drive - it must not reach outside path.
+                    if (pattern.IndexOf('\\') >= 0 || pattern.IndexOf('/') >= 0 || pattern.Contains("..") || pattern.IndexOf(':') >= 0)
+                        return "Error: list_directory pattern must be a file-name pattern such as '*.inc' (no path separators, '..' or ':').";
+                    McpPathPolicy policy;
+                    string refusal = McpPathGate.GatePath("list_directory", path, PathAccess.Read, _workspace, out path, out policy);
+                    if (refusal != null) return refusal;
                     if (!Directory.Exists(path))
                         return "Error: directory not found: " + path;
-                    var files = Directory.GetFiles(path, pattern);
+                    // Entries a deny rule covers (e.g. settings.txt in CA's data folder) are left out of the listing.
+                    var files = Directory.GetFiles(path, pattern)
+                        .Where(f => policy.CheckLexical(f, PathAccess.Read).Allowed);
                     return string.Join("\n", files.Select(f => Path.GetFileName(f)));
                 }
             });
@@ -1873,7 +2170,7 @@ IdeOnly = true,
                 {
                     string slnPath = _workspace?.CurrentSolutionPath;
                     if (string.IsNullOrEmpty(slnPath) || !File.Exists(slnPath))
-                        return "Error: No solution loaded.";
+                        return "Error: No solution loaded." + NoSolutionSuffix();
 
                     var slnParser = new ClarionCodeGraph.Parsing.SolutionParser();
                     var projParser = new ClarionCodeGraph.Parsing.ProjectParser();
@@ -2136,7 +2433,7 @@ IdeOnly = true,
                 InputSchema = McpJsonRpc.BuildSchema(new Dictionary<string, string>
                 {
                     { "sln_path?", "Path to .sln file (auto-detected from current solution if omitted)" },
-                    { "incremental?", "Only re-index changed projects (default: true)" }
+                    { "incremental?", "Only re-index changed projects (default: true). A database built by an older indexer (below the current feature level) or a new one gets a full index instead, and the result's Mode line says so" }
                 }),
                 RequiresUiThread = false,
                 Handler = args => ExecuteIndexCodeGraph(args, null),
@@ -2214,7 +2511,7 @@ COMMON QUERIES:
                         dbPath = FindCodeGraphDb();
 
                     if (string.IsNullOrEmpty(dbPath) || !File.Exists(dbPath))
-                        return "Error: CodeGraph database not found. Specify db_path or ensure a .codegraph.db exists next to the open solution.";
+                        return "Error: CodeGraph database not found. Specify db_path or ensure a .codegraph.db exists next to the open solution." + NoSolutionSuffix();
 
                     return ExecuteCodeGraphQuery(dbPath, sql);
                 }
@@ -2223,7 +2520,8 @@ COMMON QUERIES:
             Register(new McpTool
             {
                 Name = "list_codegraph_databases",
-                Description = "List available CodeGraph databases (.codegraph.db files) that have been indexed.",
+                Description = "List available CodeGraph databases (.codegraph.db files) that have been indexed, each with the indexer "
+                    + "version and feature level that built it; one marked STALE predates the current indexer's features and should be re-indexed.",
                 InputSchema = McpJsonRpc.BuildSchema(new Dictionary<string, string>()),
                 RequiresUiThread = false,
                 Handler = args =>
@@ -2253,14 +2551,29 @@ COMMON QUERIES:
 
                     if (results.Count == 0)
                         return "No CodeGraph databases found. Run the CodeGraph indexer on a Clarion solution first.";
-                    return string.Join("\n", results);
+                    // Which indexer built each one (read-only), so an index from before a feature level - e.g.
+                    // without CLASS MODULE/LINK files or INCLUDEd global data - is visibly stale.
+                    var lines = new List<string>();
+                    foreach (string db in results)
+                        lines.Add(db + "  [" + (string.Equals(db, libDb, StringComparison.OrdinalIgnoreCase)
+                            ? "Clarion library index (built by LibraryIndexer, not the solution indexer)"
+                            : ClarionCodeGraph.Graph.CodeGraphIndexer.DescribeDatabase(db)) + "]");
+                    return string.Join("\n", lines);
                 }
             });
 
             Register(new McpTool
             {
                 Name = "get_solution_info",
-                Description = "Get the currently selected Clarion solution, version/build, .red file path, and CodeGraph database status.",
+                Description = "Get the currently selected Clarion solution, the Clarion version its BUILD uses (versionName, clarionRoot - "
+                    + "Build > Set Clarion Version can make this a different Clarion from the IDE's own install), the active .red "
+                    + "(activeRedFile), the IDE's active build configuration for it (buildConfiguration), its search paths for .clw, "
+                    + ".inc and templates (clwSearchPaths, incSearchPaths, tplSearchPaths; tplAbsoluteSearchPaths anchors relative "
+                    + "entries at baseDir), and CodeGraph database status. "
+                    + "solutionSource says where the solution came from: 'ide-live' (the solution open in the IDE now - "
+                    + "this tab follows it), 'launch-arg' (--solution; the IDE has published none) or 'none'; after a "
+                    + "switch, switchedFrom names the solution it replaced. "
+                    + "Take the Clarion root and .red from here, never from memory.",
                 InputSchema = McpJsonRpc.BuildSchema(new Dictionary<string, string>()),
                 RequiresUiThread = true,
                 Handler = args =>
@@ -2268,26 +2581,52 @@ COMMON QUERIES:
                     if (_workspace == null)
                         return "Error: chat control not initialized";
 
-                    // Check the live IDE state first — the cached path may be stale
-                    string ideSlnPath = _workspace.GetHostOpenSolutionPath();
-                    string slnPath = !string.IsNullOrEmpty(ideSlnPath) ? ideSlnPath : _workspace.CurrentSolutionPath;
+                    // 9e1bd280: WHERE THE SOLUTION CAME FROM. The standalone follows the IDE (ide-live), falls back to
+                    // its --solution while the IDE has published nothing (launch-arg), and says none when the IDE
+                    // closed it. One snapshot, so the path, its source and the switch are read together - and (run 1)
+                    // the database, version and .red below come from that SAME snapshot, never a second read: a switch
+                    // mid-call answered for two solutions at once.
+                    var snap = SnapshotSolution(false);
+                    SolutionSourceSnapshot source = snap.Source;
+                    if (source != null && source.Source == SolutionSourceSnapshot.None)
+                    {
+                        var none = new Dictionary<string, object>
+                        {
+                            { "solutionPath", "(none open)" },
+                            { "solutionSource", source.Source },
+                            { "solutionSourceNote", source.Note },
+                            { "isIndexed", false },
+                            { "lastIndexed", "(never)" },
+                            { "note", "No solution is open in the IDE, so the solution tools (CodeGraph, build, .red) have "
+                                + "nothing to work on. Open one in the IDE; this tab follows it." }
+                        };
+                        AddSwitch(none, source);
+                        return none;
+                    }
 
-                    // If nothing is open in the IDE and we only have a cached path, report no solution
+                    // Check the live IDE state first — the cached path may be stale
+                    string ideSlnPath = source != null ? source.Path : _workspace.GetHostOpenSolutionPath();
+                    string slnPath = !string.IsNullOrEmpty(ideSlnPath) ? ideSlnPath : snap.SolutionPath;
+
+                    // If nothing is open in the IDE and we only have a cached path, report no solution - with the
+                    // same field names as the follower's "none" above (9e1bd280 run 1): switchedFrom, not a
+                    // second name for the solution it had.
                     if (string.IsNullOrEmpty(ideSlnPath) && !string.IsNullOrEmpty(slnPath))
                     {
                         return new Dictionary<string, object>
                         {
                             { "solutionPath", "(none open)" },
-                            { "lastSelectedPath", slnPath },
+                            { "solutionSource", SolutionSourceSnapshot.None },
+                            { "switchedFrom", slnPath },
                             { "isIndexed", false },
                             { "lastIndexed", "(never)" },
-                            { "note", "No solution is currently open in the IDE. The lastSelectedPath was the most recently selected solution." }
+                            { "note", "No solution is currently open in the IDE. switchedFrom is the most recently selected solution." }
                         };
                     }
 
-                    string dbPath = _workspace.CurrentDbPath;
+                    string dbPath = snap.DbPath;
                     bool hasDb = !string.IsNullOrEmpty(dbPath) && File.Exists(dbPath);
-                    var vConfig = _workspace.CurrentVersionConfig;
+                    var vConfig = snap.Version;
 
                     var result = new Dictionary<string, object>
                     {
@@ -2296,17 +2635,36 @@ COMMON QUERIES:
                         { "isIndexed", hasDb },
                         { "lastIndexed", hasDb ? File.GetLastWriteTime(dbPath).ToString("yyyy-MM-dd HH:mm:ss") : "(never)" }
                     };
+                    // In the addin the solution IS the IDE's (ideSlnPath came from it): ide-live too.
+                    result["solutionSource"] = source != null ? source.Source
+                        : (!string.IsNullOrEmpty(ideSlnPath) ? SolutionSourceSnapshot.IdeLive : SolutionSourceSnapshot.None);
+                    if (source != null)
+                    {
+                        result["solutionSourceNote"] = source.Note;
+                        AddSwitch(result, source);
+                    }
 
                     // Which tier chose the version, or why there is none (GH #247) — read after CurrentVersionConfig,
                     // which is what fills it in.
                     // 0ce0b5e2: the addin says it too - there the IDE's own Build > Set Clarion Version decides.
-                    var noteSource = _workspace as IVersionNoteSource;
-                    string versionNote = noteSource != null ? noteSource.VersionNote : VersionNoteForAddin(vConfig);
+                    string versionNote = snap.VersionNote;
                     if (!string.IsNullOrEmpty(versionNote))
                         result["versionNote"] = versionNote;
                     string versionWarning = SolutionVersionResolver.ProjectVersionWarning(slnPath, vConfig);
                     if (versionWarning != null)
                         result["versionWarning"] = versionWarning;
+                    // e1df6c2e (GH #244): WHICH ClarionProperties.xml the version's macros and paths came from, and
+                    // why that settings folder (a /ConfigDir one, or the default). Every Clarion's file carries a copy
+                    // of every version's entry, so the version name alone does not say what was read.
+                    if (vConfig != null && !string.IsNullOrEmpty(vConfig.SourcePropertiesXml))
+                        result["settingsFile"] = vConfig.SourcePropertiesXml;
+                    if (!string.IsNullOrEmpty(snap.SettingsNote))
+                        result["settingsChosenBy"] = snap.SettingsNote;
+                    // ...and, under the plugin launcher, why THIS server (which Clarion's install) was started.
+                    var launch = _workspace as IServerLaunchInfo;
+                    string launchNote = launch != null ? launch.ServerChosenBy : null;
+                    if (!string.IsNullOrEmpty(launchNote))
+                        result["serverChosenBy"] = launchNote;
 
                     if (vConfig != null)
                     {
@@ -2319,7 +2677,7 @@ COMMON QUERIES:
                             result["macros"] = vConfig.Macros;
                     }
 
-                    var red = _workspace.RedFile;
+                    var red = snap.Red;
                     if (red != null && red.RedFilePath != null)
                     {
                         result["activeRedFile"] = red.RedFilePath;
@@ -2327,7 +2685,34 @@ COMMON QUERIES:
                         // Include CLW and INC search paths so the AI knows where classes live
                         result["clwSearchPaths"] = red.GetSearchPaths(".clw");
                         result["incSearchPaths"] = red.GetSearchPaths(".inc");
+                        // 5a5581e6: and where templates live. Without it the agent searched drives for a .tpl
+                        // and found one of 60 stale copies. The same sections and folder resolve_red_path uses,
+                        // anchored too, so the list can be Grepped as is.
+                        var scope = RedScopeFor(new Dictionary<string, object>(), snap);
+                        if (scope.Error == null && scope.Red != null)
+                        {
+                            var tplPaths = RedResolution.SearchPaths(scope.Red, TemplateExtensions, scope.Sections);
+                            result["tplSearchPaths"] = tplPaths;
+                            WithAbsolutePaths(result, tplPaths, scope.BaseDir, "tplAbsoluteSearchPaths", "tplUnresolvedEntries");
+                            result["tplSections"] = scope.Sections;
+                            scope.Describe(result);
+                        }
+                        // GH #261: the {include}d files followed, and any that could not be.
+                        if (red.LoadedFiles.Count > 1)
+                            result["redIncludes"] = red.LoadedFiles.Skip(1).ToArray();
+                        if (red.SkippedIncludes.Count > 0)
+                            result["redSkippedIncludes"] = red.SkippedIncludes.ToArray();
                     }
+
+                    // GH #266 (adversary HIGH): when the file tools cannot use the solution's own folder (a network
+                    // drive or share, or a folder holding the profile), say so here rather than let every read fail.
+                    try
+                    {
+                        var policy = McpPathGate.BuildPolicy(_workspace);
+                        if (policy.SolutionNote != null) result["pathPolicy"] = policy.SolutionNote;
+                        if (policy.SkippedRoots.Count > 0) result["pathPolicySkippedRoots"] = policy.SkippedRoots.ToArray();
+                    }
+                    catch (Exception ex) { result["pathPolicy"] = "the path policy could not be evaluated: " + ex.Message; }
 
                     return result;
                 }
@@ -2336,12 +2721,19 @@ COMMON QUERIES:
             Register(new McpTool
             {
                 Name = "resolve_red_path",
-                Description = "Resolve a Clarion filename (e.g. 'MyClass.inc', 'MyClass.clw') to its full path using the active .red (redirection) file. Searches Common section by default. Returns the first existing file match.",
+                Description = "Resolve ANY file the Clarion compiler or template engine finds - templates (.tpl, .tpw), "
+                    + ".inc, .clw, .equ, .trn, .lib, .dll, .ico, ... - to its full path through the active .red (redirection) file. "
+                    + "Use this before any disk search: stale copies of Clarion files abound on disk, and the .red says which one "
+                    + "the build is pointed at. Searches the sections of the build configuration the IDE has active for the solution "
+                    + "('<config>32', '<config>', then 'Common'; only 'Common' when that is unknown), in .red order; a match under any "
+                    + "OTHER section is listed in 'alsoFoundIn', never chosen. Relative entries are anchored at the project's folder "
+                    + "(pass project_name in a multi-project solution; 'baseDir' says which folder was used). Takes a bare file name.",
                 InputSchema = McpJsonRpc.BuildSchema(
                     new Dictionary<string, string>
                     {
-                        { "filename", "The filename to resolve (e.g. 'MyClass.inc', 'StringClass.clw')" },
-                        { "section", "Red file section to search (default: 'Common'). Other options: 'Debug32', 'Release32', 'Copy'" }
+                        { "filename", "The bare file name to resolve, no folder (e.g. 'UltimateSQL.tpl', 'ABUtil.tpw', 'MyClass.inc', 'StringClass.clw', 'equates.clw')" },
+                        { "project_name", "The project whose .red and folder apply (its local version-named .red, and its folder for relative entries). Needed in a multi-project solution; a single-project solution uses its project." },
+                        { "section", "Search only this .red section (e.g. 'Release32', 'Common') instead of the active configuration's." }
                     },
                     new[] { "filename" }),
                 RequiresUiThread = false,
@@ -2351,79 +2743,83 @@ COMMON QUERIES:
                         return "Error: chat control not initialized";
 
                     string fileName = McpJsonRpc.GetString(args, "filename", "");
-                    if (string.IsNullOrEmpty(fileName))
-                        return "Error: filename is required";
+                    // 5a5581e6: a bare name only - a rooted or "..\" name would "match" outside the .red's folders.
+                    string nameError = RedResolution.LeafNameError(fileName);
+                    if (nameError != null)
+                        return "Error: " + nameError;
 
-                    // Prefer the language server's config-aware resolver: it merges the active
-                    // configuration section with Common (and falls back to libsrc), the way the
-                    // compiler does. The local RedFileService only knows the Common section, so it
-                    // misses config-specific paths like .\genfiles\src. Fall back to RedFileService
-                    // only when the LSP is down or the server-side solution hasn't loaded yet.
-                    EnsureLspRunning();
-                    if (_lspClient != null && _lspClient.IsRunning)
+                    var scope = RedScopeFor(args);
+                    if (scope.Error != null)
+                        return "Error: " + scope.Error;
+                    var local = scope.Red != null && scope.Red.RedFilePath != null
+                        ? RedResolution.Resolve(scope.Red, fileName, scope.BaseDir, scope.Sections) : null;
+
+                    // The language server resolves as ONE configuration (LspService.LspConfiguration) for the solution
+                    // folder. Asked unless a section or project was named; its answer is USED only when the IDE's
+                    // configuration is KNOWN to be that one - otherwise it goes to alsoFoundIn (RedResolution.Decide).
+                    string lspPath = null, lspSource = null;
+                    if (!scope.ExplicitSection && !scope.ExplicitProject)
                     {
-                        var hit = _lspClient.FindFile(fileName);
-                        if (hit != null)
+                        EnsureLspRunning();
+                        if (_lspClient != null && _lspClient.IsRunning)
                         {
-                            object p; hit.TryGetValue("path", out p);
-                            string resolvedPath = p as string;
-                            if (!string.IsNullOrEmpty(resolvedPath))
-                            {
-                                object src; hit.TryGetValue("source", out src);
-                                return WithVersion(new Dictionary<string, object>
-                                {
-                                    { "filename", fileName },
-                                    { "resolvedPath", resolvedPath },
-                                    { "found", true },
-                                    { "source", (src as string) ?? "lsp" },
-                                    { "resolver", "lsp" }
-                                }, true);
-                            }
+                            var hit = _lspClient.FindFile(fileName);
+                            object p = null, src = null;
+                            if (hit != null) { hit.TryGetValue("path", out p); hit.TryGetValue("source", out src); }
+                            lspPath = p as string;
+                            lspSource = src as string;
+                            if (string.IsNullOrEmpty(lspPath)) lspPath = null;
                         }
                     }
 
-                    // Fallback: local RedFileService (Common section only).
-                    var red = _workspace.RedFile;
-                    if (red == null || red.RedFilePath == null)
-                        return "Error: no .red file loaded and LSP unavailable. Select a version and solution first.";
+                    if (local == null && lspPath == null)
+                        return "Error: no .red file loaded and LSP unavailable. Select a version and solution first." + NoSolutionSuffix();
 
-                    string section = McpJsonRpc.GetString(args, "section", "Common");
-                    string resolved = red.Resolve(fileName, section);
-                    if (resolved != null)
-                        return WithVersion(new Dictionary<string, object>
-                        {
-                            { "filename", fileName },
-                            { "resolvedPath", resolved },
-                            { "found", true },
-                            { "resolver", "redfile-fallback" }
-                        }, false);
-
-                    // Not found - return the search paths so the user knows where we looked
-                    string ext = System.IO.Path.GetExtension(fileName);
-                    var searchPaths = red.GetSearchPaths(ext, section);
-                    return WithVersion(new Dictionary<string, object>
+                    var decision = RedResolution.Decide(local, lspPath, LspService.LspConfiguration, scope.LspMatchesConfiguration);
+                    var result = new Dictionary<string, object>
                     {
                         { "filename", fileName },
-                        { "found", false },
-                        { "searchedPaths", searchPaths },
-                        { "resolver", "redfile-fallback" }
-                    }, false);
+                        { "found", decision.Path != null },
+                        { "searchedSections", scope.Sections },
+                        { "resolver", decision.Resolver }
+                    };
+                    if (decision.Path != null)
+                    {
+                        result["resolvedPath"] = decision.Path;
+                        result["section"] = decision.Section;
+                        if (decision.Resolver == "lsp") result["source"] = lspSource ?? "lsp";
+                    }
+                    scope.Describe(result);
+                    AddAlsoFoundIn(result, decision.AlsoFoundIn, decision.Path);
+                    if (decision.Path == null && scope.Red != null)
+                    {
+                        // Not found - say where we looked.
+                        var searchPaths = RedResolution.SearchPaths(scope.Red, new[] { Path.GetExtension(fileName) }, scope.Sections);
+                        result["searchedPaths"] = searchPaths;
+                        WithAbsolutePaths(result, searchPaths, scope.BaseDir, "searchedAbsolutePaths");
+                    }
+                    return WithVersion(result, decision.Resolver == "lsp", scope.Snap);
                 }
             });
 
             Register(new McpTool
             {
                 Name = "get_red_search_paths",
-                Description = "Get all search directories for a file extension from the .red file. "
-                    + "When 'project_name' is supplied and the language server is running, results are "
-                    + "config-aware (active configuration section merged with Common, the way the compiler "
-                    + "resolves). Without a project_name, falls back to the local Common-section-only lookup.",
+                Description = "Get all search directories for ANY file extension from the active .red file - templates "
+                    + "('tpl', 'tpw'), 'inc', 'clw', 'equ', 'trn', 'lib', 'dll', 'ico', ... Use this before any disk search: to search "
+                    + "INSIDE Clarion files (e.g. which template writes X), Grep only these directories. The list covers the same "
+                    + ".red sections, in the same order, as resolve_red_path (the IDE's active build configuration, then Common; only "
+                    + "Common when that is unknown), so the order is precedence. 'absoluteSearchPaths' is the same list with relative "
+                    + "entries ('.', '.\\Source') anchored at the project's folder ('baseDir'); 'searchPaths' keeps them as the .red writes "
+                    + "them; entries that cannot be anchored (an unexpanded %MACRO%, a drive-relative path) are in 'unresolvedEntries'. "
+                    + "Pass project_name in a multi-project solution. When the language server is running and resolves as the same "
+                    + "configuration, a project_name lookup returns its paths instead.",
                 InputSchema = McpJsonRpc.BuildSchema(
                     new Dictionary<string, string>
                     {
-                        { "extension", "File extension to look up (e.g. 'clw', 'inc', 'lib', 'dll')" },
-                        { "section", "Red file section for the local fallback (default: 'Common'). Ignored when project_name drives the config-aware LSP lookup." },
-                        { "project_name", "Project name for config-aware resolution via the language server. When set and the LSP is running, returns active-config + Common search paths." }
+                        { "extension", "File extension to look up (e.g. 'tpl', 'tpw', 'clw', 'inc', 'equ', 'lib', 'dll')" },
+                        { "section", "Search only this .red section (e.g. 'Release32', 'Common') instead of the active configuration's. Skips the language server." },
+                        { "project_name", "The project whose .red and folder apply. Needed in a multi-project solution; also scopes the language server lookup." }
                     },
                     new[] { "extension" }),
                 RequiresUiThread = false,
@@ -2436,10 +2832,13 @@ COMMON QUERIES:
                     if (string.IsNullOrEmpty(ext))
                         return "Error: extension is required";
 
+                    var scope = RedScopeFor(args);
+                    if (scope.Error != null)
+                        return "Error: " + scope.Error;
                     string projectName = McpJsonRpc.GetString(args, "project_name", "");
 
-                    // Config-aware path: delegate to the server when we have a project to scope it to.
-                    if (!string.IsNullOrEmpty(projectName))
+                    // The server's view, when it is the same configuration as the IDE's (or that is unknown).
+                    if (!string.IsNullOrEmpty(projectName) && !scope.ExplicitSection && scope.LspMatchesConfiguration)
                     {
                         EnsureLspRunning();
                         if (_lspClient != null && _lspClient.IsRunning)
@@ -2447,30 +2846,35 @@ COMMON QUERIES:
                             string normalizedExt = ext.StartsWith(".") ? ext : "." + ext;
                             var serverPaths = _lspClient.GetServerSearchPaths(projectName, normalizedExt);
                             if (serverPaths != null && serverPaths.Count > 0)
-                                return WithVersion(new Dictionary<string, object>
+                            {
+                                var fromLsp = new Dictionary<string, object>
                                 {
                                     { "extension", ext },
                                     { "projectName", projectName },
                                     { "searchPaths", serverPaths },
-                                    { "resolver", "lsp" }
-                                }, true);
+                                    { "resolver", "lsp" },
+                                    { "configurationNote", "the language server resolves as configuration '" + LspService.LspConfiguration + "'" }
+                                };
+                                return WithVersion(WithAbsolutePaths(fromLsp, serverPaths, scope.BaseDir), true);
+                            }
                         }
                     }
 
-                    // Fallback: local RedFileService (single section, default Common).
-                    var red = _workspace.RedFile;
-                    if (red == null || red.RedFilePath == null)
-                        return "Error: no .red file loaded and LSP unavailable. Select a version and solution first.";
+                    // Local: the same sections, in the same order, as resolve_red_path.
+                    if (scope.Red == null || scope.Red.RedFilePath == null)
+                        return "Error: no .red file loaded and LSP unavailable. Select a version and solution first." + NoSolutionSuffix();
 
-                    string section = McpJsonRpc.GetString(args, "section", "Common");
-                    return WithVersion(new Dictionary<string, object>
+                    var paths = RedResolution.SearchPaths(scope.Red, new[] { ext }, scope.Sections);
+                    var result = new Dictionary<string, object>
                     {
                         { "extension", ext },
-                        { "section", section },
-                        { "searchPaths", red.GetSearchPaths(ext, section) },
-                        { "redFile", red.RedFilePath },
-                        { "resolver", "redfile-fallback" }
-                    }, false);
+                        { "sections", scope.Sections },
+                        { "searchPaths", paths },
+                        { "redFile", scope.Red.RedFilePath },
+                        { "resolver", "redfile" }
+                    };
+                    scope.Describe(result);
+                    return WithVersion(WithAbsolutePaths(result, paths, scope.BaseDir), false, scope.Snap);
                 }
             });
 
@@ -2481,7 +2885,7 @@ COMMON QUERIES:
                 InputSchema = McpJsonRpc.BuildSchema(
                     new Dictionary<string, string>
                     {
-                        { "incremental", "Set to 'true' for incremental update (only changed files), 'false' for full re-index (default: false)" }
+                        { "incremental", "Set to 'true' for incremental update (only changed files), 'false' for full re-index (default: false). An incremental request on a database built by an older indexer runs full automatically" }
                     }),
                 RequiresUiThread = true,
                 Handler = args =>
@@ -2500,7 +2904,7 @@ COMMON QUERIES:
                     // check against the same value, so this cannot disagree with it.
                     string slnForIndex = _workspace.CurrentSolutionPath;
                     if (string.IsNullOrEmpty(slnForIndex) || !File.Exists(slnForIndex))
-                        return "Error: no solution is selected, so there is nothing to index.";
+                        return "Error: no solution is selected, so there is nothing to index." + NoSolutionSuffix();
 
                     _workspace.RunIndex(isIncremental);
                     return isIncremental
@@ -2960,6 +3364,12 @@ COMMON QUERIES:
                 {
                     string filePath = McpJsonRpc.GetString(args, "file_path");
                     if (string.IsNullOrEmpty(filePath)) return "Error: file_path is required.";
+                    // GH #205 pipeline run 3 (security LOW): this returns buffer TEXT, so it is read-gated by the #266
+                    // path policy like read_file. A refusal is returned as is; the standalone's lsp_diagnostics then
+                    // checks the file on disk and says why (IdeLiveTextClient: "the IDE refused").
+                    string liveChecked;
+                    string liveRefused = McpPathGate.GatePath("get_live_text", filePath, PathAccess.Read, _workspace, out liveChecked);
+                    if (liveRefused != null) return liveRefused;
                     var provider = SharedLspBridge.LiveTextProvider;
                     SharedLspBridge.LiveText live = null;
                     if (provider != null)
@@ -2981,6 +3391,121 @@ COMMON QUERIES:
                     answer["lineOffset"] = live.LineOffset;
                     if (!string.IsNullOrEmpty(live.Procedure)) answer["procedure"] = live.Procedure;
                     return answer;
+                }
+            });
+
+            // GH #205: the IDE half of write_file/append_to_file's open-tab guard (OpenTabGuard). Those two are served by
+            // the standalone clarion-mcp-server, which has no editors, so it calls THIS over the pane's endpoint
+            // (IdeTabClient) before writing, and again after, to reload a clean native tab. IdeOnly: only the IDE can
+            // answer it. The UI work inside is bounded (Post + wait, never Invoke), so this tool is not RequiresUiThread.
+            Register(new McpTool
+            {
+                Name = "editor_tab_sync",
+                IdeOnly = true,
+                Description = "Internal, for write_file/append_to_file (you do not normally call it). action 'check': is the file open " +
+                    "in an IDE editor tab - { kind: none | native | ca-editor, dirty }. action 'reload': reload a NATIVE Clarion " +
+                    "editor tab of the file from disk, keeping the caret line - { reloaded, line, reason }; refused when that tab has " +
+                    "unsaved changes, so it never discards edits. action 'release': the write the check was for did not happen; give " +
+                    "the IDE's file watcher of that tab back now.",
+                InputSchema = McpJsonRpc.BuildSchema(
+                    new Dictionary<string, string>
+                    {
+                        { "file_path", "Absolute path of the file" },
+                        { OpenTabGuard.AlsoPathArg, "Optional: another spelling of the same file (the caller's, before link resolution); tabs are matched against both, by file identity" },
+                        { "action", "'check', 'reload' or 'release'" },
+                        { OpenTabGuard.HoldArg, "check only, set by write_file/append_to_file: hold the IDE's file watcher of a clean native tab until the reload (only for a path this IDE allows writing)" },
+                        { OpenTabGuard.HoldIdArg, "The write's holder token (one per check; 8-64 of A-Z a-z 0-9 -): a holding check answers held: [{view, token}]; reload and release name it and drop only that holder" }
+                    },
+                    new[] { "file_path", "action" }),
+                RequiresUiThread = false,
+                Handler = args =>
+                {
+                    string filePath = McpJsonRpc.GetString(args, "file_path");
+                    string action = (McpJsonRpc.GetString(args, "action") ?? "").Trim().ToLowerInvariant();
+                    if (string.IsNullOrEmpty(filePath)) return "Error: file_path is required.";
+                    // GH #205 re-review (holder tokens): null = none sent (an older standalone); "" = malformed (no hold,
+                    // matches no holder).
+                    string holdId = OpenTabGuard.ParseHoldId(args);
+                    var spellings = OpenTabGuard.Spellings(filePath, McpJsonRpc.GetString(args, OpenTabGuard.AlsoPathArg));
+                    // GH #266 + GH #205 pipeline run 4: EVERY spelling (file_path and also_path - both are the caller's
+                    // choice) goes through the read gate. Only an allowed spelling is looked up by file identity, which opens
+                    // a handle; a refused one is compared as text only, so \\attacker\share\x can never make this IDE
+                    // authenticate to that host (and FileIdentity never opens a network path anyway). This covers 'reload'
+                    // too: a refused path can only reload a tab already open under that very name.
+                    var gated = new List<OpenTabGuard.GatedSpelling>();
+                    foreach (var sp in spellings)
+                    {
+                        string canonical;
+                        McpPathPolicy unusedPolicy;
+                        bool outsideRoots;
+                        string refusal = McpPathGate.GatePath("editor_tab_sync", sp, PathAccess.Read, _workspace, out canonical, out unusedPolicy, out outsideRoots);
+                        gated.Add(new OpenTabGuard.GatedSpelling { Path = refusal == null ? (canonical ?? sp) : sp, Refusal = refusal, OutsideRoots = outsideRoots });
+                    }
+                    if (action == "check")
+                    {
+                        // Pipeline run 3: the gate's verdict does NOT stop the tab lookup (the IDE's roots and the writer's
+                        // differ). Refused spellings are looked up by name only; out of scope only with no matching tab, every
+                        // refusal "outside every allowed root" and a workspace; else a failed check (OpenTabGuard.CheckGated).
+                        bool hasSolution = false;
+                        try
+                        {
+                            string sln = _workspace != null ? _workspace.CurrentSolutionPath : null;
+                            hasSolution = !string.IsNullOrEmpty(sln) && File.Exists(sln);
+                        }
+                        catch { }
+                        // GH #205 review (SEC MED): only the write path's check (hold: true) may hold the IDE's file watcher
+                        // of a clean native tab, and only for a spelling that passes the #266 WRITE gate here: a path this
+                        // IDE would not let a tool write can never have its tab's watcher switched off. The read gate above
+                        // still decides the lookup itself. (Why a flag and not proof: see NativeTabSync's class comment.)
+                        var holdable = new List<string>();
+                        if (OpenTabGuard.ParseFlag(args, OpenTabGuard.HoldArg) && holdId != "")
+                            foreach (var sp in spellings)
+                            {
+                                string writeCanonical;
+                                McpPathPolicy unusedWritePolicy;
+                                bool unusedOutside;
+                                if (McpPathGate.GatePath("editor_tab_sync", sp, PathAccess.Write, _workspace, out writeCanonical, out unusedWritePolicy, out unusedOutside) == null)
+                                    holdable.Add(writeCanonical ?? sp);
+                            }
+                        var holdCheck = OpenTabGuard.LocalCheckHold;
+                        Func<IList<string>, TabProbe> fullCheck = holdable.Count > 0 && holdCheck != null
+                            ? (Func<IList<string>, TabProbe>)(paths => holdCheck(paths, holdable, holdId))
+                            : OpenTabGuard.LocalCheck;
+                        var p = OpenTabGuard.CheckGated(gated, _workspace != null, hasSolution, fullCheck, OpenTabGuard.LocalCheckLexical,
+                            note => McpPathAudit.Write("editor_tab_sync", "LOOKUP", filePath, note));
+                        return OpenTabGuard.CheckToWire(p);
+                    }
+                    if (action == "release")
+                    {
+                        // GH #205 review F1-1 + re-review: the writer's write did not happen (or no reload follows); drop ITS
+                        // watcher holder now - by its hold_id only (no tab lookup, so a busy UI thread cannot stop it; D2).
+                        // An unknown hold_id is a silent no-op; none at all (an older standalone) releases nothing. Releasing
+                        // only gives the IDE its watcher back.
+                        var release = OpenTabGuard.LocalRelease;
+                        TabReload r;
+                        try
+                        {
+                            r = string.IsNullOrEmpty(holdId) ? new TabReload { Reason = "nothing to release (no hold_id)" }
+                                : release != null ? release(holdId) : new TabReload { Reason = "the IDE's release is not registered" };
+                        }
+                        catch (Exception ex) { r = new TabReload { Reason = "the release failed: " + ex.Message }; }
+                        var answer = new Dictionary<string, object>();
+                        answer["released"] = true;
+                        answer["detail"] = r != null ? r.Reason : null;
+                        return answer;
+                    }
+                    if (action == "reload")
+                    {
+                        var byIdentity = new List<string>();
+                        var byName = new List<string>();
+                        foreach (var g in gated) (g.Refusal == null ? byIdentity : byName).Add(g.Path);
+                        var reload = OpenTabGuard.LocalReload;
+                        TabReload r;
+                        try { r = reload != null ? reload(byIdentity, byName, holdId) : null; }
+                        catch (Exception ex) { r = new TabReload { Reason = "the reload failed: " + ex.Message }; }
+                        return OpenTabGuard.ReloadToWire(r);
+                    }
+                    return "Error: action must be 'check', 'reload' or 'release'.";
                 }
             });
 
@@ -3152,6 +3677,19 @@ IdeOnly = true,
 
                     string originalFile = McpJsonRpc.GetString(args, "original_file");
                     string modifiedFile = McpJsonRpc.GetString(args, "modified_file");
+                    // b8f9431c H1: both caller-named files go through the #266 path policy, as read_file, before either is
+                    // read (a UNC path is never touched). get_diff_content returns only what this loaded, so it is covered.
+                    // The active editor's own path (modified_from_active_editor with no original_file) is the developer's.
+                    if (!string.IsNullOrEmpty(originalFile))
+                    {
+                        string refusal = McpPathGate.GatePath("show_diff", originalFile, PathAccess.Read, _workspace, out originalFile);
+                        if (refusal != null) return refusal;
+                    }
+                    if (!string.IsNullOrEmpty(modifiedFile))
+                    {
+                        string refusal = McpPathGate.GatePath("show_diff", modifiedFile, PathAccess.Read, _workspace, out modifiedFile);
+                        if (refusal != null) return refusal;
+                    }
 
                     // modified_from_active_editor — fetch the live editor buffer in-process (same source
                     // get_active_file uses) instead of requiring the caller to round-trip the content
@@ -3462,7 +4000,7 @@ Rebuilds both the bundled and the personal DocGraph DBs when both exist.",
             Register(new McpTool
             {
                 Name = "build_solution",
-                Description = "Build the entire loaded Clarion solution using ClarionCL.exe. Returns build output with errors and warnings. Use build_app instead for multi-DLL solutions when you only need to rebuild one target.",
+                Description = "Run ClarionCL.exe template generation (/ag) over the loaded Clarion solution: every .app in the .sln is generated, NOT compiled. ClarionCL has no compile step, so no .exe/.dll is produced; compile in the IDE or with MSBuild. Hand-written source projects (no .app) are left alone by /ag and listed as such; a solution with no .app at all is refused. The result lists every project's kind (app-generated or source) with its evidence and its real OUTPUT file (from the .cwproj's OutputName/OutputType/OutputPath for the IDE's active configuration, else the .red) with whether it exists and when it was last written (existing output, not produced by this call). Use build_app for one target.",
                 InputSchema = McpJsonRpc.BuildSchema(
                     new Dictionary<string, string>
                     {
@@ -3479,7 +4017,7 @@ Rebuilds both the bundled and the personal DocGraph DBs when both exist.",
                         slnPath = _workspace.GetHostOpenSolutionPath();
 
                     if (string.IsNullOrEmpty(slnPath) || !File.Exists(slnPath))
-                        return "Error: No solution path provided and no solution is currently loaded in the IDE.";
+                        return "Error: No solution path provided and no solution is currently loaded in the IDE." + NoSolutionSuffix();
 
                     string clarionRoot = _workspace.GetClarionInstallPath();
                     if (string.IsNullOrEmpty(clarionRoot))
@@ -3492,7 +4030,28 @@ Rebuilds both the bundled and the personal DocGraph DBs when both exist.",
                     // /au suppresses the app/dct upgrade prompt — a modal dialog would
                     // otherwise sit invisibly (CreateNoWindow) until the timeout kills us.
                     string arguments = "/au /ag \"" + slnPath + "\"";
-                    return RunBuildProcess(clarionCl, arguments, Path.GetDirectoryName(slnPath), timeout, "build_solution", slnPath, exitCodeIsErrorCount: true);
+
+                    // GH #204: what each project is and where its binary goes, read from the .sln and .cwproj files.
+                    var projects = SolutionProjectsFor(slnPath);
+                    var solutionApps = ClarionBuildTarget.SolutionItemApps(slnPath);
+                    bool anyApp = solutionApps.Count > 0;
+                    foreach (var p in projects) if (p.Error == null && p.Kind == ClarionProjectKind.App) anyApp = true;
+                    Func<string> describeAll = () =>
+                    {
+                        var sb = new StringBuilder();
+                        foreach (var p in projects) sb.Append(ClarionBuildTarget.Describe(p));
+                        return sb.ToString();
+                    };
+                    if (!anyApp && projects.Count > 0)
+                        return "Error: " + Path.GetFileName(slnPath) + " has no .app-driven project (and no .app under Solution Items); nothing to generate.\n"
+                             + "build_solution runs ClarionCL /ag, which only generates source from .app files and has no compile step. "
+                             + "Compile these source projects in the IDE, or with MSBuild per .cwproj (e.g. through run_command):\n"
+                             + string.Join("\n", projects.Where(p => p.Error == null)
+                                   .Select(p => "  " + ClarionBuildTarget.MsBuildCommand(p, FindMSBuild(), clarionRoot)).ToArray())
+                             + "\n\n" + describeAll();
+
+                    return RunBuildProcess(clarionCl, arguments, Path.GetDirectoryName(slnPath), timeout, "build_solution", slnPath, exitCodeIsErrorCount: true,
+                                           resultPreamble: describeAll);
                 }
             });
 
@@ -3500,28 +4059,24 @@ Rebuilds both the bundled and the personal DocGraph DBs when both exist.",
             {
                 Name = "build_app",
 IdeOnly = true,
-                Description = "Build a single Clarion .app file using ClarionCL.exe. Ideal for multi-DLL solutions where you only need to rebuild one target. Defaults to the currently active app in the IDE.",
+                Description = "Run ClarionCL.exe template generation (/ag) for ONE .app-driven project: generated, NOT compiled. ClarionCL has no compile step, so this produces .clw/.inc source, never the .exe/.dll; compile in the IDE or with MSBuild. Ideal for multi-DLL solutions where only one target changed. Defaults to the currently active app in the IDE. Accepts project_path (.cwproj): a hand-written source project (no .app) is refused with the MSBuild command that compiles it. Every result names the project kind (app-generated or source) with its evidence, and the real OUTPUT file (from the .cwproj's OutputName/OutputType/OutputPath for the IDE's active configuration, else the .red) with whether it exists and when it was last written; that file is existing output, not produced by this call. app_path / project_path need read access only: ClarionCL writes the app's own generated modules, in its folder.",
                 InputSchema = McpJsonRpc.BuildSchema(
                     new Dictionary<string, string>
                     {
-                        { "app_path", "Path to .app file. Defaults to the currently active app in the IDE." },
+                        { "app_path", "Path to .app file. Defaults to the currently active app in the IDE. A .cwproj here is treated as project_path." },
+                        { "project_path", "Path to a .cwproj instead of an .app: its .app is found beside it or in the .sln's Solution Items. A source project (no .app) is refused." },
                         { "timeout", "Timeout in seconds (default: 120)" }
                     }),
                 RequiresUiThread = false,
                 Handler = args =>
                 {
-                    string appPath = McpJsonRpc.GetString(args, "app_path", null);
-                    int timeout = McpJsonRpc.GetInt(args, "timeout", 120);
+                    int timeout = CapBuildTimeout(McpJsonRpc.GetInt(args, "timeout", 120));
 
-                    if (string.IsNullOrEmpty(appPath))
-                    {
-                        var appInfo = _appTree.GetAppInfo();
-                        if (appInfo != null && appInfo.ContainsKey("fileName"))
-                            appPath = appInfo["fileName"]?.ToString();
-                    }
-
-                    if (string.IsNullOrEmpty(appPath) || !File.Exists(appPath))
-                        return "Error: No app path provided and no .app file is currently open in the IDE.";
+                    var target = ResolveClarionClTarget("build_app", args);
+                    if (target.Error != null) return target.Error;
+                    string refusal = ClarionClRefusal("build_app", target);
+                    if (refusal != null) return refusal;
+                    string appPath = target.AppPath;
 
                     string clarionRoot = _workspace.GetClarionInstallPath();
                     if (string.IsNullOrEmpty(clarionRoot))
@@ -3533,7 +4088,8 @@ IdeOnly = true,
 
                     // /au suppresses the app/dct upgrade prompt (see build_solution).
                     string arguments = "/au /ag \"" + appPath + "\"";
-                    return RunBuildProcess(clarionCl, arguments, Path.GetDirectoryName(appPath), timeout, "build_app", appPath, exitCodeIsErrorCount: true);
+                    return RunBuildProcess(clarionCl, arguments, Path.GetDirectoryName(appPath), timeout, "build_app", appPath, exitCodeIsErrorCount: true,
+                                           resultPreamble: () => target.Describe());
                 }
             });
 
@@ -3541,11 +4097,12 @@ IdeOnly = true,
             {
                 Name = "generate_source",
 IdeOnly = true,
-                Description = "Generate Clarion source code (.clw/.inc files) from an .app file using ClarionCL.exe without a full build. Runs template code generation to produce the source files. Defaults to the currently active app.",
+                Description = "Generate Clarion source code (.clw/.inc files) from an .app file using ClarionCL.exe template generation (/ag): generated, NOT compiled. Defaults to the currently active app. Accepts project_path (.cwproj): a hand-written source project with no .app is refused (\"nothing to generate\") instead of running ClarionCL into a misleading \"no templates have been registered\" error. The result names the project kind with its evidence and the real OUTPUT file with whether it exists and when it was last written (existing output, not produced by this call). app_path / project_path need read access only: ClarionCL writes the app's own generated modules, in its folder.",
                 InputSchema = McpJsonRpc.BuildSchema(
                     new Dictionary<string, string>
                     {
-                        { "app_path", "Path to .app file. Defaults to the currently active app in the IDE." },
+                        { "app_path", "Path to .app file. Defaults to the currently active app in the IDE. A .cwproj here is treated as project_path." },
+                        { "project_path", "Path to a .cwproj instead of an .app: its .app is found beside it or in the .sln's Solution Items. A source project (no .app) is refused." },
                         { "conditional_generation", "on/off — toggle conditional code generation (default: use app setting)" },
                         { "debug_generation", "on/off — toggle #DEBUG generation (default: use app setting)" },
                         { "timeout", "Timeout in seconds (default: 120)" }
@@ -3553,20 +4110,19 @@ IdeOnly = true,
                 RequiresUiThread = false,
                 Handler = args =>
                 {
-                    string appPath = McpJsonRpc.GetString(args, "app_path", null);
                     string condGen = McpJsonRpc.GetString(args, "conditional_generation", null);
                     string debugGen = McpJsonRpc.GetString(args, "debug_generation", null);
-                    int timeout = McpJsonRpc.GetInt(args, "timeout", 120);
+                    int timeout = CapBuildTimeout(McpJsonRpc.GetInt(args, "timeout", 120));
+                    // b8f9431c L1: these are appended to ClarionCL's command line, so only on/off is accepted (never
+                    // free text: a quote or a further switch would reach the command line as it came).
+                    string onOffError = OnOffArgument("conditional_generation", ref condGen) ?? OnOffArgument("debug_generation", ref debugGen);
+                    if (onOffError != null) return onOffError;
 
-                    if (string.IsNullOrEmpty(appPath))
-                    {
-                        var appInfo = _appTree.GetAppInfo();
-                        if (appInfo != null && appInfo.ContainsKey("fileName"))
-                            appPath = appInfo["fileName"]?.ToString();
-                    }
-
-                    if (string.IsNullOrEmpty(appPath) || !File.Exists(appPath))
-                        return "Error: No app path provided and no .app file is currently open in the IDE.";
+                    var target = ResolveClarionClTarget("generate_source", args);
+                    if (target.Error != null) return target.Error;
+                    string refusal = ClarionClRefusal("generate_source", target);
+                    if (refusal != null) return refusal;
+                    string appPath = target.AppPath;
 
                     string clarionRoot = _workspace.GetClarionInstallPath();
                     if (string.IsNullOrEmpty(clarionRoot))
@@ -3584,7 +4140,8 @@ IdeOnly = true,
                     if (!string.IsNullOrEmpty(debugGen))
                         argBuilder.Append(" /agd " + debugGen);
 
-                    return RunBuildProcess(clarionCl, argBuilder.ToString(), Path.GetDirectoryName(appPath), timeout, "generate_source", appPath, exitCodeIsErrorCount: true);
+                    return RunBuildProcess(clarionCl, argBuilder.ToString(), Path.GetDirectoryName(appPath), timeout, "generate_source", appPath, exitCodeIsErrorCount: true,
+                                           resultPreamble: () => target.Describe());
                 }
             });
 
@@ -4020,15 +4577,22 @@ IdeOnly = true,
             });
 
             // ── Everything Search Tools ──────────────────────────────────────
+            //
+            // GH #266: these used to search the WHOLE Everything index - every drive, every profile - and Claude
+            // Code's permission rules never see an MCP tool. Every query now goes through McpPathGate.Search: it is
+            // scoped server-side to the path policy's roots and every result is filtered again before it is
+            // returned. max_results is clamped (1..1000), queries that name nothing are refused, and
+            // search_content (file CONTENTS) is off unless Mcp.EverythingContentSearch=true.
 
             Register(new McpTool
             {
                 Name = "search_files",
-                Description = "Instant file search using Everything (voidtools). Searches file/folder names across all indexed drives.",
+                Description = "Instant file search using Everything (voidtools). Searches file/folder names within the allowed roots only " +
+                              "(the solution and project folders, the Clarion root, the .red search folders, Mcp.AllowedRoots). " + SearchScopeNote,
                 InputSchema = McpJsonRpc.BuildSchema(new Dictionary<string, string>
                 {
-                    { "query", "Search query for file names" },
-                    { "max_results?", "Maximum results to return (default: 100, max: 1000)" },
+                    { "query", "Search query for file names (must name something: bare '*' or '*.*' is refused)" },
+                    { "max_results?", "Maximum results to return (default: 100, max: 1000, enforced)" },
                     { "match_case?", "Enable case-sensitive search (true/false)" },
                     { "match_whole_word?", "Match whole words only (true/false)" },
                     { "regex?", "Enable regular expression search (true/false)" }
@@ -4038,21 +4602,23 @@ IdeOnly = true,
                 {
                     string query = args.ContainsKey("query") ? args["query"]?.ToString() : null;
                     if (string.IsNullOrEmpty(query)) return "Error: query is required.";
+                    if (McpPathGate.IsBareWildcard(query))
+                        return BareWildcardRefusal("search_files", query);
 
+                    int max = McpPathGate.ClampMax(GetIntArg(args, "max_results", 100), 100);
                     var opts = new SearchOptions
                     {
-                        MaxResults = GetIntArg(args, "max_results", 100),
                         MatchCase = GetBoolArg(args, "match_case"),
                         MatchWholeWord = GetBoolArg(args, "match_whole_word"),
                         Regex = GetBoolArg(args, "regex")
                     };
 
-                    var result = EverythingService.Search(query, opts);
-                    if (result.HasError) return "Error: " + result.Error;
-                    if (result.Items.Count == 0) return "No files found matching \"" + query + "\"";
+                    var result = McpPathGate.Search("search_files", _workspace, query, null, null, opts, max);
+                    if (result.Error != null) return "Error: " + result.Error;
+                    if (result.Items.Count == 0) return "No files found matching \"" + query + "\" within the allowed roots." + ScanNote(result);
 
                     var sb = new StringBuilder();
-                    sb.AppendLine("Found " + result.TotalResults + " results (showing " + result.Items.Count + "):");
+                    sb.AppendLine("Found " + result.Items.Count + " results within the allowed roots:" + ScanNote(result));
                     sb.AppendLine();
                     foreach (var item in result.Items)
                         sb.AppendLine("[" + item.Type + "] " + item.FullPath);
@@ -4063,15 +4629,15 @@ IdeOnly = true,
             Register(new McpTool
             {
                 Name = "search_files_advanced",
-                Description = "Advanced file search with path, extension, size, and date filters using Everything.",
+                Description = "Advanced file search with path, extension, size, and date filters using Everything, within the allowed roots only. " + SearchScopeNote,
                 InputSchema = McpJsonRpc.BuildSchema(new Dictionary<string, string>
                 {
-                    { "query", "Search query for file names" },
-                    { "path?", "Limit search to specific path" },
+                    { "query", "Search query for file names ('*' is accepted only together with path or extension)" },
+                    { "path?", "Limit search to a folder inside the allowed roots (a folder outside them is refused)" },
                     { "extension?", "Filter by file extension (e.g., 'txt', 'pdf', 'clw')" },
                     { "size?", "Filter by file size (e.g., '>1mb', '<100kb', '1gb..2gb')" },
                     { "date_modified?", "Filter by date modified (e.g., 'today', 'yesterday', 'thisweek', '2024')" },
-                    { "max_results?", "Maximum results to return (default: 100, max: 1000)" },
+                    { "max_results?", "Maximum results to return (default: 100, max: 1000, enforced)" },
                     { "match_case?", "Enable case-sensitive search (true/false)" },
                     { "match_whole_word?", "Match whole words only (true/false)" },
                     { "regex?", "Enable regular expression search (true/false)" },
@@ -4083,42 +4649,44 @@ IdeOnly = true,
                     string query = args.ContainsKey("query") ? args["query"]?.ToString() : null;
                     if (string.IsNullOrEmpty(query)) return "Error: query is required.";
 
-                    // Build Everything search query with filters
-                    var sb = new StringBuilder();
                     string path = GetStringArg(args, "path");
                     string ext = GetStringArg(args, "extension");
                     string size = GetStringArg(args, "size");
                     string dateMod = GetStringArg(args, "date_modified");
 
-                    if (!string.IsNullOrEmpty(path)) sb.Append("path:\"" + path + "\" ");
-                    if (!string.IsNullOrEmpty(ext)) sb.Append("ext:" + ext + " ");
-                    if (!string.IsNullOrEmpty(size)) sb.Append("size:" + size + " ");
-                    if (!string.IsNullOrEmpty(dateMod)) sb.Append("dm:" + dateMod + " ");
-                    sb.Append(query);
+                    // A bare query is fine once a folder or an extension says what is being listed (still in scope).
+                    if (McpPathGate.IsBareWildcard(query) && string.IsNullOrEmpty(path) && McpPathGate.IsBareWildcard(ext))
+                        return BareWildcardRefusal("search_files_advanced", query);
 
+                    var filters = new StringBuilder();
+                    if (!string.IsNullOrEmpty(ext)) filters.Append("ext:" + ext + " ");
+                    if (!string.IsNullOrEmpty(size)) filters.Append("size:" + size + " ");
+                    if (!string.IsNullOrEmpty(dateMod)) filters.Append("dm:" + dateMod + " ");
+
+                    int max = McpPathGate.ClampMax(GetIntArg(args, "max_results", 100), 100);
                     var opts = new SearchOptions
                     {
-                        MaxResults = GetIntArg(args, "max_results", 100),
                         MatchCase = GetBoolArg(args, "match_case"),
                         MatchWholeWord = GetBoolArg(args, "match_whole_word"),
                         Regex = GetBoolArg(args, "regex"),
                         SortBy = GetStringArg(args, "sort_by")
                     };
 
-                    var result = EverythingService.Search(sb.ToString(), opts);
-                    if (result.HasError) return "Error: " + result.Error;
-                    if (result.Items.Count == 0) return "No files found matching \"" + query + "\"";
+                    var result = McpPathGate.Search("search_files_advanced", _workspace, McpPathGate.IsBareWildcard(query) ? "" : query,
+                                                    filters.ToString(), path, opts, max);
+                    if (result.Error != null) return "Error: " + result.Error;
+                    if (result.Items.Count == 0) return "No files found matching \"" + query + "\" within the allowed roots." + ScanNote(result);
 
-                    var filters = new List<string>();
-                    if (!string.IsNullOrEmpty(path)) filters.Add("path: \"" + path + "\"");
-                    if (!string.IsNullOrEmpty(ext)) filters.Add("extension: " + ext);
-                    if (!string.IsNullOrEmpty(size)) filters.Add("size: " + size);
-                    if (!string.IsNullOrEmpty(dateMod)) filters.Add("date modified: " + dateMod);
+                    var filterNames = new List<string>();
+                    if (!string.IsNullOrEmpty(path)) filterNames.Add("path: \"" + path + "\"");
+                    if (!string.IsNullOrEmpty(ext)) filterNames.Add("extension: " + ext);
+                    if (!string.IsNullOrEmpty(size)) filterNames.Add("size: " + size);
+                    if (!string.IsNullOrEmpty(dateMod)) filterNames.Add("date modified: " + dateMod);
 
                     var output = new StringBuilder();
-                    output.Append("Found " + result.TotalResults + " results");
-                    if (filters.Count > 0) output.Append(" (filtered by " + string.Join(", ", filters) + ")");
-                    output.AppendLine(" (showing " + result.Items.Count + "):");
+                    output.Append("Found " + result.Items.Count + " results within the allowed roots");
+                    if (filterNames.Count > 0) output.Append(" (filtered by " + string.Join(", ", filterNames) + ")");
+                    output.AppendLine(":" + ScanNote(result));
                     output.AppendLine();
                     foreach (var item in result.Items)
                         output.AppendLine("[" + item.Type + "] " + item.FullPath);
@@ -4129,38 +4697,33 @@ IdeOnly = true,
             Register(new McpTool
             {
                 Name = "find_duplicates",
-                Description = "Find duplicate files by filename across all indexed drives using Everything.",
+                Description = "Find duplicate files by filename using Everything, within the allowed roots only. " + SearchScopeNote,
                 InputSchema = McpJsonRpc.BuildSchema(new Dictionary<string, string>
                 {
                     { "filename", "Filename to search for duplicates" },
-                    { "path?", "Limit search to specific path" },
-                    { "max_results?", "Maximum results to return (default: 50)" }
+                    { "path?", "Limit search to a folder inside the allowed roots" },
+                    { "max_results?", "Maximum results to return (default: 50, max: 1000, enforced)" }
                 }),
                 RequiresUiThread = false,
                 Handler = args =>
                 {
                     string filename = args.ContainsKey("filename") ? args["filename"]?.ToString() : null;
                     if (string.IsNullOrEmpty(filename)) return "Error: filename is required.";
+                    if (McpPathGate.IsBareWildcard(filename))
+                        return BareWildcardRefusal("find_duplicates", filename);
 
-                    string searchQuery = filename;
-                    string path = GetStringArg(args, "path");
-                    if (!string.IsNullOrEmpty(path)) searchQuery = "path:\"" + path + "\" " + searchQuery;
+                    int max = McpPathGate.ClampMax(GetIntArg(args, "max_results", 50), 50);
+                    var opts = new SearchOptions { MatchWholeWord = true };
 
-                    var opts = new SearchOptions
-                    {
-                        MaxResults = GetIntArg(args, "max_results", 50),
-                        MatchWholeWord = true
-                    };
+                    var result = McpPathGate.Search("find_duplicates", _workspace, filename, null, GetStringArg(args, "path"), opts, max);
+                    if (result.Error != null) return "Error: " + result.Error;
+                    if (result.Items.Count == 0) return "No files found with name \"" + filename + "\" within the allowed roots." + ScanNote(result);
 
-                    var result = EverythingService.Search(searchQuery, opts);
-                    if (result.HasError) return "Error: " + result.Error;
-                    if (result.Items.Count == 0) return "No files found with name \"" + filename + "\"";
-
-                    if (result.TotalResults == 1)
-                        return "Found only 1 instance of \"" + filename + "\":\n\n[" + result.Items[0].Type + "] " + result.Items[0].FullPath;
+                    if (result.Items.Count == 1)
+                        return "Found only 1 instance of \"" + filename + "\" within the allowed roots:\n\n[" + result.Items[0].Type + "] " + result.Items[0].FullPath;
 
                     var sb = new StringBuilder();
-                    sb.AppendLine("Found " + result.TotalResults + " instances of \"" + filename + "\" (showing " + result.Items.Count + "):");
+                    sb.AppendLine("Found " + result.Items.Count + " instances of \"" + filename + "\" within the allowed roots:" + ScanNote(result));
                     sb.AppendLine();
                     foreach (var item in result.Items)
                         sb.AppendLine("[" + item.Type + "] " + item.FullPath);
@@ -4171,47 +4734,55 @@ IdeOnly = true,
             Register(new McpTool
             {
                 Name = "search_content",
-                Description = "Search for text content within files using Everything. Requires Everything content indexing to be enabled.",
+                Description = "Search for text content within files using Everything, within the allowed roots only. Requires Everything content " +
+                              "indexing, AND is off by default: the developer must set " + McpPathPolicy.ContentSearchSetting + "=true in " +
+                              "%APPDATA%\\ClarionAssistant\\settings.txt. Until then every call returns an error saying so. " + SearchScopeNote,
                 InputSchema = McpJsonRpc.BuildSchema(new Dictionary<string, string>
                 {
                     { "content", "Text content to search for within files" },
                     { "file_types?", "Limit to specific file types, semicolon-separated (e.g., 'clw;inc;txt')" },
-                    { "path?", "Limit search to specific path" },
-                    { "max_results?", "Maximum results to return (default: 50)" }
+                    { "path?", "Limit search to a folder inside the allowed roots" },
+                    { "max_results?", "Maximum results to return (default: 50, max: 1000, enforced)" }
                 }),
                 RequiresUiThread = false,
                 Handler = args =>
                 {
+                    if (!McpPathGate.ContentSearchEnabled())
+                    {
+                        McpPathAudit.Write("search_content", "DENY", GetStringArg(args, "content"), "content search disabled");
+                        return "Error: search_content is disabled. It searches file CONTENTS, so it is off by default (GH #266). " +
+                               "The developer can enable it by adding " + McpPathPolicy.ContentSearchSetting + "=true to " +
+                               "%APPDATA%\\ClarionAssistant\\settings.txt. Use read_file or the LSP/CodeGraph tools meanwhile.";
+                    }
+
                     string content = args.ContainsKey("content") ? args["content"]?.ToString() : null;
                     if (string.IsNullOrEmpty(content)) return "Error: content is required.";
+                    if (McpPathGate.IsBareWildcard(content))
+                        return BareWildcardRefusal("search_content", content);
+                    if (content.IndexOf('"') >= 0)
+                        return "Error: search_content: the text cannot contain a double quote (\"); it is sent as content:\"...\".";
 
-                    var sb = new StringBuilder();
-                    string path = GetStringArg(args, "path");
+                    var filters = new StringBuilder();
                     string fileTypes = GetStringArg(args, "file_types");
-
                     if (!string.IsNullOrEmpty(fileTypes))
                     {
-                        var types = fileTypes.Split(';');
                         var parts = new List<string>();
-                        foreach (var t in types)
+                        foreach (var t in fileTypes.Split(';'))
                         {
                             string trimmed = t.Trim();
                             if (!string.IsNullOrEmpty(trimmed)) parts.Add("ext:" + trimmed);
                         }
-                        if (parts.Count > 0) sb.Append("(" + string.Join(" | ", parts) + ") ");
+                        if (parts.Count > 0) filters.Append("<" + string.Join("|", parts) + "> ");
                     }
 
-                    if (!string.IsNullOrEmpty(path)) sb.Append("path:\"" + path + "\" ");
-                    sb.Append("content:\"" + content + "\"");
-
-                    var opts = new SearchOptions { MaxResults = GetIntArg(args, "max_results", 50) };
-
-                    var result = EverythingService.Search(sb.ToString(), opts);
-                    if (result.HasError) return "Error: " + result.Error + " Note: Content search requires Everything to have content indexing enabled.";
-                    if (result.Items.Count == 0) return "No files found containing \"" + content + "\". Note: Content search requires Everything to have content indexing enabled.";
+                    int max = McpPathGate.ClampMax(GetIntArg(args, "max_results", 50), 50);
+                    var result = McpPathGate.Search("search_content", _workspace, "content:\"" + content + "\"", filters.ToString(),
+                                                    GetStringArg(args, "path"), new SearchOptions(), max);
+                    if (result.Error != null) return "Error: " + result.Error + " Note: Content search requires Everything to have content indexing enabled.";
+                    if (result.Items.Count == 0) return "No files found containing \"" + content + "\" within the allowed roots. Note: Content search requires Everything to have content indexing enabled." + ScanNote(result);
 
                     var output = new StringBuilder();
-                    output.AppendLine("Found " + result.TotalResults + " files containing \"" + content + "\" (showing " + result.Items.Count + "):");
+                    output.AppendLine("Found " + result.Items.Count + " files containing \"" + content + "\" within the allowed roots:" + ScanNote(result));
                     output.AppendLine();
                     foreach (var item in result.Items)
                         output.AppendLine("[" + item.Type + "] " + item.FullPath);
@@ -4833,7 +5404,11 @@ IdeOnly = true,
             Register(new McpTool
             {
                 Name = "query_schema",
-                Description = "Run a read-only SQL query against a SchemaGraph database. Tables: tables, columns, keys, key_columns, relationships, relationship_mappings, procedures, procedure_params, views, view_references, schema_fts, schema_metadata.",
+                Description = "Run a read-only SQL query against a SchemaGraph database. Tables: tables, columns, keys, key_columns, relationships, relationship_mappings, procedures, procedure_params, views, view_references, schema_fts, schema_metadata. " +
+                              "Dictionary attributes from a .dctx ingest: tables.path (external file name, may be a memory file like !MEM:Name); " +
+                              "columns.default_value (InitialValue verbatim, a leading ! marks an expression), columns.derived_from (DerivedFrom), columns.base_type (BaseType), columns.external_name, columns.is_binary/is_password/is_read_only (0/1); " +
+                              "keys.is_primary/is_unique/is_auto_increment (AutoNumber)/is_exclude/is_case_sensitive (0/1; 0 = NOCASE), keys.external_name. " +
+                              "Optional text attributes are NULL when the dictionary does not set them. A database ingested before these were captured has them empty until ingest_schema is re-run (schema_metadata key 'dctx_attributes_version' >= 2 once it has been).",
                 InputSchema = McpJsonRpc.BuildSchema(new Dictionary<string, string>
                 {
                     { "sql", "SQL SELECT query to run (read-only)" },
@@ -4885,7 +5460,7 @@ IdeOnly = true,
             Register(new McpTool
             {
                 Name = "get_table",
-                Description = "Get full detail for a database table: all columns (name, type, size, picture), keys with their fields, and relationships to other tables.",
+                Description = "Get full detail for a database table: path, all columns (name, type, size, picture, plus dictionary attributes: initial value, derived_from, base_type, external_name, BINARY/PASSWORD/READONLY), keys with their fields and flags (PRIMARY, UNIQUE, AUTO, EXCLUDE, CASE/NOCASE, external_name), and relationships to other tables.",
                 InputSchema = McpJsonRpc.BuildSchema(new Dictionary<string, string>
                 {
                     { "name", "Exact table name (case-insensitive)" },
@@ -5284,12 +5859,226 @@ IdeOnly = true,
             return Math.Min(ms, LspDiagnosticsMaxTimeoutMs);
         }
 
+        /// <summary>5a5581e6: the template extensions get_solution_info's tplSearchPaths covers (.red: *.tp?, *.tpl, *.tpw).</summary>
+        internal static readonly string[] TemplateExtensions = { ".tpl", ".tpw" };
+
+        /// <summary>
+        /// 9e1bd280: appended to a solution tool's "no solution" error. When the workspace follows the IDE and the
+        /// IDE has no solution open, says so (and which solution it had), rather than leaving the agent to guess
+        /// whether this tab is broken. Empty otherwise.
+        /// </summary>
+        private string NoSolutionSuffix()
+        {
+            try
+            {
+                var info = _workspace as ISolutionSourceInfo;
+                var src = info != null ? info.SolutionSource : null;
+                if (src == null || src.Source != SolutionSourceSnapshot.None) return "";
+                return " No solution is open in the IDE"
+                    + (string.IsNullOrEmpty(src.SwitchedFrom) ? "" : " (it had " + src.SwitchedFrom + " open)")
+                    + ". This tab follows the IDE: open a solution there.";
+            }
+            catch { return ""; }
+        }
+
+        /// <summary>
+        /// 9e1bd280 run 1: ONE read of the solution and everything keyed on it, for one call. A workspace that can switch
+        /// under a call (the standalone follows the IDE: ISolutionScopedWorkspace) builds it from one record read; the
+        /// addin's members answer for its own current solution, as they always did, so its scope is just those members.
+        /// <paramref name="withLibraryPaths"/>: the addin computes the index library paths only when asked.
+        /// </summary>
+        private SolutionScope SnapshotSolution(bool withLibraryPaths)
+        {
+            var scoped = _workspace as ISolutionScopedWorkspace;
+            if (scoped != null) return scoped.Snapshot();
+            var cfg = _workspace.CurrentVersionConfig;
+            var info = _workspace as ISolutionSourceInfo;
+            var noteSource = _workspace as IVersionNoteSource;
+            return new SolutionScope
+            {
+                Source = info != null ? info.SolutionSource : null,
+                SolutionPath = _workspace.CurrentSolutionPath,
+                Version = cfg,
+                VersionNote = noteSource != null ? noteSource.VersionNote : VersionNoteForAddin(cfg),
+                Red = _workspace.RedFile,
+                DbPath = _workspace.CurrentDbPath,
+                IndexLibraryPaths = withLibraryPaths ? _workspace.BuildIndexLibraryPaths() : null
+            };
+        }
+
+        /// <summary>9e1bd280: after the followed solution switched, say from which and when.</summary>
+        private static void AddSwitch(Dictionary<string, object> result, SolutionSourceSnapshot source)
+        {
+            if (source == null || string.IsNullOrEmpty(source.SwitchedFrom)) return;
+            result["switchedFrom"] = source.SwitchedFrom;
+            if (source.SwitchedAt.HasValue)
+                result["switchedAt"] = source.SwitchedAt.Value.ToString("yyyy-MM-dd HH:mm:ss");
+        }
+
+        /// <summary>
+        /// 5a5581e6: add <paramref name="key"/> ('absoluteSearchPaths') - <paramref name="paths"/> anchored at
+        /// <paramref name="baseDir"/> by RedFileService.AnchorAt, the rule resolution uses - leaving 'searchPaths' as the
+        /// .red writes it, and list the entries that cannot be anchored (unexpanded %MACRO%, drive-relative on another
+        /// drive) under <paramref name="unresolvedKey"/>. Omitted with no base folder.
+        /// </summary>
+        internal static Dictionary<string, object> WithAbsolutePaths(Dictionary<string, object> result, IEnumerable<string> paths, string baseDir,
+                                                                     string key = "absoluteSearchPaths", string unresolvedKey = "unresolvedEntries")
+        {
+            var absolute = RedFileService.AnchorAll(paths, baseDir);
+            if (absolute != null)
+            {
+                result[key] = absolute;
+                result["baseDir"] = baseDir;
+            }
+            var unresolved = RedFileService.Unanchorable(paths, baseDir);
+            if (unresolved.Count > 0)
+                result[unresolvedKey] = unresolved;
+            return result;
+        }
+
+        /// <summary>5a5581e6: 'alsoFoundIn' - the matches at a path other than <paramref name="chosen"/>, with their section.</summary>
+        private static void AddAlsoFoundIn(Dictionary<string, object> result, IEnumerable<RedFileService.RedHit> hits, string chosen)
+        {
+            var list = new List<Dictionary<string, object>>();
+            foreach (var h in hits)
+                if (!string.Equals(h.Path, chosen, StringComparison.OrdinalIgnoreCase))
+                    list.Add(new Dictionary<string, object> { { "section", h.Section }, { "path", h.Path } });
+            if (list.Count > 0)
+            {
+                result["alsoFoundIn"] = list;
+                result["alsoFoundInNote"] = "the same file name resolves elsewhere under another .red section or resolver - "
+                    + "check which one the build you mean uses";
+            }
+        }
+
+        /// <summary>5a5581e6: which .red, which folder and which sections a resolve_red_path / get_red_search_paths call means.</summary>
+        private sealed class RedScope
+        {
+            public RedFileService Red;
+            /// <summary>The solution snapshot this scope was built from: one read per call (9e1bd280 run 1).</summary>
+            public SolutionScope Snap;
+            public string BaseDir;
+            public string[] Sections;
+            public string Configuration;
+            public string ConfigurationNote;
+            public string ProjectNote;
+            public string Error;
+            public bool ExplicitSection;
+            public bool ExplicitProject;
+
+            /// <summary>The language server resolves as one configuration; its answer fits only when the IDE's is KNOWN to be that one.</summary>
+            public bool LspMatchesConfiguration
+            {
+                get { return Configuration != null && string.Equals(Configuration, LspService.LspConfiguration, StringComparison.OrdinalIgnoreCase); }
+            }
+
+            public void Describe(Dictionary<string, object> result)
+            {
+                result["buildConfiguration"] = Configuration ?? "(unknown)";
+                if (ConfigurationNote != null) result["configurationNote"] = ConfigurationNote;
+                if (BaseDir != null) result["baseDir"] = BaseDir;
+                if (ProjectNote != null) result["projectNote"] = ProjectNote;
+            }
+        }
+
+        /// <summary>
+        /// 5a5581e6: the scope of a .red lookup. Folder: the project's (project_name, or the solution's only project),
+        /// else the solution's with a note. .red: that folder's own version-named one when it has one. Sections: the
+        /// 'section' argument, else the IDE's active build configuration's, else Common only.
+        /// </summary>
+        private RedScope RedScopeFor(Dictionary<string, object> args)
+        {
+            return RedScopeFor(args, SnapshotSolution(false));
+        }
+
+        /// <summary>
+        /// As above for a solution the caller already snapshotted (9e1bd280 run 1): the folder, .red, version and
+        /// configuration all come from <paramref name="snap"/>, read once - never from a second read of the followed
+        /// solution.
+        /// </summary>
+        private RedScope RedScopeFor(Dictionary<string, object> args, SolutionScope snap)
+        {
+            string sln = snap.SolutionPath;
+            var scope = new RedScope { Snap = snap };
+            string project = McpJsonRpc.GetString(args, "project_name", "");
+            scope.ExplicitProject = !string.IsNullOrEmpty(project);
+            string projectNote, projectError;
+            scope.BaseDir = RedResolution.ProjectDirectory(sln, project, out projectNote, out projectError);
+            if (projectError != null) { scope.Error = projectError; return scope; }
+            scope.ProjectNote = projectNote;
+
+            scope.Red = snap.Red;
+            if (scope.Red != null && scope.BaseDir != null)
+                scope.Red = RedFileService.ForProjectDirectory(scope.BaseDir, scope.Red);
+
+            scope.Configuration = ActiveBuildConfiguration(sln, out scope.ConfigurationNote);
+            string section = McpJsonRpc.GetString(args, "section", "");
+            scope.ExplicitSection = !string.IsNullOrEmpty(section);
+            scope.Sections = scope.ExplicitSection ? new[] { section } : RedResolution.SectionsFor(scope.Configuration);
+            return scope;
+        }
+
+        /// <summary>
+        /// 5a5581e6: the build configuration ("Debug", "Release", ...) the IDE has for <paramref name="slnPath"/>, most
+        /// live first (IdeSolutionPreferences.ResolveBuildConfiguration): the IDE in this process (the addin), the
+        /// record the IDE publishes (the standalone), then its saved preferences\&lt;sln&gt;.&lt;hash&gt;.xml. Null, with a
+        /// note, when none establishes it - the caller then searches Common only.
+        /// </summary>
+        /// <summary>
+        /// The build configuration a CodeGraph index run resolves through (GH #245), the one resolve_red_path uses:
+        /// the IDE's active configuration for <paramref name="slnPath"/>, or null when unknown (the indexer then
+        /// keeps its old fixed section order). Never throws.
+        /// </summary>
+        internal static string BuildConfigurationForIndex(string slnPath)
+        {
+            try { string note; return ActiveBuildConfiguration(slnPath, out note); }
+            catch { return null; }
+        }
+
+        private static string ActiveBuildConfiguration(string slnPath, out string note)
+        {
+            IdeSolutionRecord.BuildConfiguration inProcess = null;
+            try { var p = IdeSolutionRecord.BuildConfigurationProvider; if (p != null) inProcess = p(); } catch { }
+            IdeSolutionRecord.Details rec = null;
+            var configDirs = new List<string>();
+            try
+            {
+                if (IdeProcessId.HasValue)
+                {
+                    string recNote;
+                    rec = IdeSolutionRecord.ReadDetailsCached(IdeProcessId.Value, out recNote);
+                    if (rec != null && !string.IsNullOrEmpty(rec.ConfigDir) && SolutionVersionResolver.SamePath(rec.Solution, slnPath))
+                        configDirs.Add(rec.ConfigDir);
+                }
+            }
+            catch { }
+            try
+            {
+                string ide = ClarionConfigDirectory.Resolve();
+                if (!string.IsNullOrEmpty(ide) && !configDirs.Contains(ide)) configDirs.Add(ide);
+            }
+            catch { }
+
+            string platform;
+            string config = IdeSolutionPreferences.ResolveBuildConfiguration(slnPath, inProcess, rec, configDirs, out platform, out note);
+            if (config == null)
+                note += ", so only [Common] is searched; a match under any other section, or the language server's "
+                      + LspService.LspConfiguration + " answer, is listed in alsoFoundIn";
+            return config;
+        }
         /// <summary>
         /// 0ce0b5e2: every answer that depends on the Clarion version says which one and what chose it - an INCLUDE
         /// "not found" means nothing until you know which Clarion's paths were searched. <paramref name="fromLsp"/>:
         /// the language server's version (what it was started with); else this host's version for the solution.
         /// </summary>
         private Dictionary<string, object> WithVersion(Dictionary<string, object> result, bool fromLsp)
+        {
+            return WithVersion(result, fromLsp, null);
+        }
+
+        /// <summary>As above; with <paramref name="snap"/>, the version of the solution the call snapshotted (9e1bd280
+        /// run 1), not a re-read one.</summary>
+        private Dictionary<string, object> WithVersion(Dictionary<string, object> result, bool fromLsp, SolutionScope snap)
         {
             try
             {
@@ -5299,6 +6088,12 @@ IdeOnly = true,
                     name = LspService.RunningVersionName;
                     note = LspService.RunningVersionNote;
                     warning = LspService.RunningVersionWarning;
+                }
+                else if (snap != null)
+                {
+                    name = snap.Version != null ? snap.Version.Name : null;
+                    note = snap.VersionNote;
+                    warning = null;   // get_solution_info carries it; not re-read on every lookup
                 }
                 else
                 {
@@ -5399,18 +6194,37 @@ IdeOnly = true,
         private object ExecuteIndexCodeGraph(Dictionary<string, object> args, Action<double, string> onProgress)
         {
             string slnPath = McpJsonRpc.GetString(args, "sln_path");
-            if (string.IsNullOrEmpty(slnPath) && _workspace != null)
-                slnPath = _workspace.CurrentSolutionPath;
+            // 583abdec review M1 (security): an EXPLICIT sln_path is caller input, so the path policy (GH #266) judges it
+            // FIRST - before File.Exists, the run gate, the solution scope or any other I/O on it. File.Exists on a UNC
+            // path is an SMB connection, which hands the share this user's NTLM credentials; a path outside every
+            // allowed root is refused like read_file refuses it. The database it would write is gated for WRITE.
+            bool explicitSln = !string.IsNullOrEmpty(slnPath);
+            if (explicitSln)
+            {
+                string slnRefusal = McpPathGate.GatePath("index_codegraph", slnPath, PathAccess.Read, _workspace, out slnPath);
+                if (slnRefusal != null) return slnRefusal;
+            }
+            // 9e1bd280 run 1: ONE read of the solution, its .red and its library paths, taken here - a switch between
+            // this and the set-up below indexed A's db with B's .red and library paths.
+            SolutionScope snap = _workspace != null ? SnapshotSolution(true) : null;
+            if (string.IsNullOrEmpty(slnPath) && snap != null)
+                slnPath = snap.SolutionPath;
             if (string.IsNullOrEmpty(slnPath))
                 return "Error: no solution path provided and no solution is open in the IDE.";
-            if (!File.Exists(slnPath))
-                return "Error: solution file not found: " + slnPath;
-
-            bool incremental = McpJsonRpc.GetString(args, "incremental") != "false";
 
             string dbPath = Path.Combine(
                 Path.GetDirectoryName(slnPath),
                 Path.GetFileNameWithoutExtension(slnPath) + ".codegraph.db");
+            if (explicitSln)
+            {
+                string dbRefusal = McpPathGate.GatePath("index_codegraph", dbPath, PathAccess.Write, _workspace, out dbPath);
+                if (dbRefusal != null) return dbRefusal;
+            }
+
+            if (!File.Exists(slnPath))
+                return "Error: solution file not found: " + slnPath;
+
+            bool incremental = McpJsonRpc.GetString(args, "incremental") != "false";
 
             // Cross-entry-point gate: RunIndex (header buttons / index_solution) may already
             // be writing this database. Refuse BEFORE opening the run log so this call can't
@@ -5425,18 +6239,37 @@ IdeOnly = true,
             try
             {
                 SymbolIndex.Release(dbPath);   // completion's read-only handle (1c685f2e) - never across a write open
-                var db = new ClarionCodeGraph.Graph.CodeGraphDatabase();
-                db.Open(dbPath);
-                try
                 {
-                    var indexer = new ClarionCodeGraph.Graph.CodeGraphIndexer(db);
+                    // 583abdec: the index runs in clarion-indexer.exe (64-bit), never inside this host - in the IDE
+                    // pane that host is the 32-bit Clarion.exe, which ran out of memory on a large solution.
+                    var indexer = new OutOfProcessIndexer();
                     // PARITY with RunIndex/index_solution: same active .red, same library
                     // paths. This handler used to pass neither, so the same db was more or
                     // less complete depending on which tool indexed last (ticket d1a0aea6).
-                    if (_workspace != null)
+                    // 9e1bd280 run 1: from the snapshot taken at the top of this call. Run 2: an explicit sln_path that
+                    // is not the followed solution gets ITS OWN scope (version, .red, library paths) in the standalone,
+                    // never the followed one's. The addin keeps its per-project ActiveRedFileService.
+                    IndexRunGate.PauseBeforeSetUpForTest();
+                    RedFileService red = null;
+                    List<string> libPaths = null;
+                    if (snap != null)
                     {
-                        indexer.RedService = _workspace.ActiveRedFileService;
+                        var scopedWs = _workspace as ISolutionScopedWorkspace;
+                        if (scopedWs != null)
+                        {
+                            var own = SolutionVersionResolver.SamePath(slnPath, snap.SolutionPath) ? snap : scopedWs.ScopeFor(slnPath);
+                            red = own.Red;
+                            libPaths = own.IndexLibraryPaths;
+                        }
+                        else
+                        {
+                            red = _workspace.ActiveRedFileService;
+                            libPaths = snap.IndexLibraryPaths;
+                        }
                     }
+                    runLog.WriteLine("Redirection file: " + (red != null && red.RedFilePath != null ? red.RedFilePath : "(none)")
+                        + " (for " + slnPath + ")");
+                    runLog.WriteLine("Indexer process: " + (indexer.ExePath ?? "(addin folder unknown)"));
                     indexer.OnProgress += msg => runLog.WriteLine(msg);
                     if (onProgress != null)
                     {
@@ -5445,11 +6278,20 @@ IdeOnly = true,
                             DescribeIndexEvent(ev));
                     }
 
-                    var result = indexer.IndexSolution(slnPath, incremental,
-                        _workspace != null ? _workspace.BuildIndexLibraryPaths() : null);
+                    string buildConfiguration = BuildConfigurationForIndex(slnPath);
+                    var result = indexer.Run(new IndexRunRequest
+                    {
+                        SlnPath = slnPath,
+                        DbPath = dbPath,
+                        Incremental = incremental,
+                        Red = red,
+                        BuildConfiguration = buildConfiguration,
+                        LibraryPaths = libPaths
+                    });
 
-                    return string.Format(
-                        "CodeGraph indexed successfully:\n" +
+                    // #244 item 3: the headline and the coverage block say when most of the solution did
+                    // not resolve, instead of "indexed successfully" over a near-empty graph.
+                    return result.Headline + "\n" + string.Format(
                         "  Solution: {0}\n" +
                         "  Projects: {1}\n" +
                         "  Files: {2}\n" +
@@ -5458,23 +6300,26 @@ IdeOnly = true,
                         "  Duration: {5}ms\n" +
                         "  Database: {6}\n" +
                         "  Mode: {7}\n" +
+                        "  Redirection: {9}\n" +
                         "  Log: {8}",
                         Path.GetFileName(slnPath), result.ProjectCount, result.FileCount,
                         result.SymbolCount, result.RelationshipCount, result.DurationMs, dbPath,
-                        incremental ? "incremental" : "full",
+                        result.ModeText,
                         // LogPath is null when the log could not be opened (e.g. another index
                         // run holds the per-solution file) — say so instead of a bare "Log: ".
-                        runLog.LogPath ?? "(no log written — another index run may hold the log file)");
-                }
-                finally
-                {
-                    db.Close();
+                        runLog.LogPath ?? "(no log written — another index run may hold the log file)",
+                        red != null && red.RedFilePath != null ? red.RedFilePath : "(none)")
+                        + "\n  Build configuration: " + (buildConfiguration ?? "(unknown - .red sections Common, Debug, Release)")
+                        + "\n" + result.CoverageText()
+                        + (indexer.FallbackWarning != null ? "\n  " + indexer.FallbackWarning : "");
                 }
             }
             catch (Exception ex)
             {
+                // 583abdec review L3: the whole message (the child's full stderr tail) goes to the run log; the caller
+                // gets the headline, the last few lines, each cut short, and where the rest is.
                 runLog.WriteLine("FAILED: " + ex.Message);
-                return "Error indexing solution: " + ex.Message;
+                return OutOfProcessIndexer.McpFailureReply(ex, runLog.LogPath);
             }
             finally
             {
@@ -5611,8 +6456,174 @@ IdeOnly = true,
         private static readonly HashSet<string> ClarionSourceBuildTools =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "build_solution", "build_app", "generate_source" };
 
-        private string RunBuildProcess(string fileName, string arguments, string workingDirectory, int timeoutSeconds, string toolName = null, string targetFile = null, bool exitCodeIsErrorCount = false)
+        /// <summary>GH #204: what build_app / generate_source run ClarionCL on, and the project it generates.</summary>
+        private sealed class ClarionClTarget
         {
+            /// <summary>The .app ClarionCL is given; null when the project has none (it is then refused).</summary>
+            public string AppPath;
+            /// <summary>The .cwproj read for kind and output; null when there is none beside the .app.</summary>
+            public ClarionProjectInfo Project;
+            public string Error;
+
+            public string Describe()
+            {
+                if (Project != null) return ClarionBuildTarget.Describe(Project);
+                return "PROJECT: no " + Path.GetFileNameWithoutExtension(AppPath ?? "") + ".cwproj beside " + AppPath
+                     + "; project kind and OUTPUT path not resolved\n";
+            }
+        }
+
+        /// <summary>
+        /// GH #204: resolve 'project_path' (a .cwproj; also accepted in 'app_path') or 'app_path' (default: the IDE's
+        /// active app) to the .app ClarionCL generates and the .cwproj that describes the output. Configuration: the
+        /// IDE's active one for the followed solution; .red: that solution's, superseded by the project folder's own.
+        /// </summary>
+        private ClarionClTarget ResolveClarionClTarget(string toolName, Dictionary<string, object> args)
+        {
+            string appPath = McpJsonRpc.GetString(args, "app_path", null);
+            string projectPath = McpJsonRpc.GetString(args, "project_path", null);
+            // b8f9431c H1: both caller-named paths go through the #266 path policy, as read_file, BEFORE any File.Exists
+            // or parse (a UNC path is never touched). The default (the IDE's active app) is the developer's own.
+            // N3: DELIBERATELY the READ gate, not Write. ClarionCL /ag generates into the developer's own app folder, as the
+            // IDE's own Generate does, and an app outside the solution folder (a read-only project folder) must still
+            // generate. What is written is the template engine's output for that app's own modules; no caller-chosen file
+            // is written. What WE write before the run - dirty CA Editor tabs - goes through the Write gate (RunBuildProcess).
+            if (!string.IsNullOrEmpty(appPath))
+            {
+                string refusal = McpPathGate.GatePath(toolName, appPath, PathAccess.Read, _workspace, out appPath);
+                if (refusal != null) return new ClarionClTarget { Error = refusal };
+            }
+            if (!string.IsNullOrEmpty(projectPath))
+            {
+                string refusal = McpPathGate.GatePath(toolName, projectPath, PathAccess.Read, _workspace, out projectPath);
+                if (refusal != null) return new ClarionClTarget { Error = refusal };
+            }
+            if (string.IsNullOrEmpty(projectPath) && !string.IsNullOrEmpty(appPath)
+                && appPath.EndsWith(".cwproj", StringComparison.OrdinalIgnoreCase))
+            {
+                projectPath = appPath;
+                appPath = null;
+            }
+
+            var t = new ClarionClTarget();
+            var snap = SnapshotSolution(false);
+            string configNote;
+            string configuration = ActiveBuildConfiguration(snap.SolutionPath, out configNote);
+            var solutionApps = ClarionBuildTarget.SolutionItemApps(snap.SolutionPath);
+
+            if (!string.IsNullOrEmpty(appPath) && !File.Exists(appPath))
+            {
+                t.Error = "Error: .app file not found: " + appPath;
+                return t;
+            }
+
+            if (!string.IsNullOrEmpty(projectPath))
+            {
+                if (!File.Exists(projectPath)) { t.Error = "Error: project file not found: " + projectPath; return t; }
+                t.Project = ClarionBuildTarget.Inspect(projectPath, configuration, snap.Red, solutionApps);
+                if (t.Project.Error != null) { t.Error = "Error: " + t.Project.Error; return t; }
+                // An explicit app_path names the .app that generates this project wherever it lives.
+                t.AppPath = !string.IsNullOrEmpty(appPath) ? appPath : t.Project.AppPath;
+                return t;
+            }
+
+            if (string.IsNullOrEmpty(appPath))
+            {
+                var appInfo = _appTree.GetAppInfo();
+                if (appInfo != null && appInfo.ContainsKey("fileName"))
+                    appPath = appInfo["fileName"]?.ToString();
+            }
+            if (string.IsNullOrEmpty(appPath) || !File.Exists(appPath))
+            {
+                t.Error = "Error: No app_path or project_path provided and no .app file is currently open in the IDE.";
+                return t;
+            }
+
+            t.AppPath = appPath;
+            string cwproj = ClarionBuildTarget.CwprojForApp(appPath);
+            if (cwproj != null)
+            {
+                var info = ClarionBuildTarget.Inspect(cwproj, configuration, snap.Red, solutionApps);
+                if (info.Error == null) t.Project = info;
+            }
+            return t;
+        }
+
+        /// <summary>
+        /// b8f9431c L6: a ClarionCL run's timeout, 1 s to <see cref="McpUiTimeoutPolicy.MaxForwardedSeconds"/> (3600) - the
+        /// longest the plugin's server lets a forwarded call run (it waits that plus its margin), so the IDE never runs on
+        /// after that client has given up on it.
+        /// </summary>
+        internal static int CapBuildTimeout(int seconds)
+        {
+            if (seconds < 1) return 1;
+            return seconds > McpUiTimeoutPolicy.MaxForwardedSeconds ? McpUiTimeoutPolicy.MaxForwardedSeconds : seconds;
+        }
+
+        /// <summary>b8f9431c L1: an optional on/off switch value: null/empty stays null, "on"/"off" (any case) is
+        /// normalised to lower case, anything else is the refusal text.</summary>
+        internal static string OnOffArgument(string name, ref string value)
+        {
+            if (string.IsNullOrEmpty(value)) { value = null; return null; }
+            string v = value.Trim();
+            if (string.Equals(v, "on", StringComparison.OrdinalIgnoreCase)) { value = "on"; return null; }
+            if (string.Equals(v, "off", StringComparison.OrdinalIgnoreCase)) { value = "off"; return null; }
+            return "Error: " + name + " must be 'on' or 'off' (or omitted to use the app's setting); nothing was run.";
+        }
+
+        /// <summary>GH #204: every .cwproj of <paramref name="slnPath"/>, read for kind and output (empty when the .sln can't be parsed).</summary>
+        private List<ClarionProjectInfo> SolutionProjectsFor(string slnPath)
+        {
+            var result = new List<ClarionProjectInfo>();
+            List<ClarionCodeGraph.Parsing.Models.SolutionProject> projects;
+            try { projects = new ClarionCodeGraph.Parsing.SolutionParser().Parse(slnPath); }
+            catch { return result; }
+            var snap = SnapshotSolution(false);
+            string configNote;
+            string configuration = ActiveBuildConfiguration(slnPath, out configNote);
+            var solutionApps = ClarionBuildTarget.SolutionItemApps(slnPath);
+            foreach (var p in projects)
+            {
+                if (!File.Exists(p.CwprojPath))
+                {
+                    result.Add(new ClarionProjectInfo { CwprojPath = p.CwprojPath, ProjectName = p.Name, Error = "project file not found: " + p.CwprojPath });
+                    continue;
+                }
+                result.Add(ClarionBuildTarget.Inspect(p.CwprojPath, configuration, snap.Red, solutionApps));
+            }
+            return result;
+        }
+
+        /// <summary>GH #204: the refusal for a target with no .app to generate from, or null when ClarionCL can run.</summary>
+        private string ClarionClRefusal(string toolName, ClarionClTarget target)
+        {
+            if (target.AppPath != null || target.Project == null) return null;
+            return ClarionBuildTarget.Refusal(toolName, target.Project, FindMSBuild(), _workspace.GetClarionInstallPath());
+        }
+
+        /// <summary>b8f9431c N1: the result line naming the dirty CA Editor tabs the save-before-build did NOT save (the
+        /// path policy refuses to write them). Empty when there are none.</summary>
+        internal static string SaveBeforeBuildSkippedNote(IList<string> skipped)
+        {
+            if (skipped == null || skipped.Count == 0) return "";
+            return "NOT SAVED before the run (the Clarion Assistant path policy refuses to write "
+                + (skipped.Count == 1 ? "this file" : "these files") + "; the tab keeps its unsaved edits, and ClarionCL read the "
+                + "file as it is on disk - save it yourself if you mean to): " + string.Join("; ", skipped) + "\n";
+        }
+
+        private string RunBuildProcess(string fileName, string arguments, string workingDirectory, int timeoutSeconds, string toolName = null, string targetFile = null, bool exitCodeIsErrorCount = false,
+                                       Func<string> resultPreamble = null)
+        {
+            // GH #204: ClarionCL /ag only generates. Its tools say so in the headline, never "BUILD SUCCEEDED".
+            bool generateOnly = toolName != null && ClarionSourceBuildTools.Contains(toolName);
+            // Evaluated AFTER the process ends, so the PROJECT/OUTPUT lines show the file as it is now.
+            Func<string> preamble = () =>
+            {
+                if (resultPreamble == null) return "";
+                try { return resultPreamble() ?? ""; }
+                catch (Exception ex) { return "PROJECT: could not be described: " + ex.Message + "\n"; }
+            };
+
             // Flush unsaved CA Editor tabs before ClarionCL reads the files off disk.
             //
             // The IDE's own toolbar build is covered by SaveSourceEditorsBeforeBuildCommand, which hangs off
@@ -5625,10 +6636,32 @@ IdeOnly = true,
             // but benignly so: the page pushes fileState on every edit and is explicitly not debounced, so
             // the worst case is text from moments ago rather than stale-since-last-save. Best-effort — a
             // failure here must never block the build the user actually asked for.
+            //
+            // b8f9431c N1: through the #266 WRITE gate, per tab. A dirty tab on a file the policy refuses to write
+            // (.vscode\tasks.json, CLAUDE.md, a template under the Clarion root) is NOT saved: it stays dirty and the
+            // result names it, so the developer saves it themselves if they mean to.
+            string skippedNote = "";
             if (toolName != null && ClarionSourceBuildTools.Contains(toolName))
             {
-                try { if (_ideProbe != null) _ideProbe.SaveAllDirtyEditors(); }
+                try
+                {
+                    if (_ideProbe != null)
+                    {
+                        string gateTool = toolName + " (save before build)";
+                        var skipped = _ideProbe.SaveAllDirtyEditors(p =>
+                        {
+                            string canonical;
+                            return McpPathGate.GatePath(gateTool, p, PathAccess.Write, _workspace, out canonical);
+                        });
+                        skippedNote = SaveBeforeBuildSkippedNote(skipped);
+                    }
+                }
                 catch (Exception ex) { if (DiagnosticLog != null) DiagnosticLog("[save-before-build] " + toolName + " pre-flush failed: " + ex.Message); }
+            }
+            if (skippedNote.Length > 0)
+            {
+                var inner = resultPreamble;
+                resultPreamble = () => skippedNote + (inner != null ? inner() ?? "" : "");
             }
 
             try
@@ -5684,7 +6717,7 @@ IdeOnly = true,
                     if (!exited)
                     {
                         try { process.Kill(); } catch { }
-                        return string.Format("Error: Build timed out after {0} seconds.\n\nPartial output:\n{1}", timeoutSeconds, output.ToString());
+                        return string.Format("Error: Build timed out after {0} seconds.\n{2}\nPartial output:\n{1}", timeoutSeconds, output.ToString(), preamble());
                     }
 
                     var result = new StringBuilder();
@@ -5699,7 +6732,7 @@ IdeOnly = true,
                     if (exitCodeIsErrorCount && !success)
                         errorCount = process.ExitCode;
 
-                    result.AppendLine(success ? "BUILD SUCCEEDED" : "BUILD FAILED");
+                    result.AppendLine(generateOnly ? ClarionBuildTarget.GenerationHeadline(success) : (success ? "BUILD SUCCEEDED" : "BUILD FAILED"));
                     result.AppendLine(string.Format("Exit code: {0} | Errors: {1} | Warnings: {2}", process.ExitCode, errorCount, warningCount));
                     result.AppendLine(string.Format("Command: {0} {1}", fileName, arguments));
                     // A locked .app (GH #204) fails exactly like a real generation error; say which it is
@@ -5709,6 +6742,8 @@ IdeOnly = true,
                     // failure anyway, so gating it could only hide the message.
                     string lockDiagnosis = ClarionClDiagnosis.DescribeAppLock(output.ToString() + errors.ToString());
                     if (lockDiagnosis != null) result.AppendLine(lockDiagnosis);
+                    if (generateOnly) result.AppendLine(ClarionBuildTarget.GenerateOnlyNote);
+                    result.Append(preamble());
                     result.AppendLine();
 
                     if (output.Length > 0)
@@ -5785,6 +6820,63 @@ IdeOnly = true,
 
         #endregion
 
+        #region Path policy (GH #266)
+
+        /// <summary>Appended to the file tools' descriptions: the model must know a refusal is a boundary, not a missing file.</summary>
+        // GH #205: what write_file / append_to_file do about a file that is open in an IDE editor tab (OpenTabGuard).
+        private const string OpenTabNote =
+            "If the file is open in a NATIVE Clarion editor tab (which keeps its own buffer, so a save there would put the old " +
+            "text back): a tab with NO unsaved changes is reloaded from disk after the write (caret line kept; its undo history " +
+            "starts afresh); a tab WITH unsaved changes makes the call refuse ('Error: <file> is open in the Clarion editor with " +
+            "unsaved changes; save or close it there first'), nothing written - ask the developer to save or close it there, do " +
+            "not just retry. A file open in the CA Editor is written; the CA Editor shows a 'File changed on disk' notice and offers " +
+            "a reload. When no IDE can be asked, the file is written and the result says open tabs could not be checked.";
+
+        private const string OpenTabOverrideArgNote =
+            "Optional, default false. 'true' writes even though a native Clarion editor tab holds this file with unsaved changes. " +
+            "That tab is NOT reloaded (it would lose its edits), so saving it there WILL overwrite this write; the result warns. " +
+            "Use only with the developer's explicit go-ahead.";
+
+        private const string PathScopeNote =
+            "Scoped by the Clarion Assistant path policy: only paths inside the allowed roots are accepted. Readable: the open solution " +
+            "and its project folders, the Clarion root and IDE install, the .red search folders, Clarion Assistant's own data folder and " +
+            "the Mcp.AllowedRoots setting. WRITABLE: only the solution folder (and Mcp.AllowedRoots) - the Clarion root, .red and project " +
+            "folders outside the solution are read-only, and .sln/.cwproj/.red (and files a .red includes)/clarion-assistant.json/" +
+            "ClarionProperties.xml are never written by these tools (they define the scope; the developer edits them), nor are files " +
+            "that make tools run commands (.git\\*, a bare repo's HEAD/config/hooks, .gitattributes, .gitmodules, .mcp.json, " +
+            ".vscode\\tasks|settings|launch.json, *.code-workspace), nor instruction files later sessions follow (CLAUDE.md, " +
+            "CLAUDE.local.md, AGENTS.md, AGENTS.override.md, GEMINI.md, .github\\copilot-instructions.md, .github\\**\\*.instructions.md), " +
+            "nor assistant / MCP config (.vscode\\mcp.json, .cursor\\*, .cursorrules, .windsurfrules, .github\\prompts\\*.prompt.md, " +
+            ".github\\agents\\*.agent.md, .github\\chatmodes\\*, .codex\\*, .gemini\\*). " +
+            "UNC/network paths (unless Mcp.AllowedRoots names " +
+            "them), .ssh/.aws folders, credential files, the user's Claude config (%USERPROFILE%\\.claude) and other users' profiles " +
+            "are always refused; any other .claude folder (a project's CLAUDE.md, skills) is readable but never writable, except a " +
+            "checkout under .claude\\worktrees. A refused path " +
+            "returns an error starting 'Error: <tool> refused by the Clarion Assistant path policy'; when a setting can lift it the " +
+            "error names Mcp.AllowedRoots, and built-in rules cannot be lifted at all. Report it to the developer; do not retry with " +
+            "another spelling of the same path. Use your assistant's own Edit/Write tools for such a file (they ask the developer for " +
+            "permission), or ask the developer; never use run_command or another tool to work around a refusal.";
+
+        /// <summary>Appended to the Everything tools' descriptions.</summary>
+        private const string SearchScopeNote =
+            "Results outside the allowed roots are never returned, whatever the query or path says. Queries that name nothing ('*', '*.*') " +
+            "are refused, max_results is capped at 1000, and a refusal is an error naming the setting that would allow it (Mcp.AllowedRoots), " +
+            "not an empty result.";
+
+        private static string BareWildcardRefusal(string tool, string query)
+        {
+            McpPathAudit.Write(tool, "DENY", query, "bare wildcard");
+            return "Error: " + tool + " refused: the query '" + query + "' names nothing (a bare wildcard would enumerate the whole index). " +
+                   "Include part of a file name, e.g. '*.clw' or 'Main'.";
+        }
+
+        private static string ScanNote(McpPathGate.ScopedResult r)
+        {
+            return r.ScanCapped ? " (stopped after scanning " + McpPathGate.ScanCap + " index entries; narrow the query)" : "";
+        }
+
+        #endregion
+
         #region Argument Helpers
 
         private static string GetStringArg(Dictionary<string, object> args, string key)
@@ -5823,7 +6915,7 @@ IdeOnly = true,
         /// server, where AppTreeFactory / IdeProbeFactory are left unset and no IEditorService is
         /// injected.
         /// </summary>
-        private bool HasIde { get { return _editorService != null || _appTree != null || _ideProbe != null; } }
+        private bool HasIde { get { return _definitionsOnly || _editorService != null || _appTree != null || _ideProbe != null; } }
 
         private void Register(McpTool tool)
         {

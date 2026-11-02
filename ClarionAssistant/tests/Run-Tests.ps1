@@ -122,11 +122,38 @@ if (-not $NodeOnly -and -not $InstallerOnly) {
                Sources = @("tests\ClaudeMdDeployer.Test.cs", "Services\ClaudeMdDeployer.cs", "Services\EncodingHelper.cs")
                Refs = @("System.dll")
                Args = @($RepoDir) }
+            # GH #214: one --plugin-dir resolver - shared marketplace, active profile (CLAUDE_CONFIG_DIR), newest
+            # cached version (not "1.0.0", ticket 7c36dd75). Gets the project dir to check all three callers use it.
+            @{ Name = "ClaudePluginLocator.Test"
+               Sources = @("tests\ClaudePluginLocator.Test.cs", "Services\ClaudePluginLocator.cs")
+               Refs = @("System.dll")
+               Args = @($RepoDir) }
+            # 6a4b4d71: closing a tab that was not the active one never repainted the custom-painted strip,
+            # so the closed tab stayed drawn and the other tabs' X buttons seemed dead until a refresh.
+            @{ Name = "TabManager.Close.Test"
+               Sources = @("tests\TabManager.Close.Test.cs", "tests\TabManager.Close.Stubs.cs", "Terminal\TerminalTab.cs", "Terminal\TabManager.cs")
+               Refs = @("System.dll", "System.Drawing.dll", "System.Windows.Forms.dll") }
+            # 0f928849: models.json went stale (no Opus 5.5, retired Copilot/Codex ids). Checks the
+            # registry's internal consistency and the retired-model remap. Gets the project dir to
+            # read the shipped models.json and the Codex launcher's hard-coded default.
+            @{ Name = "ModelRegistry.Test"
+               Sources = @("tests\ModelRegistry.Test.cs", "Services\SettingsService.cs")
+               Refs = @("System.dll", "System.Web.Extensions.dll")
+               Args = @($RepoDir) }
             # c175492a: two IDEs' CA tabs could not tell which MultiTerminal name was theirs. Gets the
             # project dir so it can check the launch resolves the name before composing the prompt.
             @{ Name = "CaAgentIdentity.Test"
                Sources = @("tests\CaAgentIdentity.Test.cs", "Services\CaAgentIdentity.cs")
                Refs = @("System.dll")
+               Args = @($RepoDir) }
+            # GH #263 Q2: a generated module opened as a plain file shows attribute names, not chips.
+            @{ Name = "GeneratedModuleMatch.Test"
+               Sources = @("tests\GeneratedModuleMatch.Test.cs", "Services\GeneratedModuleMatch.cs")
+               Refs = @("System.dll") }
+            # GH #263 run 2: GeneratedSourceWatch's wiring never subscribes a handler twice.
+            @{ Name = "EventWiringOnce.Test"
+               Sources = @("tests\EventWiringOnce.Test.cs", "Services\EventWiringOnce.cs")
+               Refs = @("System.dll", "System.Core.dll")
                Args = @($RepoDir) }
             @{ Name = "NpgsqlLoader.SmokeTest"
                Sources = @("tests\NpgsqlLoader.SmokeTest.cs", "Services\NpgsqlLoader.cs")
@@ -136,6 +163,13 @@ if (-not $NodeOnly -and -not $InstallerOnly) {
             @{ Name = "IdeSolutionRecord.Test"
                Sources = @("tests\IdeSolutionRecord.Test.cs", "Services\IdeSolutionRecord.cs", "Services\EncodingHelper.cs")
                Refs = @("System.dll", "System.Web.Extensions.dll") }
+            # 9e1bd280: every tool in a tab follows the IDE's open solution - --solution only until the IDE publishes,
+            # none once it closes it, the switch reported - and the standalone/LSP/addin wiring reads that one follower.
+            @{ Name = "SolutionFollower.Test"
+               Sources = @("tests\SolutionFollower.Test.cs", "Services\SolutionFollower.cs",
+                           "Services\IdeSolutionRecord.cs", "Services\EncodingHelper.cs")
+               Refs = @("System.dll", "System.Web.Extensions.dll")
+               Args = @($RepoDir) }
             # 0ce0b5e2: a solution's Clarion version - pins, then the IDE's own choice for it (live record, then its
             # saved preferences file, chosen by content with the name hash only as a tiebreak), then the host
             # install. x86 like the IDE, so the hash tiebreak is checked as the IDE computes it.
@@ -145,6 +179,18 @@ if (-not $NodeOnly -and -not $InstallerOnly) {
                            "Services\ClarionVersionService.cs", "Services\ClarionConfigDirectory.cs")
                Refs = @("System.dll", "System.Xml.dll", "System.Core.dll", "System.Web.Extensions.dll")
                Platform = "x86" }
+            # e1df6c2e (GH #244): the standalone server's settings folder for a Clarion run with /ConfigDir (live IDE,
+            # --clarion-config-dir, CLARION_CONFIG_DIR, clarion-assistant.json; a named folder fails closed), and the
+            # plugin launcher's pick of WHICH installed server to start (newest only as a reported fallback).
+            @{ Name = "StandaloneConfigDir.Test"
+               Sources = @("tests\StandaloneConfigDir.Test.cs", "mcp-server\StandaloneConfigDir.cs",
+                           "mcp-server\SolutionClarionVersion.cs", "mcp-server\ServerPicker.cs",
+                           "Services\IdeSolutionRecord.cs", "Services\SolutionFollower.cs", "Services\EncodingHelper.cs",
+                           "Services\SolutionVersionResolver.cs", "Services\ClarionVersionService.cs",
+                           "Services\ClarionConfigDirectory.cs")
+               Refs = @("System.dll", "System.Xml.dll", "System.Core.dll", "System.Web.Extensions.dll")
+               # The project dir: the running-server downgrade checks need the BUILT server (a real file version).
+               Args = @($RepoDir) }
             # GH #209: the running Clarion.exe matched the FIRST version entry on its bin folder (a
             # Clarion.NET compiler, not the IDE). Fixture = the reporter's own ClarionProperties.xml.
             @{ Name = "ClarionVersionService.ExeMatchTest"
@@ -181,6 +227,12 @@ if (-not $NodeOnly -and -not $InstallerOnly) {
                Sources = @("tests\EmbedLspContext.LineMapping.cs", "tests\EmbedLspContext.LineMapping.Stubs.cs",
                            "Services\EmbedLspContext.cs", "Services\RedFileService.cs", "Services\EncodingHelper.cs")
                Refs = @("System.dll", "System.Core.dll") }
+            # H1-a: the CA Embeditor's hover links to its own module, put in embeditor lines (server card)
+            # or marked ?ondisk (index card, disk lines); links to other files untouched.
+            @{ Name = "EmbedLspContext.SelfLinks"
+               Sources = @("tests\EmbedLspContext.SelfLinks.cs", "tests\EmbedLspContext.LineMapping.Stubs.cs",
+                           "Services\EmbedLspContext.cs", "Services\RedFileService.cs", "Services\EncodingHelper.cs")
+               Refs = @("System.dll", "System.Core.dll") }
             # 16d140e9: the CA Explorer header's APP/VERSION/ROOT values and the path check in front of
             # the "open in Windows Explorer" clicks. Existence probes injected; touches no real path.
             @{ Name = "ExplorerHeader.Test"
@@ -193,6 +245,14 @@ if (-not $NodeOnly -and -not $InstallerOnly) {
             @{ Name = "ClarionClDiagnosis.Test"
                Sources = @("tests\ClarionClDiagnosis.Test.cs", "Services\ClarionClDiagnosis.cs")
                Refs = @("System.dll") }
+            # GH #204 (708139c0): app vs. source project detection and the real output path (.cwproj OutputPath per
+            # configuration, else the .red), plus a source scan that the three ClarionCL tools use them.
+            @{ Name = "ClarionBuildTarget.Test"
+               Sources = @("tests\ClarionBuildTarget.Test.cs", "Services\ClarionBuildTarget.cs", "tests\EmbedLspContext.RedResolve.Stubs.cs",
+                           "Services\RedFileService.cs", "Services\EncodingHelper.cs", "Services\RedResolution.cs",
+                           "CodeGraph\Parsing\SolutionParser.cs", "CodeGraph\Parsing\Models\SolutionProject.cs")
+               Refs = @("System.dll", "System.Core.dll", "System.Xml.dll")
+               Args = @($RepoDir) }
             # PR #228: the embeditor finds the generated module through the .red's build sections too.
             @{ Name = "EmbedLspContext.RedResolve.Test"
                Sources = @("tests\EmbedLspContext.RedResolve.Test.cs", "tests\EmbedLspContext.RedResolve.Stubs.cs",
@@ -203,6 +263,19 @@ if (-not $NodeOnly -and -not $InstallerOnly) {
             @{ Name = "RedFileService.FailClosed.Test"
                Sources = @("tests\RedFileService.FailClosed.Test.cs", "tests\EmbedLspContext.RedResolve.Stubs.cs",
                            "Services\EmbedLspContext.cs", "Services\RedFileService.cs", "Services\EncodingHelper.cs")
+               Refs = @("System.dll", "System.Core.dll") }
+            # GH #261: {include} lines are followed (a local .red that includes %BIN%\clarion110.red resolved
+            # none of the app's .\clw modules), repeated sections add up, and IsStale sees an edited .red.
+            @{ Name = "RedFileService.Include.Test"
+               Sources = @("tests\RedFileService.Include.Test.cs", "tests\EmbedLspContext.RedResolve.Stubs.cs",
+                           "Services\EmbedLspContext.cs", "Services\RedFileService.cs", "Services\EncodingHelper.cs")
+               Refs = @("System.dll", "System.Core.dll") }
+            # 5a5581e6: template search paths (*.tp?/*.tpl/*.tpw in .red order) and relative entries anchored at the
+            # solution folder - what get_solution_info / get_red_search_paths hand the agent instead of a drive search.
+            @{ Name = "RedFileService.SearchPaths.Test"
+               Sources = @("tests\RedFileService.SearchPaths.Test.cs", "tests\EmbedLspContext.RedResolve.Stubs.cs",
+                           "Services\EmbedLspContext.cs", "Services\RedFileService.cs", "Services\EncodingHelper.cs",
+                           "Services\RedResolution.cs", "CodeGraph\Parsing\SolutionParser.cs", "CodeGraph\Parsing\Models\SolutionProject.cs")
                Refs = @("System.dll", "System.Core.dll") }
             # PR #208: a hung instance stays swept, a busy one re-registers, beats never overlap.
             # The vendored SQLite is x86-only (SQLite.Interop.dll), hence Platform and the copies.
@@ -237,7 +310,7 @@ if (-not $NodeOnly -and -not $InstallerOnly) {
             @{ Name = "EmbedToolRouter.Test"
                Sources = @("tests\EmbedToolRouter.Test.cs", "Services\EmbedToolRouter.cs", "Services\EmbedSlotText.cs",
                            "Services\EditorToolRouter.cs", "Services\HostRequestBroker.cs", "Services\EditorTextOps.cs",
-                           "Services\IUiDispatcher.cs")
+                           "Services\IUiDispatcher.cs", "Services\FileIdentity.cs")
                Refs = @("System.dll", "System.Core.dll", "System.Web.Extensions.dll") }
             # PR #198 pipeline round: apply_embed_edits' write/commit/save half - an abandoned call rolls
             # back instead of saving; a failed save or unconfirmed close discards our writes.
@@ -249,7 +322,7 @@ if (-not $NodeOnly -and -not $InstallerOnly) {
             # detaches and never cancels, recovery files are BOM-free and atomic, the stash restores per slot.
             @{ Name = "EmbedSaveFlow.Test"
                Sources = @("tests\EmbedSaveFlow.Test.cs", "Services\EmbedSaveFlow.cs", "Services\EmbedRecovery.cs",
-                           "Services\TextLines.cs")
+                           "Services\EmbedSaveJournal.cs", "Services\TextLines.cs")
                Refs = @("System.dll", "System.Core.dll") }
             # ... and the ordering in the IDE-coupled callers that the harness above can't reach (red on 3904549).
             @{ Name = "EmbedSaveOrder.SourceScan"
@@ -288,9 +361,11 @@ if (-not $NodeOnly -and -not $InstallerOnly) {
                Args = @((Join-Path $TestDir "fixtures\incremental-sync\fake-lsp.js")) }
             # fc420c30: the MCP editor tools against the CA Editor (Monaco) — reads and writes hit its text, never the
             # native document under it; save keeps the edit; a dirty close is refused; fail closed; native unchanged.
+            # b8f9431c N1/N2: edits and saves gated on the ACTIVE file's write access (embeds exempt); file_path as text.
             @{ Name = "EditorToolRouter.Test"
                Sources = @("tests\EditorToolRouter.Test.cs", "Services\EditorToolRouter.cs", "Services\HostRequestBroker.cs",
-                           "Services\EditorTextOps.cs", "Services\IUiDispatcher.cs")
+                           "Services\EditorTextOps.cs", "Services\IUiDispatcher.cs", "Services\FileIdentity.cs",
+                           "Services\EmbedToolRouter.cs", "Services\EmbedSlotText.cs")
                Refs = @("System.dll", "System.Core.dll", "System.Web.Extensions.dll") }
             @{ Name = "LspClient.Robustness.Test"
                Sources = @("tests\LspClient.Robustness.Test.cs", "Services\LspClient.cs", "Services\LspTextDiff.cs", "Services\JsonTextStream.cs", "Services\LspTrace.cs", "Services\EncodingHelper.cs")
@@ -366,6 +441,17 @@ if (-not $NodeOnly -and -not $InstallerOnly) {
                Copy = @("lib\sqlite-fts5\System.Data.SQLite.dll", "lib\sqlite-fts5\SQLite.Interop.dll")
                Platform = "x86"
                Args = @($RepoDir) }
+            # GH #267 (b9260ec6): the .dctx ingest carries key CaseSensitive/AutoNumber/ExternalName, field InitialValue/
+            # DerivedFrom/BaseType/ExternalName/Binary/Password/ReadOnly and table Path; get_table shows them; a pre-#267
+            # database answers read-only and gains the columns on EnsureDatabase; the SQLite merge path still ingests.
+            @{ Name = "SchemaGraphService.Ingest.Test"
+               Sources = @("tests\SchemaGraphService.Ingest.Test.cs", "Services\SchemaGraphService.cs", "Services\NpgsqlLoader.cs",
+                           "Services\LspClient.cs", "Services\LspTextDiff.cs", "Services\JsonTextStream.cs", "Services\LspTrace.cs", "Services\EncodingHelper.cs")
+               Refs = @("System.dll", "System.Core.dll", "System.Data.dll", "System.Xml.dll", "System.Security.dll", "System.Web.Extensions.dll")
+               RepoRefs = @("lib\sqlite-fts5\System.Data.SQLite.dll")
+               Copy = @("lib\sqlite-fts5\System.Data.SQLite.dll", "lib\sqlite-fts5\SQLite.Interop.dll")
+               Platform = "x86"
+               Args = @((Join-Path $TestDir "fixtures\schemagraph-gh267\attrs.dctx")) }
             # PR #237: the active tab re-selected on solution reopen - a view opening before the reopen loop
             # (the .app tab from Recent Applications) neither gives up the restore nor lets the loop record
             # over the saved choice; the store's temp file is per process and never left behind. IDE stubbed.
@@ -399,6 +485,145 @@ if (-not $NodeOnly -and -not $InstallerOnly) {
                            "CodeGraph\Parsing\Models\ClarionSymbol.cs", "CodeGraph\Parsing\Models\ClarionRelationship.cs",
                            "CodeGraph\Parsing\Models\ParseResult.cs", "Services\EncodingHelper.cs")
                Refs = @("System.dll", "System.Core.dll") }
+            # GH #266: the path policy the MCP file tools and the Everything tools go through - allowed roots,
+            # deny-wins, canonicalisation (sibling prefix, '..', UNC/device, case, separators), a REAL junction
+            # and 8.3 name, CA's read-only data folder, and the no-solution scope.
+            @{ Name = "McpPathPolicy.Test"
+               Sources = @("tests\McpPathPolicy.Test.cs", "Services\McpPathPolicy.cs")
+               Refs = @("System.dll") }
+            # The REAL indexer end to end over a temp solution: CLASS MODULE()/LINK() followed to the implementing
+            # .clw through the project's .red and build configuration (GH #245), honest coverage status (#244 item 3);
+            # every feature check re-run with the pass off, where it must fail (x86 SQLite).
+            @{ Name = "CodeGraphIndexer.ModuleLink.Test"
+               Sources = @("tests\CodeGraphIndexer.ModuleLink.Test.cs",
+                           "CodeGraph\Graph\CodeGraphIndexer.cs", "CodeGraph\Graph\CodeGraphDatabase.cs", "CodeGraph\Graph\IndexProgress.cs",
+                           "CodeGraph\Parsing\ClarionParser.cs", "CodeGraph\Parsing\ClarionBuiltins.cs", "CodeGraph\Parsing\SolutionParser.cs",
+                           "CodeGraph\Parsing\ProjectParser.cs", "CodeGraph\Parsing\SourceResolver.cs",
+                           "CodeGraph\Parsing\Models\ClarionSymbol.cs", "CodeGraph\Parsing\Models\ClarionRelationship.cs",
+                           "CodeGraph\Parsing\Models\ParseResult.cs", "CodeGraph\Parsing\Models\SolutionProject.cs",
+                           "Services\RedFileService.cs", "Services\RedResolution.cs", "Services\ClarionConfigDirectory.cs",
+                           "Services\ClarionVersionService.cs", "Services\EncodingHelper.cs")
+               Refs = @("System.dll", "System.Core.dll", "System.Xml.dll", "System.Data.dll")
+               RepoRefs = @("lib\sqlite-fts5\System.Data.SQLite.dll")
+               Copy = @("lib\sqlite-fts5\System.Data.SQLite.dll", "lib\sqlite-fts5\SQLite.Interop.dll")
+               Platform = "x86" }
+            # The REAL indexer end to end: data in an .inc INCLUDEd into the PROGRAM's global data is scope='global',
+            # and calls through such a global object (Mark's ActiveThreads.Add in N modules) link to the class's
+            # method, inherited ones included (GH #246); every feature check re-run with the pass off (x86 SQLite).
+            @{ Name = "CodeGraphIndexer.GlobalObject.Test"
+               Sources = @("tests\CodeGraphIndexer.GlobalObject.Test.cs",
+                           "CodeGraph\Graph\CodeGraphIndexer.cs", "CodeGraph\Graph\CodeGraphDatabase.cs", "CodeGraph\Graph\IndexProgress.cs",
+                           "CodeGraph\Parsing\ClarionParser.cs", "CodeGraph\Parsing\ClarionBuiltins.cs", "CodeGraph\Parsing\SolutionParser.cs",
+                           "CodeGraph\Parsing\ProjectParser.cs", "CodeGraph\Parsing\SourceResolver.cs",
+                           "CodeGraph\Parsing\Models\ClarionSymbol.cs", "CodeGraph\Parsing\Models\ClarionRelationship.cs",
+                           "CodeGraph\Parsing\Models\ParseResult.cs", "CodeGraph\Parsing\Models\SolutionProject.cs",
+                           "Services\RedFileService.cs", "Services\RedResolution.cs", "Services\ClarionConfigDirectory.cs",
+                           "Services\ClarionVersionService.cs", "Services\EncodingHelper.cs")
+               Refs = @("System.dll", "System.Core.dll", "System.Xml.dll", "System.Data.dll")
+               RepoRefs = @("lib\sqlite-fts5\System.Data.SQLite.dll")
+               Copy = @("lib\sqlite-fts5\System.Data.SQLite.dll", "lib\sqlite-fts5\SQLite.Interop.dll")
+               Platform = "x86" }
+            # GH #271: Pass 2b reads INCLUDE() as the compiler does - a commented-out INCLUDE is not followed, one that
+            # does not resolve inside a conditional COMPILE/OMIT block is unresolved_conditional (not a gap), and the
+            # warning names each real gap with its includer; the feature checks fail on 6.1.0 (x86 SQLite).
+            @{ Name = "CodeGraphIndexer.IncludeOutcome.Test"
+               Sources = @("tests\CodeGraphIndexer.IncludeOutcome.Test.cs",
+                           "CodeGraph\Graph\CodeGraphIndexer.cs", "CodeGraph\Graph\CodeGraphDatabase.cs", "CodeGraph\Graph\IndexProgress.cs",
+                           "CodeGraph\Parsing\ClarionParser.cs", "CodeGraph\Parsing\ClarionBuiltins.cs", "CodeGraph\Parsing\SolutionParser.cs",
+                           "CodeGraph\Parsing\ProjectParser.cs", "CodeGraph\Parsing\SourceResolver.cs",
+                           "CodeGraph\Parsing\Models\ClarionSymbol.cs", "CodeGraph\Parsing\Models\ClarionRelationship.cs",
+                           "CodeGraph\Parsing\Models\ParseResult.cs", "CodeGraph\Parsing\Models\SolutionProject.cs",
+                           "Services\RedFileService.cs", "Services\RedResolution.cs", "Services\ClarionConfigDirectory.cs",
+                           "Services\ClarionVersionService.cs", "Services\EncodingHelper.cs")
+               Refs = @("System.dll", "System.Core.dll", "System.Xml.dll", "System.Data.dll")
+               RepoRefs = @("lib\sqlite-fts5\System.Data.SQLite.dll")
+               Copy = @("lib\sqlite-fts5\System.Data.SQLite.dll", "lib\sqlite-fts5\SQLite.Interop.dll")
+               Platform = "x86" }
+            # integ-1023 review D1-D5: the include guard (ABUTIL.INC's OMIT('_EndOfInclude_',_XPresent_)) does not hide
+            # a real gap, a .cwproj-listed .inc is judged by how it is reached, an outer block can end inside an OMIT,
+            # a | in a comment is no continuation, and the .red {include} log line is worded per reason; 15 of 22
+            # checks fail on 3e57b84 (x86 SQLite).
+            @{ Name = "CodeGraphIndexer.IncludeGuard.Test"
+               Sources = @("tests\CodeGraphIndexer.IncludeGuard.Test.cs",
+                           "CodeGraph\Graph\CodeGraphIndexer.cs", "CodeGraph\Graph\CodeGraphDatabase.cs", "CodeGraph\Graph\IndexProgress.cs",
+                           "CodeGraph\Parsing\ClarionParser.cs", "CodeGraph\Parsing\ClarionBuiltins.cs", "CodeGraph\Parsing\SolutionParser.cs",
+                           "CodeGraph\Parsing\ProjectParser.cs", "CodeGraph\Parsing\SourceResolver.cs",
+                           "CodeGraph\Parsing\Models\ClarionSymbol.cs", "CodeGraph\Parsing\Models\ClarionRelationship.cs",
+                           "CodeGraph\Parsing\Models\ParseResult.cs", "CodeGraph\Parsing\Models\SolutionProject.cs",
+                           "Services\RedFileService.cs", "Services\RedResolution.cs", "Services\ClarionConfigDirectory.cs",
+                           "Services\ClarionVersionService.cs", "Services\EncodingHelper.cs")
+               Refs = @("System.dll", "System.Core.dll", "System.Xml.dll", "System.Data.dll")
+               RepoRefs = @("lib\sqlite-fts5\System.Data.SQLite.dll")
+               Copy = @("lib\sqlite-fts5\System.Data.SQLite.dll", "lib\sqlite-fts5\SQLite.Interop.dll")
+               Platform = "x86" }
+            # ef2fd2a9 / cea47717: an incremental index of a database built below the current feature level (or with
+            # none recorded) runs FULL and says so; a current database stays incremental and an unchanged one reads
+            # "up to date", not a bare 0-symbol success (x86 SQLite).
+            @{ Name = "CodeGraphIndexer.FeatureUpgrade.Test"
+               Sources = @("tests\CodeGraphIndexer.FeatureUpgrade.Test.cs",
+                           "CodeGraph\Graph\CodeGraphIndexer.cs", "CodeGraph\Graph\CodeGraphDatabase.cs", "CodeGraph\Graph\IndexProgress.cs",
+                           "CodeGraph\Parsing\ClarionParser.cs", "CodeGraph\Parsing\ClarionBuiltins.cs", "CodeGraph\Parsing\SolutionParser.cs",
+                           "CodeGraph\Parsing\ProjectParser.cs", "CodeGraph\Parsing\SourceResolver.cs",
+                           "CodeGraph\Parsing\Models\ClarionSymbol.cs", "CodeGraph\Parsing\Models\ClarionRelationship.cs",
+                           "CodeGraph\Parsing\Models\ParseResult.cs", "CodeGraph\Parsing\Models\SolutionProject.cs",
+                           "Services\RedFileService.cs", "Services\RedResolution.cs", "Services\ClarionConfigDirectory.cs",
+                           "Services\ClarionVersionService.cs", "Services\EncodingHelper.cs")
+               Refs = @("System.dll", "System.Core.dll", "System.Xml.dll", "System.Data.dll")
+               RepoRefs = @("lib\sqlite-fts5\System.Data.SQLite.dll")
+               Copy = @("lib\sqlite-fts5\System.Data.SQLite.dll", "lib\sqlite-fts5\SQLite.Interop.dll")
+               Platform = "x86" }
+            # 583abdec: every host-side index runs in clarion-indexer.exe (64-bit), not in the 32-bit IDE. This 32-bit
+            # harness builds the REAL indexer into a deployed-addin-like folder (32-bit interop at its root), runs it
+            # through the REAL OutOfProcessIndexer, and requires the in-process run's result, rows and progress stream;
+            # plus the protocol round trip, cancel (graceful and killed), child failures and the missing-exe fallback.
+            # Review fixes: the child's own writer lock (D1), an unstartable exe falls back (D2), a finished run is never
+            # a cancel (D3), the last stdout object (D4a), UTF-8 before the preload (D4b), absolute paths (L1), one-line
+            # stderr text (L2), the short MCP failure reply (L3).
+            @{ Name = "OutOfProcessIndexer.Test"
+               Sources = @("tests\OutOfProcessIndexer.Test.cs", "Services\OutOfProcessIndexer.cs", "CodeGraph\Graph\IndexerProtocol.cs",
+                           "CodeGraph\Graph\CodeGraphIndexer.cs", "CodeGraph\Graph\CodeGraphDatabase.cs", "CodeGraph\Graph\IndexProgress.cs",
+                           "CodeGraph\Parsing\ClarionParser.cs", "CodeGraph\Parsing\ClarionBuiltins.cs", "CodeGraph\Parsing\SolutionParser.cs",
+                           "CodeGraph\Parsing\ProjectParser.cs", "CodeGraph\Parsing\SourceResolver.cs",
+                           "CodeGraph\Parsing\Models\ClarionSymbol.cs", "CodeGraph\Parsing\Models\ClarionRelationship.cs",
+                           "CodeGraph\Parsing\Models\ParseResult.cs", "CodeGraph\Parsing\Models\SolutionProject.cs",
+                           "Services\RedFileService.cs", "Services\RedResolution.cs", "Services\ClarionConfigDirectory.cs",
+                           "Services\ClarionVersionService.cs", "Services\EncodingHelper.cs", "Services\IndexRunGate.cs")
+               Refs = @("System.dll", "System.Core.dll", "System.Xml.dll", "System.Data.dll")
+               RepoRefs = @("lib\sqlite-fts5\System.Data.SQLite.dll")
+               Copy = @("lib\sqlite-fts5\System.Data.SQLite.dll", "lib\sqlite-fts5\SQLite.Interop.dll")
+               Platform = "x86"
+               Args = @($csc, $RepoDir) }
+            # GH #205: write_file / append_to_file vs an open native editor tab - refuse under unsaved changes (file
+            # untouched), reload a clean tab only AFTER a successful write, the override, the CA Editor note, and the
+            # could-not-check line when no IDE answers. The IDE half is pinned by OpenTabGuard.SourceScan.ps1.
+            @{ Name = "OpenTabGuard.Test"
+               Sources = @("tests\OpenTabGuard.Test.cs", "Services\OpenTabGuard.cs", "Services\FileIdentity.cs")
+               Refs = @("System.dll", "System.Core.dll", "System.Web.Extensions.dll") }
+            # GH #205 review: the IDE file-watcher hold's bookkeeping - counted holders, a cap from the FIRST hold that is
+            # never renewed (plus a cool-down), and a generation per hold that a late timer or release must still match.
+            @{ Name = "WatcherHoldBook.Test"
+               Sources = @("tests\WatcherHoldBook.Test.cs", "Services\WatcherHoldBook.cs")
+               Refs = @("System.dll") }
+            # GH #205 pipeline run 1: the open-tab check matches a tab by FILE IDENTITY - a REAL junction, hard link,
+            # subst drive, symlink and 8.3 name (the last three skipped, never passed, when this machine cannot make them).
+            @{ Name = "FileIdentity.Test"
+               Sources = @("tests\FileIdentity.Test.cs", "Services\FileIdentity.cs")
+               Refs = @("System.dll") }
+            # GH #205 pipeline run 1: IDEs asked in parallel inside one budget, a timed-out IDE skipped for a minute; and
+            # one endpoint record per IDE whichever of its servers runs (no chat pane needed).
+            @{ Name = "IdeFanOut.Test"
+               Sources = @("tests\IdeFanOut.Test.cs", "Services\IdeFanOut.cs", "Services\EndpointOwnership.cs", "Services\OpenTabGuard.cs", "Services\FileIdentity.cs")
+               Refs = @("System.dll", "System.Core.dll") }
+            # GH #205 pipeline run 2: every endpoint publish sweeps records (with tokens) of IDEs that died without Stop.
+            @{ Name = "EndpointRecordSweep.Test"
+               Sources = @("tests\EndpointRecordSweep.Test.cs", "Services\IdeEndpointRecord.cs", "Services\IdeSolutionRecord.cs", "Services\EncodingHelper.cs")
+               Refs = @("System.dll", "System.Web.Extensions.dll") }
+            # GH #279 follow-up (integ-1023 review D6/D7): the header's CodeGraph line - "Rebuilding index..." for an
+            # incremental request that runs full, the early real-work signal, an error/cancel line that stays until the
+            # database changes, and a queued check for another solution. Does not exist on 3e57b84.
+            @{ Name = "IndexHeaderStatus.Test"
+               Sources = @("tests\IndexHeaderStatus.Test.cs", "Services\IndexHeaderStatus.cs")
+               Refs = @("System.dll") }
         )
         if ($Probe) {
             $harnesses += @{ Name = "VsCodeSettingsImporter.LiveProbe"

@@ -2019,7 +2019,11 @@ namespace ClarionAssistant.Terminal
         {
             _isInitialized = success;
             if (_embedOverlay && success) RemoveOverlayCover();
+            // An in-memory stash for this procedure is restored as before; the save journal then waits for its own
+            // next open, so two restores never compete for the same slots (GH #179).
+            bool memStash = _embedOverlay && PeekStash(_procedureName) != null;
             if (_embedOverlay && success) TryRestoreStashedEdits();   // re-apply edits an external teardown stashed (d19c036d)
+            if (!_fileMode && success && !memStash) CheckSaveJournal();   // a save that did not survive the Generator (GH #179)
             FocusIfActiveTab();   // #66 round-4: the INITIAL open never fires SwitchedTo (the tab is born selected)
         }
 
@@ -2068,6 +2072,215 @@ namespace ClarionAssistant.Terminal
             catch (Exception ex) { ClarionAssistant.MonacoSpikeLog.Write("TryRestoreStashedEdits error: " + ex.Message); }
         }
 
+        // ---------------- save journal (GH #179, 254e4353) ----------------
+        // ok=True from SaveLive means "handed to Clarion", not "persisted": the Generator can fault ~60 ms later and
+        // take the edit with it. Every embed save is journaled BEFORE the native round-trip and the journal is kept
+        // through ok=True; THIS method, on the next open of the procedure, decides from the freshly loaded slots
+        // whether that save landed. See Services.EmbedSaveJournal for why the open, not a timer, is the proof.
+        private bool _journalChecked;            // CheckSaveJournal runs once per view
+        private Services.EmbedSaveJournal.Entry _offeredJournal;   // the entry the page is offering, if any
+        private string _offeredCopy;   // the copy the offer already wrote for slots it could not place, if any
+
+        /// <summary>The .app this embed belongs to, captured by the launcher while the native embed was open
+        /// (AppTreeService.GetOpenEmbedAppFileName). Null = unknown: the save journal is then off for this view,
+        /// never filed under a guessed app (pipeline run 1: the "current app" falls back to the FIRST app view when
+        /// a CA tab is active, which with several apps open is the wrong one).</summary>
+        internal string EmbedAppFile { get; set; }
+
+        private string JournalApp()
+        {
+            return string.IsNullOrWhiteSpace(EmbedAppFile) ? null : EmbedAppFile;
+        }
+
+        // Once per IDE session, at the first CA Embeditor open: archive journals nobody reopened for 30 days
+        // (pipeline run 2), so they never surface months later as a stale "lost save". UI thread only.
+        private static bool _journalSwept;
+        private static void SweepStaleJournalsOnce()
+        {
+            if (_journalSwept) return;
+            _journalSwept = true;
+            try
+            {
+                foreach (var rec in Services.EmbedSaveJournal.SweepStale(DateTime.Now))
+                    MonacoSpikeLog.Write("[save-journal] stale entry archived unoffered: " + rec);
+                // ...and the dated recovery copies themselves, which Restore/Discard and failures keep adding
+                // (pipeline run 3). The pending journal folder is never touched.
+                int pruned = Services.EmbedRecovery.PruneOlderThan(Services.EmbedSaveJournal.MaxAge, DateTime.Now);
+                if (pruned > 0) MonacoSpikeLog.Write("[save-journal] deleted " + pruned + " recovery cop(ies) older than " +
+                    (int)Services.EmbedSaveJournal.MaxAge.TotalDays + " days");
+            }
+            catch { }
+        }
+
+        private static int MyPid()
+        {
+            try { return System.Diagnostics.Process.GetCurrentProcess().Id; } catch { return 0; }
+        }
+
+        private static DateTime? MyStart()
+        {
+            // UTC, like the journal's times (ruling F2-3).
+            try { return System.Diagnostics.Process.GetCurrentProcess().StartTime.ToUniversalTime(); } catch { return null; }
+        }
+
+        private void CheckSaveJournal()
+        {
+            if (_journalChecked || _panel == null || string.IsNullOrEmpty(_procedureName)) return;
+            _journalChecked = true;
+            SweepStaleJournalsOnce();
+            if (JournalApp() == null) { MonacoSpikeLog.Write("[save-journal] open " + _procedureName + ": app unknown, not checked"); return; }
+            try
+            {
+                var e = Services.EmbedSaveJournal.Read(JournalApp(), _procedureName);
+                if (e == null) return;
+                DateTime? appWrite = null;
+                try { if (File.Exists(JournalApp())) appWrite = File.GetLastWriteTimeUtc(JournalApp()); } catch { }
+                var verdict = Services.EmbedSaveJournal.Assess(e, _originalSlotTexts);
+                // G1 (live test 2026-10-19): a Persisted entry is retired only once the .app was written after it;
+                // until then Recover's text may be only in memory, so it is kept and the log says why.
+                var act = Services.EmbedSaveJournal.Decide(e, _originalSlotTexts, MyPid(), MyStart(), appWrite);
+                MonacoSpikeLog.Write("[save-journal] open " + _procedureName + ": entry of " + e.Written.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss") +
+                    " (pid " + e.Pid + ", " + e.Index.Count + " slot(s), " + e.SlotCount + " slots then, " +
+                    (_originalSlotTexts == null ? "?" : _originalSlotTexts.Count.ToString()) + " now), app written " +
+                    (appWrite.HasValue ? appWrite.Value.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss") : "?") + " -> " + verdict + " -> " + act +
+                    (act == Services.EmbedSaveJournal.OpenDecision.Keep
+                        ? " (" + Services.EmbedSaveJournal.KeepReason(e, MyPid(), MyStart(), appWrite) + ")" : ""));
+                var ser = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+                if (act == Services.EmbedSaveJournal.OpenDecision.Retire)
+                {
+                    Services.EmbedSaveJournal.Retire(JournalApp(), _procedureName);   // read back by a later session, .app saved since
+                    return;
+                }
+                if (act == Services.EmbedSaveJournal.OpenDecision.Keep) return;   // maybe only in an in-memory .app: say nothing
+                string when = e.Written.ToLocalTime().ToString("yyyy-MM-dd HH:mm");
+                if (act == Services.EmbedSaveJournal.OpenDecision.Archive)
+                {
+                    // Changed since IN THIS SESSION (e.g. edited in Clarion's own embeditor after the CA save):
+                    // offering it would overwrite newer work. SILENT (pipeline run 3): a toast on every such open was
+                    // noise. The dated copy and the log line remain. An entry from an EARLIER session never gets here
+                    // (Decide offers it: live test 2026-10-19, "Last Saved" reverted past the save's baseline).
+                    string rec = Services.EmbedSaveJournal.Archive(e, "this embed has changed since");
+                    MonacoSpikeLog.Write("[save-journal] archived silently (changed since " + when + ", same session) " + rec);
+                    return;
+                }
+                // Offered even if the .app was written after the save (PM ruling): the #179 crash leaves exactly that
+                // trace, as does a deliberate revert, so the wording names both and the developer decides.
+                var plan = Services.EmbedSaveJournal.PlanRestore(e, _originalSlotTexts);
+                if (plan == null) return;
+                string copy = null;
+                if (plan.Unplaced.Count > 0)
+                {
+                    // Never guessed: the slots that cannot be identified go to a dated copy the toast names. One copy
+                    // per entry (ruling 5): an offer nobody answers finds its copy again at the next open.
+                    copy = Services.EmbedSaveJournal.WriteCopy(e, plan.Unplaced.Count + " changed embed(s) could not be " +
+                        "placed when it was offered back (the procedure's embed points changed)");
+                    MonacoSpikeLog.Write("[save-journal] " + plan.Unplaced.Count + " slot(s) not placeable (" +
+                        string.Join(",", plan.Unplaced) + "); copy in " + copy);
+                }
+                if (plan.Placed == 0)
+                {
+                    if (copy == null)
+                    {
+                        // Every changed slot is proven to show its saved text (PlanRestore's Present, ruling F2-1 / 6):
+                        // nothing to put back. Still archived, not retired: a dated copy outlives the journal.
+                        string rec = Services.EmbedSaveJournal.Archive(e, "its text is already in the procedure");
+                        MonacoSpikeLog.Write("[save-journal] nothing to restore (text already present); copy kept in " + rec);
+                        return;
+                    }
+                    Services.EmbedSaveJournal.Retire(JournalApp(), _procedureName);   // the copy holds it now
+                    _panel.PostJson("{\"type\":\"toast\",\"ok\":false,\"message\":" +
+                        ser.Serialize(Services.EmbedSaveJournal.NotPlaceableMessage(e, copy)) + "}");
+                    return;
+                }
+                // Ruling F2-2: Restore replaces the procedure's current text in plan.Replaced, which may be native work
+                // saved after the CA save. A dated copy of that text is written BEFORE the offer can be answered; if it
+                // cannot be written, nothing is offered (the journal stays, and the next open tries again).
+                string current;
+                try { current = Services.EmbedSaveJournal.WriteCurrentCopy(e, _originalSlotTexts, plan); }
+                catch (Exception cx)
+                {
+                    MonacoSpikeLog.Write("[save-journal] current-text copy FAILED, not offered: " + cx.Message);
+                    _panel.PostJson("{\"type\":\"toast\",\"ok\":false,\"message\":" + ser.Serialize(
+                        "Your CA Embeditor save of " + _procedureName + " on " + when + " is not in this procedure, but it is not " +
+                        "offered now: a copy of the current text could not be written first (" + cx.Message + "). It is kept " +
+                        "and offered again the next time this procedure opens.") + "}");
+                    return;
+                }
+                if (current != null) MonacoSpikeLog.Write("[save-journal] current text of " + plan.Replaced.Count + " slot(s) kept in " + current);
+                _offeredJournal = e;
+                _offeredCopy = copy;
+                _panel.PostJson("{\"type\":\"offerSavedEdits\",\"message\":" + ser.Serialize(
+                    Services.EmbedSaveJournal.OfferMessage(e, appWrite, _originalSlotTexts, plan, copy, current)) +
+                    ",\"slots\":" + ser.Serialize(plan.Slots) + "}");
+            }
+            catch (Exception ex) { MonacoSpikeLog.Write("[save-journal] open check error: " + ex.Message); }
+        }
+
+        /// <summary>{action:"savedEditsOffer", choice:"restore"|"discard"} — the developer answered the offer.
+        /// Restore: the page has put the text in as unsaved edits; the journal becomes a dated recovery file (a disk
+        /// copy until they save, and it no longer looks like an unconfirmed save). Discard: also archived, not
+        /// offered again. Dismissing the toast sends nothing, and the offer comes back at the next open.</summary>
+        private void HandleSavedEditsOffer(string rawJson)
+        {
+            try
+            {
+                var e = _offeredJournal;
+                if (e == null) return;
+                var data = new JavaScriptSerializer().DeserializeObject(rawJson) as Dictionary<string, object>;
+                object c;
+                string choice = data != null && data.TryGetValue("choice", out c) && c != null ? c.ToString() : "";
+                // When the offer already wrote a copy (some slots could not be placed), that copy is the one kept:
+                // the journal is just retired, so one offer leaves one file.
+                string copy = _offeredCopy;
+                if (choice == "restore")
+                {
+                    _offeredJournal = null; _offeredCopy = null;
+                    string rec = copy != null && Services.EmbedSaveJournal.Retire(JournalApp(), _procedureName) ? copy
+                        : Services.EmbedSaveJournal.Archive(e, "it was restored into the CA Embeditor as unsaved edits");
+                    MonacoSpikeLog.Write("[save-journal] restored into the editor; copy kept in " + rec);
+                }
+                else if (choice == "discard")
+                {
+                    // Not offered again, but a dated copy is still kept: Discard may have been a misclick (PM ruling).
+                    _offeredJournal = null; _offeredCopy = null;
+                    string rec = copy != null && Services.EmbedSaveJournal.Retire(JournalApp(), _procedureName) ? copy
+                        : Services.EmbedSaveJournal.Archive(e, "the developer chose Discard when it was offered");
+                    MonacoSpikeLog.Write("[save-journal] discarded by the developer (" + _procedureName + "); copy kept in " + rec);
+                }
+            }
+            catch (Exception ex) { MonacoSpikeLog.Write("[save-journal] offer answer error: " + ex.Message); }
+        }
+
+        /// <summary>Journal this save before Clarion gets it. Never throws and never blocks the save: a journal
+        /// that cannot be written is logged, and the save goes ahead as it did before.</summary>
+        private void BeginSaveJournal(List<string> current)
+        {
+            if (string.IsNullOrEmpty(_procedureName)) return;
+            if (JournalApp() == null) { MonacoSpikeLog.Write("[save-journal] skipped: the app of " + _procedureName + " is unknown"); return; }
+            try
+            {
+                string archived;
+                string path = Services.EmbedSaveJournal.Begin(JournalApp(), _procedureName, _originalSlotTexts, current, out archived);
+                if (archived != null) MonacoSpikeLog.Write("[save-journal] an unconfirmed earlier save was archived to " + archived);
+                if (path != null)
+                {
+                    // The slot list shows any slots carried over from a kept, not-yet-saved earlier entry (G1).
+                    var kept = Services.EmbedSaveJournal.Read(JournalApp(), _procedureName);
+                    MonacoSpikeLog.Write("[save-journal] kept " + path + (kept != null ? " (slots " + string.Join(",", kept.Index) + ")" : ""));
+                }
+            }
+            catch (Exception ex) { MonacoSpikeLog.Write("[save-journal] write FAILED (saving anyway): " + ex.Message); }
+        }
+
+        /// <summary>The save did not go through and the text is still in the editor: the journal claims a save
+        /// that never happened, so it goes.</summary>
+        private void RetireSaveJournal(string why)
+        {
+            if (string.IsNullOrEmpty(_procedureName) || JournalApp() == null) return;
+            if (Services.EmbedSaveJournal.Retire(JournalApp(), _procedureName))
+                MonacoSpikeLog.Write("[save-journal] retired — " + why);
+        }
+
         /// <summary>Hand the freshly loaded Monaco page keyboard focus + claim the CA Find pad — but only
         /// if OUR tab is the active document (same initial-open gap the CA Editor had: a new tab is born
         /// selected, so SwitchedTo never fires for it and nothing focused the page).</summary>
@@ -2089,6 +2302,7 @@ namespace ClarionAssistant.Terminal
         void IMonacoEditorHost.OnUnknownAction(MonacoEditorControl editor, string action, string rawJson)
         {
             if (action == "embedState") HandleEmbedState(rawJson);
+            else if (action == "savedEditsOffer") HandleSavedEditsOffer(rawJson);
         }
 
         /// <summary>{action:"embedState"} — the page's per-edit mirror of its edited slot texts (see the
@@ -2855,6 +3069,12 @@ namespace ClarionAssistant.Terminal
             // own right for a first-call cost, so it gets its own mark rather than being folded into "enter".
             mark("liveCheck(live=" + live + ",overlay=" + _embedOverlay + ",slots=" + current.Count + ")");
 
+            // GH #179: journal the text BEFORE Clarion gets it, and keep it through ok=True. The Generator can fault
+            // after every line below has run (reporter: AV 60 ms after "refreshPadSources DONE"), so nothing on the
+            // success path retires it; the next open of this procedure does (CheckSaveJournal).
+            BeginSaveJournal(current);
+            mark("saveJournal");
+
             // OVERLAY save-and-exit (a5bbf005). The Monaco surface must come OFF the embed host BEFORE the native
             // embed closes: closing it disposes the ClaGenEditor host panel, which would otherwise cascade-dispose
             // our WebView2 child on the native close stack (the documented freeze).
@@ -2888,7 +3108,10 @@ namespace ClarionAssistant.Terminal
                     msg += KeepTypedDuringSave(current, true);
                 }
                 else if (editorIntact)
+                {
                     RecordNativeWrites(current, o.WrittenSlots);   // a partial write stays in the native buffer: ours
+                    RetireSaveJournal("save refused or failed; the text is still in the CA Embeditor");
+                }
                 else
                 {
                     // Past the point of no return: the surface is gone and the native save failed. The text must
@@ -2934,6 +3157,8 @@ namespace ClarionAssistant.Terminal
             // The prime suspect: Save() RE-OPENS the native embeditor and pumps DoEvents, which is where a
             // one-time-per-session lazy ABC class load would be paid (see the warmup_abc tool).
             mark((live ? "SaveLive" : "Save(re-open)") + " ok=" + ok);
+            // Tab mode keeps its surface on a failure, so the text is still in the editor (GH #179).
+            if (!ok) RetireSaveJournal("save did not go through; the text is still in the editor tab");
 
             // A successful live save closed the native embed (SAVE-AND-EXIT) — drop the live link so Dispose won't
             // try to cancel an already-closed embed, and clear the global live pointer if it's us.
@@ -3514,6 +3739,33 @@ namespace ClarionAssistant.Terminal
             try { foreach (Control child in c.Controls) ScanForNav(child, log, depth + 1); } catch { }
         }
 
+        /// <summary>GH #263 Q2: is this file-mode tab's file a module an open app generates?</summary>
+        private bool IsGeneratedSourceFile()
+        {
+            try { return new AppTreeService().IsGeneratedModuleOfOpenApp(_filePath); }
+            catch { return false; }
+        }
+
+        private readonly GeneratedSourceFlag _generatedFlag = new GeneratedSourceFlag();
+
+        /// <summary>GH #263 Q2 follow-up (GeneratedSourceWatch, UI thread): re-check every file-mode tab whose page
+        /// has had its setSource, and post the new generatedSource to the ones whose answer changed.</summary>
+        internal static void RefreshGeneratedSourceFlags()
+        {
+            List<ModernEmbeditorViewContent> snapshot;
+            lock (_instances) { snapshot = new List<ModernEmbeditorViewContent>(_instances); }
+            foreach (var inst in snapshot)
+            {
+                try
+                {
+                    if (!inst._fileMode || inst._disposed || inst._panel == null) continue;
+                    string msg = inst._generatedFlag.Update(inst.IsGeneratedSourceFile());
+                    if (msg != null) inst._panel.PostJson(msg);
+                }
+                catch (Exception ex) { System.Diagnostics.Debug.WriteLine("[ModernEmbeditor] generatedSource refresh: " + ex.Message); }
+            }
+        }
+
         /// <summary>JSON object of role→data-URI for the captured native icons (empty {} if none).</summary>
         private string NativeIconsJson()
         {
@@ -3882,7 +4134,8 @@ namespace ClarionAssistant.Terminal
                                     { "kind", c.Kind },
                                     { "detail", c.Detail },
                                     { "documentation", c.Documentation },
-                                    { "insertText", c.InsertText }
+                                    { "insertText", c.InsertText },
+                                    { "insertTextFormat", c.InsertTextFormat }
                                 });
                         // LastCompletionDiagnostic is bundled-only; surface it on the local path, else "ok".
                         var local = LspClient.Active;
@@ -4106,8 +4359,14 @@ namespace ClarionAssistant.Terminal
                         // Sync happens INSIDE GetHover on the bundled client and not at all on the shared
                         // addin (it answers from the last synced text), so requestMs includes any sync.
                         var reqSw = System.Diagnostics.Stopwatch.StartNew();
-                        var resp = SharedLspBridge.GetHover(_lspFileName, LspLine0(buffer, line), Math.Max(0, column - 1), LspBuffer(buffer));
+                        bool fromIndex;
+                        var resp = SharedLspBridge.GetHover(_lspFileName, LspLine0(buffer, line), Math.Max(0, column - 1), LspBuffer(buffer), out fromIndex);
                         contents = ExtractHoverString(resp);
+                        // H1-a: a link to this embeditor's own module carries a line of the text the server was
+                        // sent (or, from the index, of the module on disk): put it in the embeditor's terms.
+                        if (!_fileMode && contents != null)
+                            contents = EmbedLspContext.ToEmbeditorLinks(contents, _lspFileName,
+                                (_lspContext != null) ? _lspContext.LineOffsetFor(buffer) : 0, fromIndex);
                         timing.Add("sync", "inline").Add("requestMs", reqSw.ElapsedMilliseconds);
                     }
                 }
@@ -4835,16 +5094,25 @@ namespace ClarionAssistant.Terminal
                 try { snippetsJson = SnippetStore.ToJson(SnippetStore.Load()); }
                 catch { snippetsJson = "[]"; }
 
+                // GH #263 Q2: computed once here, then kept current by GeneratedSourceWatch when apps open/close.
+                bool generatedSource = _fileMode && IsGeneratedSourceFile();
                 string json = "{\"type\":\"setSource\"," +
                     "\"title\":" + JsonString(_title) + "," +
                     "\"language\":" + JsonString(_language) + "," +
                     "\"isDark\":" + (_isDark ? "true" : "false") + "," +
                     "\"fileMode\":" + (_fileMode ? "true" : "false") + "," +
+                    // GH #263 Q2: a generated module opened as a plain file gets plain attribute names on the hover
+                    // card, not edit chips (the next generate would overwrite the edit). File mode only: the
+                    // embeditor's own module is guarded by its slots.
+                    "\"generatedSource\":" + (generatedSource ? "true" : "false") + "," +
                     // 1c685f2e item 7: the same flag that decides LocalOptions().SlotChecks. This FILE MODE tab never
                     // runs the slot checks (ticket 564aa142), so the page skips slotDiagnostics. (The CA Editor overlay
                     // omits the flag; the page treats a missing one as on, and the overlay does run them.)
                     "\"slotChecks\":" + (!_fileMode ? "true" : "false") + "," +
                     "\"filePath\":" + JsonString(_filePath ?? "") + "," +
+                    // H1-a: the document the CA Embeditor stands for (the module path the server analyses its
+                    // text under). A location link to it stays in the embeditor instead of opening the .clw.
+                    "\"docPath\":" + JsonString(_fileMode ? "" : (_lspFileName ?? "")) + "," +
                     "\"saveEnabled\":" + (_saveEnabled ? "true" : "false") + "," +
                     "\"findUiMode\":\"" + Services.CaFindSettings.FindUiModeForPage + "\"," +   // Pad vs in-editor Overlay (#66 phase 2)
                     "\"liveLinked\":" + (_liveLinked ? "true" : "false") + "," +   // live mode: relabel Save → "Save and Exit" (a5bbf005)
@@ -4866,6 +5134,8 @@ namespace ClarionAssistant.Terminal
                     "\"snippets\":" + snippetsJson + "," +
                     "\"sourceUrl\":\"https://" + VIRTUAL_HOST + "/source.txt\"}";
                 _panel.PostJson(json);
+                if (_fileMode) { _generatedFlag.MarkSent(generatedSource); GeneratedSourceWatch.EnsureWired(); }
+                else _generatedFlag.Reset();
             }
             catch (Exception ex)
             {

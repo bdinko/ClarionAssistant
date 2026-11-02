@@ -29,6 +29,94 @@ namespace ClarionCodeGraph.Graph
         /// </summary>
         public ClarionAssistant.Services.RedFileService RedService { get; set; }
 
+        /// <summary>
+        /// The build configuration ("Debug", "Release", ...) the solution is built in, when the host knows it.
+        /// Source files then resolve through that configuration's .red sections first ([Release32], [Release],
+        /// [Common]), as resolve_red_path and the compiler do. Null keeps the indexer's old fixed order
+        /// (Common, Debug, Release).
+        /// </summary>
+        public string BuildConfiguration { get; set; }
+
+        /// <summary>
+        /// Follow CLASS MODULE('x.clw') / LINK('x.clw') to the implementing .clw (Pass 2c, GH #245). On by
+        /// default; the switch exists so a harness can prove its own checks fail without it.
+        /// </summary>
+        public bool FollowClassModules { get; set; } = true;
+
+        /// <summary>
+        /// Index the data declared in files INCLUDEd into a PROGRAM's global data section as scope='global'
+        /// variables (Pass 2d, GH #246). On by default; the switch exists so a harness can prove its own checks
+        /// fail without it.
+        /// </summary>
+        public bool IndexGlobalDataIncludes { get; set; } = true;
+
+        /// <summary>
+        /// What this indexer can put in a database, as a number that only goes up. 1 (or no index_metadata row) =
+        /// before GH #245/#246; 2 = CLASS MODULE()/LINK() files (pass2c-module) and global data from INCLUDEd files
+        /// (pass2d-global-data); 3 = INCLUDE() read as the compiler does (include-outcome, GH #271): no include
+        /// followed from a comment, the PROGRAM file's INCLUDEs outside its MAP indexed, unresolved_conditional.
+        /// Bump it, and add to <see cref="Features"/>, whenever a change means an older
+        /// database is missing code a re-index would add.
+        /// </summary>
+        public const int FeatureLevel = 3;
+        public const string Features = "pass2c-module,pass2d-global-data,include-outcome";
+
+        public const string MetaIndexerVersion = "indexer_version";
+        public const string MetaFeatureLevel = "indexer_feature_level";
+        public const string MetaFeatures = "indexer_features";
+
+        /// <summary>The assembly version of the build running this indexer (the addin, the server or clarion-indexer).</summary>
+        public static string IndexerVersion
+        {
+            get
+            {
+                try { return typeof(CodeGraphIndexer).Assembly.GetName().Version.ToString(); }
+                catch { return "unknown"; }
+            }
+        }
+
+        /// <summary>
+        /// One line saying which indexer built the database at <paramref name="dbPath"/> and whether it predates the
+        /// current feature level, for database listings. Read-only. Never throws.
+        /// </summary>
+        public static string DescribeDatabase(string dbPath)
+        {
+            var meta = CodeGraphDatabase.ReadMetadataReadOnly(dbPath);
+            string version, level, last;
+            meta.TryGetValue(MetaIndexerVersion, out version);
+            meta.TryGetValue(MetaFeatureLevel, out level);
+            meta.TryGetValue("last_indexed", out last);
+            int lvl;
+            if (!int.TryParse(level, out lvl)) lvl = meta.Count > 0 ? 1 : 0;
+            if (lvl == 0) return "no index metadata";
+            string s = "indexer " + (version ?? "unknown (before feature levels)") + ", feature level " + lvl;
+            if (!string.IsNullOrEmpty(last)) s += ", last indexed " + last;
+            if (lvl < FeatureLevel)
+                s += " - STALE: built before feature level " + FeatureLevel + " (" + Features + "); re-index to add the missing code";
+            return s;
+        }
+
+        /// <summary>
+        /// The feature level recorded in an open database: its indexer_feature_level row; 1 when that row is missing
+        /// (or unreadable) in a database that was indexed before - the indexer from before feature levels wrote none;
+        /// 0 for a database nothing was ever indexed into. Same reading as <see cref="DescribeDatabase"/>.
+        /// </summary>
+        public static int StoredFeatureLevel(CodeGraphDatabase db)
+        {
+            string level = db.GetMetadata(MetaFeatureLevel);
+            int lvl;
+            if (level != null) return int.TryParse(level.Trim(), out lvl) && lvl >= 1 ? lvl : 1;
+            bool everIndexed = !string.IsNullOrEmpty(db.GetMetadata("last_indexed")) || !string.IsNullOrEmpty(db.GetMetadata("sln_path"));
+            return everIndexed ? 1 : 0;
+        }
+
+        /// <summary>
+        /// Whether the CURRENT (or last) <see cref="IndexSolution(string,bool,List{string})"/> run is incremental after the
+        /// feature-level check - an incremental request on an older database runs full. Set before anything in the run
+        /// can throw, so a host's cancel path (a cancelled FULL run leaves a partial database) can read it.
+        /// </summary>
+        public bool EffectiveIncremental { get; private set; }
+
         public event Action<string> OnProgress;
 
         /// <summary>
@@ -63,6 +151,9 @@ namespace ClarionCodeGraph.Graph
             });
         }
 
+        /// <summary>Inside one file's relationship scan, the cancel probe runs every (mask + 1) lines.</summary>
+        private const int CancelPollLineMask = 4095;
+
         private void ThrowIfCancelled()
         {
             var probe = CancelRequested;
@@ -94,7 +185,28 @@ namespace ClarionCodeGraph.Graph
         public IndexResult IndexSolution(string slnPath, bool incremental, List<string> libraryPaths = null)
         {
             var sw = Stopwatch.StartNew();
-            var result = new IndexResult { SlnPath = slnPath };
+            var result = new IndexResult { SlnPath = slnPath, RequestedIncremental = incremental };
+
+            // ef2fd2a9 / cea47717: an incremental run only re-parses projects whose files changed, so on a database an
+            // older indexer built it re-parses nothing and the passes added since never run - the live failure was
+            // "indexed successfully ... Mode: incremental" over a database that stayed at feature level 1. Below the
+            // current feature level (or with none recorded) the request becomes a FULL index, and the result says so.
+            if (incremental)
+            {
+                int stored = StoredFeatureLevel(_db);
+                if (stored < FeatureLevel)
+                {
+                    incremental = false;
+                    result.UpgradedFromFeatureLevel = stored;
+                }
+            }
+            result.Incremental = incremental;
+            EffectiveIncremental = incremental;
+            if (result.UpgradedFromFeatureLevel > 0)
+                ReportProgress(string.Format("Incremental index requested, but this database was built at feature level {0} " +
+                    "(current: {1}, adds {2}) - running a full index so the new passes run.", result.UpgradedFromFeatureLevel, FeatureLevel, Features));
+            else if (result.UpgradedFromFeatureLevel == 0)
+                ReportProgress("Incremental index requested on a new database - running a full index.");
 
             // Step 1: Parse .sln for projects
             ReportProgress("Parsing solution file...");
@@ -112,7 +224,31 @@ namespace ClarionCodeGraph.Graph
                 red = TryLoadRedFile(slnDir);
             if (red == null)
                 ReportProgress("No redirection file in effect — resolution limited to .\\source, project root, and explicit search paths.");
+            else
+                // GH #278: an {include} the .red could not follow (an unexpanded macro, a missing file) drops every
+                // search path of the included file, and surfaced only as thousands of unresolved files far below.
+                // Name the cause where the operator reads first.
+                ReportRedSkippedIncludes(red, null);
             _resolver = new SourceResolver(red);
+            _resolveCache.Clear();
+            if (!string.IsNullOrEmpty(BuildConfiguration))
+            {
+                _resolver.RedSections = ClarionAssistant.Services.RedResolution.SectionsFor(BuildConfiguration);
+                ReportProgress(string.Format("Build configuration: {0} (.red sections {1})",
+                    BuildConfiguration, string.Join(", ", _resolver.RedSections)));
+            }
+            // Files under the Clarion install (%ROOT%: libsrc, accessory) are the compiler's own and the
+            // vendors' libraries; MODULE/LINK targets there are not followed (Pass 2c).
+            string clarionRoot = null;
+            if (red != null)
+            {
+                string root;
+                if (red.Macros.TryGetValue("ROOT", out root) && !string.IsNullOrEmpty(root))
+                {
+                    try { clarionRoot = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar); }
+                    catch { clarionRoot = null; }
+                }
+            }
 
             // For full re-index, wipe everything and start fresh
             if (!incremental)
@@ -185,22 +321,55 @@ namespace ClarionCodeGraph.Graph
             var changedProjects = new HashSet<int>(); // projects that need re-parsing
             var projectDirs = new Dictionary<int, string>();
             var discoveredIncludeNames = new Dictionary<int, HashSet<string>>();
+            var includeOrigins = new Dictionary<int, Dictionary<string, IncludeOrigin>>(); // Pass 2b audit/log
             var allResolved = new Dictionary<int, List<ResolvedFile>>(); // per-file outcome audit
             var mainMapSymCount = new Dictionary<int, int>(); // Pass 1 MAP symbol count per main file
+            // Pass 2c (GH #245): what each .inc INCLUDEs and which .clw its classes name in MODULE/LINK, by full
+            // path, filled as .inc files are parsed (Pass 1, 1b, 2b) so the include walk reads each file once.
+            var incScans = new Dictionary<string, IncScan>(StringComparer.OrdinalIgnoreCase);
+            // Pass 2c seeds: MODULE/LINK names on classes declared in a project's parsed .clw files.
+            var clwModuleSeeds = new Dictionary<int, List<KeyValuePair<string, string>>>();
+            // Pass 2d seeds (GH #246): files the PROGRAM INCLUDEs in its global data section, per project, each with
+            // whether that INCLUDE sits in a conditional COMPILE/OMIT block.
+            var globalDataIncludeSeeds = new Dictionary<int, List<KeyValuePair<string, bool>>>();
+            // Pass 2b (integ-1023 review D2): the INCLUDEs inside each .inc the .cwproj lists, per project and file name,
+            // from Pass 1's parse. Listing an .inc does not compile it; what it INCLUDEs counts only through the
+            // INCLUDEs that reach it, so the walk follows them from there like any other .inc's.
+            var listedIncIncludes = new Dictionary<int, Dictionary<string, List<ClarionSymbol>>>();
+            var reportedProjectReds = new HashSet<ClarionAssistant.Services.RedFileService>();
             int unresolvedCount = 0;
+
+            // Files an earlier run reached OTHER than through the .cwproj (Pass 2b includes, Pass 2c MODULE/LINK
+            // targets), per project. Incremental only: an edit to one of them must count as a change, and an
+            // unchanged project's MODULE-reached files must still be rescanned for relationships (Pass 3 rebuilds
+            // every edge), so they are read back from the audit before anything is cleared.
+            var priorReached = incremental ? LoadReachedFiles() : new Dictionary<int, List<ReachedFile>>();
 
             foreach (var proj in projects)
             {
                 if (!File.Exists(proj.CwprojPath))
                 {
                     ReportProgress(string.Format("Skipping {0} — .cwproj not found", proj.Name));
+                    result.ProjectsUnresolved++;
+                    result.UnresolvedProjectNames.Add(proj.Name);
                     continue;
                 }
+                result.ProjectsResolved++;
 
                 string projectDir = Path.GetDirectoryName(proj.CwprojPath);
                 projectDirs[proj.Id] = projectDir;
+                // A project's own version-named .red replaces the solution's for that project: what it could not
+                // {include} is reported the same way, once per file.
+                var projectRed = _resolver.RedFor(projectDir);
+                if (projectRed != null && !ReferenceEquals(projectRed, red) && reportedProjectReds.Add(projectRed))
+                    ReportRedSkippedIncludes(projectRed, proj.Name);
                 var projResult = _projParser.Parse(proj.CwprojPath);
                 var resolved = _resolver.Resolve(projectDir, projResult.SourceFiles, libraryPaths);
+                foreach (var f in resolved)
+                {
+                    result.CwprojFilesListed++;
+                    if (!f.Found) result.CwprojFilesUnresolved++;
+                }
 
                 var members = new List<ResolvedFile>();
                 var includes = new List<ResolvedFile>();
@@ -241,7 +410,7 @@ namespace ClarionCodeGraph.Graph
                         {
                             changedProjects.Add(proj.Id);
                         }
-                        else if (ProjectHasChanges(resolved, lastIndexed))
+                        else if (ProjectHasChanges(resolved, lastIndexed) || ReachedFilesChanged(priorReached, proj.Id, lastIndexed))
                         {
                             changedProjects.Add(proj.Id);
                         }
@@ -263,6 +432,12 @@ namespace ClarionCodeGraph.Graph
                     sw.Stop();
                     result.DurationMs = sw.ElapsedMilliseconds;
                     ReportProgress("No changes detected — index is up to date.");
+                    // Nothing was written, so report the indexer and level the database already records (the
+                    // feature-level check above made sure that level is current).
+                    result.UpToDate = true;
+                    result.IndexerVersion = _db.GetMetadata(MetaIndexerVersion) ?? IndexerVersion;
+                    result.FeatureLevel = StoredFeatureLevel(_db);
+                    FinishCoverage(result);
                     return result;
                 }
 
@@ -320,13 +495,7 @@ namespace ClarionCodeGraph.Graph
 
                         if (sym.Type == "include")
                         {
-                            HashSet<string> names;
-                            if (!discoveredIncludeNames.TryGetValue(projectId, out names))
-                            {
-                                names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                                discoveredIncludeNames[projectId] = names;
-                            }
-                            names.Add(sym.Name);
+                            NoteInclude(discoveredIncludeNames, includeOrigins, projectId, sym);
                         }
                     }
                     result.SymbolCount += parseResult.Symbols.Count;
@@ -348,6 +517,8 @@ namespace ClarionCodeGraph.Graph
                             long symId = _db.InsertSymbol(sym);
                             sym.Id = symId;
                         }
+                        RememberListedIncIncludes(listedIncIncludes, proj.Id, file.FileName, parseResult);
+                        RememberIncScan(incScans, file.FullPath, parseResult);
                         result.SymbolCount += parseResult.Symbols.Count;
                         _db.InsertIndexedFile(proj.Id, file.FileName, file.FullPath,
                             parseResult.Symbols.Count > 0 ? "resolved_parsed" : "resolved_no_symbols",
@@ -424,7 +595,9 @@ namespace ClarionCodeGraph.Graph
                         {
                             if (!Directory.Exists(libDir))
                             {
-                                ReportProgress(string.Format("  Library path not found: {0}", libDir));
+                                // GH #271: a folder the .red lists that is not on disk (an old %ROOT%\convsrc entry, for one)
+                                // has nothing to index and does not change the status; say so, so it does not read as a fault.
+                                ReportProgress(string.Format("  Library path not found, skipped (a .red search folder that does not exist; does not affect the index): {0}", libDir));
                                 continue;
                             }
 
@@ -448,6 +621,7 @@ namespace ClarionCodeGraph.Graph
                                     continue; // already indexed (from project or duplicate lib path casing)
 
                                 var parseResult = _clarionParser.ParseIncFile(fullPath, libProjectId);
+                                RememberIncScan(incScans, fullPath, parseResult);
                                 if (parseResult.Symbols.Count > 0)
                                 {
                                     foreach (var sym in parseResult.Symbols)
@@ -509,6 +683,7 @@ namespace ClarionCodeGraph.Graph
                     {
                         ThrowIfCancelled();
                         var parseResult = _clarionParser.ParseMemberFile(file.FullPath, proj.Id, null);
+                        AddModuleSeeds(clwModuleSeeds, proj.Id, parseResult);
                         foreach (var sym in parseResult.Symbols)
                         {
                             long symId = _db.InsertSymbol(sym);
@@ -516,13 +691,7 @@ namespace ClarionCodeGraph.Graph
 
                             if (sym.Type == "include")
                             {
-                                HashSet<string> names;
-                                if (!discoveredIncludeNames.TryGetValue(proj.Id, out names))
-                                {
-                                    names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                                    discoveredIncludeNames[proj.Id] = names;
-                                }
-                                names.Add(sym.Name);
+                                NoteInclude(discoveredIncludeNames, includeOrigins, proj.Id, sym);
                             }
                         }
                         result.SymbolCount += parseResult.Symbols.Count;
@@ -538,28 +707,32 @@ namespace ClarionCodeGraph.Graph
                     // opens the DATA machinery over the declaration section, capturing the app's
                     // GLOBAL data as scope='global' symbols — previously that entire section
                     // (~6,000 lines in a large app main) was never scanned and every global was
-                    // invisible (ticket d1a0aea6). The MAP block is depth-skipped, so Pass 1's
-                    // procedure declarations don't repeat; INCLUDE symbols DO repeat (Pass 1
-                    // already captured them for this same file), so they're filtered here —
-                    // they still feed discoveredIncludeNames, which is a set.
+                    // invisible (ticket d1a0aea6). The MAP block is skipped wholesale, so neither
+                    // Pass 1's procedure declarations nor its INCLUDEs (Pass 1 only reads the MAP)
+                    // repeat here: every include symbol this parse finds is outside the MAP and is
+                    // inserted, so the Pass 2b warning can name the PROGRAM file as an includer.
                     string tailMainPath;
                     if (mainFiles.TryGetValue(proj.Id, out tailMainPath))
                     {
                         ThrowIfCancelled();
                         var tailResult = _clarionParser.ParseMemberFile(tailMainPath, proj.Id, null, 0);
+                        AddModuleSeeds(clwModuleSeeds, proj.Id, tailResult);
                         int inserted = 0;
                         foreach (var sym in tailResult.Symbols)
                         {
                             if (sym.Type == "include")
                             {
-                                HashSet<string> names;
-                                if (!discoveredIncludeNames.TryGetValue(proj.Id, out names))
+                                NoteInclude(discoveredIncludeNames, includeOrigins, proj.Id, sym);
+                                if (sym.InGlobalData)
                                 {
-                                    names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                                    discoveredIncludeNames[proj.Id] = names;
+                                    List<KeyValuePair<string, bool>> gd;
+                                    if (!globalDataIncludeSeeds.TryGetValue(proj.Id, out gd))
+                                    {
+                                        gd = new List<KeyValuePair<string, bool>>();
+                                        globalDataIncludeSeeds[proj.Id] = gd;
+                                    }
+                                    gd.Add(new KeyValuePair<string, bool>(sym.Name, sym.Conditional));
                                 }
-                                names.Add(sym.Name);
-                                continue; // Pass 1 already inserted this file's include symbols
                             }
 
                             long symId = _db.InsertSymbol(sym);
@@ -623,6 +796,37 @@ namespace ClarionCodeGraph.Graph
                     var includeWork = new Queue<KeyValuePair<string, int>>();
                     foreach (string seedName in kvp.Value)
                         includeWork.Enqueue(new KeyValuePair<string, int>(seedName, 0));
+                    // GH #271: whether a target that does not resolve is a real gap depends on EVERY route to it,
+                    // and an unconditional route can turn up deeper in the walk than a conditional one. So the
+                    // walk records the INCLUDE edges between the .inc files it parses and the targets it cannot
+                    // resolve; their rows are written after it, once every route is known.
+                    var includeEdges = new Dictionary<string, List<KeyValuePair<string, bool>>>(StringComparer.OrdinalIgnoreCase);
+                    var unresolvedIncludes = new List<string>();
+                    // Record an .inc's own INCLUDE() targets as edges of the walk and queue them.
+                    Action<string, IEnumerable<ClarionSymbol>, int> followIncludesOf = (parentName, syms, parentDepth) =>
+                    {
+                        if (parentDepth >= MaxIncludeDepth) return;
+                        foreach (var sym in syms)
+                        {
+                            if (sym.Type != "include") continue;
+                            List<KeyValuePair<string, bool>> children;
+                            if (!includeEdges.TryGetValue(parentName, out children))
+                            {
+                                children = new List<KeyValuePair<string, bool>>();
+                                includeEdges[parentName] = children;
+                            }
+                            children.Add(new KeyValuePair<string, bool>(sym.Name, sym.Conditional));
+                            NoteIncludeOrigin(includeOrigins, projectId, sym, sym.Conditional);
+                            if (!alreadyKnown.Contains(sym.Name))
+                                includeWork.Enqueue(new KeyValuePair<string, int>(sym.Name, parentDepth + 1));
+                        }
+                    };
+                    // D2: an .inc the .cwproj lists was parsed in Pass 1, so it is not parsed again here, but the walk
+                    // still goes through it - once, the first time an INCLUDE reaches it - so what it INCLUDEs is judged
+                    // by the routes to it, exactly as for an .inc only the walk finds.
+                    Dictionary<string, List<ClarionSymbol>> listedHere;
+                    listedIncIncludes.TryGetValue(projectId, out listedHere);
+                    var listedFollowed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
                     while (includeWork.Count > 0)
                     {
@@ -630,6 +834,12 @@ namespace ClarionCodeGraph.Graph
                         string includeName = workItem.Key;
                         int depth = workItem.Value;
 
+                        List<ClarionSymbol> listedIncludes;
+                        if (listedHere != null && listedHere.TryGetValue(includeName, out listedIncludes))
+                        {
+                            if (listedFollowed.Add(includeName)) followIncludesOf(includeName, listedIncludes, depth);
+                            continue;
+                        }
                         if (alreadyKnown.Contains(includeName)) continue;
                         if (!includeName.EndsWith(".inc", StringComparison.OrdinalIgnoreCase))
                         {
@@ -645,8 +855,8 @@ namespace ClarionCodeGraph.Graph
                         var resolved = resolvedList.Count > 0 ? resolvedList[0] : null;
                         if (resolved == null || !resolved.Found)
                         {
-                            // Unresolvable — leave alone, but leave a trace (audit, d1a0aea6)
-                            _db.InsertIndexedFile(projectId, includeName, null, "unresolved", 0, "pass2b-include");
+                            // Unresolvable — leave alone, but leave a trace (audit, d1a0aea6), written after the walk
+                            unresolvedIncludes.Add(includeName);
                             alreadyKnown.Add(includeName); // one audit row per name, not per referencing file
                             continue;
                         }
@@ -669,6 +879,7 @@ namespace ClarionCodeGraph.Graph
                             long symId = _db.InsertSymbol(sym);
                             sym.Id = symId;
                         }
+                        RememberIncScan(incScans, fullPath, parseResult);
                         result.SymbolCount += parseResult.Symbols.Count;
                         _db.InsertIndexedFile(projectId, includeName, fullPath,
                             parseResult.Symbols.Count > 0 ? "resolved_parsed" : "resolved_no_symbols",
@@ -676,18 +887,67 @@ namespace ClarionCodeGraph.Graph
                         alreadyKnown.Add(includeName); // avoid double-parse if INCLUDE()'d from multiple files
 
                         // Follow THIS file's own INCLUDE() targets
-                        if (depth < MaxIncludeDepth)
-                        {
-                            foreach (var sym in parseResult.Symbols)
-                            {
-                                if (sym.Type == "include" && !alreadyKnown.Contains(sym.Name))
-                                    includeWork.Enqueue(new KeyValuePair<string, int>(sym.Name, depth + 1));
-                            }
-                        }
+                        followIncludesOf(includeName, parseResult.Symbols, depth);
+                    }
+
+                    // A target is required when some route to it is unconditional all the way: an unconditional
+                    // INCLUDE in a parsed source file, then only unconditional INCLUDEs in the .inc files between.
+                    // Every other target that does not resolve is one the project's defines may well leave out,
+                    // so it gets its own outcome and does not count as a gap (GH #271).
+                    var required = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    var requiredWork = new Queue<string>();
+                    foreach (string seedName in kvp.Value)
+                    {
+                        IncludeOrigin seedOrigin = OriginOf(includeOrigins, projectId, seedName);
+                        if ((seedOrigin == null || seedOrigin.SeedUnconditional) && required.Add(seedName))
+                            requiredWork.Enqueue(seedName);
+                    }
+                    while (requiredWork.Count > 0)
+                    {
+                        List<KeyValuePair<string, bool>> children;
+                        if (!includeEdges.TryGetValue(requiredWork.Dequeue(), out children)) continue;
+                        foreach (var child in children)
+                            if (!child.Value && required.Add(child.Key))
+                                requiredWork.Enqueue(child.Key);
+                    }
+                    foreach (string includeName in unresolvedIncludes)
+                    {
+                        bool conditional = !required.Contains(includeName);
+                        IncludeOrigin origin = OriginOf(includeOrigins, projectId, includeName);
+                        _db.InsertIndexedFile(projectId, includeName, null,
+                            conditional ? OutcomeUnresolvedConditional : "unresolved", 0, "pass2b-include");
+                        ReportProgress(string.Format(conditional
+                                ? "  INCLUDE not resolved: {0} ({1}) - inside a conditional COMPILE/OMIT block, not counted"
+                                : "  INCLUDE not resolved: {0} ({1})",
+                            includeName, origin != null ? Path.GetFileName(origin.File) + ":" + origin.Line : "?"));
                     }
                 }
 
                 txn.Commit();
+            }
+
+            // Pass 2c (GH #245): CLASS MODULE('x.clw') / LINK('x.clw') -> the implementing .clw.
+            if (FollowClassModules)
+            {
+                ReportProgress("Pass 2c: Following CLASS MODULE()/LINK() to implementation files...");
+                using (var txn = _db.BeginTransaction())
+                {
+                    FollowClassModuleTargets(projects, changedProjects, projectDirs, mainFiles, memberFiles, incFiles,
+                        discoveredIncludeNames, clwModuleSeeds, incScans, priorReached, libraryPaths, clarionRoot, result);
+                    txn.Commit();
+                }
+            }
+
+            // Pass 2d (GH #246): data declared in files the PROGRAM INCLUDEs into its global data -> scope='global'.
+            if (IndexGlobalDataIncludes && globalDataIncludeSeeds.Count > 0)
+            {
+                ReportProgress("Pass 2d: Indexing global data declared in INCLUDEd files...");
+                using (var txn = _db.BeginTransaction())
+                {
+                    IndexGlobalDataIncludeFiles(projects, changedProjects, projectDirs, globalDataIncludeSeeds,
+                        libraryPaths, clarionRoot, result);
+                    txn.Commit();
+                }
             }
 
             // Pass 3: Always rebuild ALL relationships (they cross project boundaries)
@@ -715,18 +975,26 @@ namespace ClarionCodeGraph.Graph
             _db.SetMetadata("file_count", result.FileCount.ToString());
             _db.SetMetadata("symbol_count", result.SymbolCount.ToString());
             _db.SetMetadata("index_duration_ms", result.DurationMs.ToString());
+            // Which indexer built this database (pipeline follow-up): an index written before MODULE/LINK and
+            // global-data includes existed answers "who calls X" from a smaller graph and looks no different.
+            result.IndexerVersion = IndexerVersion;
+            result.FeatureLevel = FeatureLevel;
+            _db.SetMetadata(MetaIndexerVersion, IndexerVersion);
+            _db.SetMetadata(MetaFeatureLevel, FeatureLevel.ToString());
+            _db.SetMetadata(MetaFeatures, Features);
 
             string mode = incremental ? "Incremental" : "Full";
             ReportProgress(string.Format("{0} indexing complete: {1} projects, {2} files, {3} symbols in {4}ms",
                 mode, result.ProjectCount, result.FileCount, result.SymbolCount, result.DurationMs));
-            // No silent gaps (ticket d1a0aea6): say when cwproj-listed files did not resolve,
-            // and where the per-file audit lives either way.
-            if (unresolvedCount > 0)
-                ReportProgress(string.Format(
-                    "WARNING: {0} cwproj-listed file(s) did not resolve — SELECT * FROM indexed_files WHERE outcome='unresolved'",
-                    unresolvedCount));
-            else
-                ReportProgress("All cwproj-listed files resolved. Per-file audit: indexed_files table.");
+            // No silent gaps (ticket d1a0aea6, #244 item 3): say how much of the solution the index actually
+            // covers - projects, cwproj-listed files, INCLUDE and MODULE/LINK targets - and call a run that
+            // resolved little of it partial rather than plain success. The per-file audit is indexed_files.
+            FinishCoverage(result);
+            if (unresolvedCount == 0)
+                ReportProgress("All cwproj-listed files resolved this run. Per-file audit: indexed_files table.");
+            foreach (string w in result.Warnings)
+                ReportProgress("WARNING: " + w);
+            ReportProgress("Index status: " + result.Status);
 
             return result;
         }
@@ -748,6 +1016,640 @@ namespace ClarionCodeGraph.Graph
                 catch { }
             }
             return false;
+        }
+
+        // ---------------------------------------------------------------------------------------------
+        // Pass 2c (GH #245): CLASS MODULE('x.clw') / LINK('x.clw') -> the implementing .clw.
+        //
+        // A hand-coded class library reaches the compiler through the class declaration, not the .cwproj:
+        // a project INCLUDEs x.inc, x.inc declares "X CLASS,TYPE,MODULE('x.clw'),LINK('x.clw')", and the
+        // compiler then builds x.clw. Mark's shared library had 109 such files and 3 were indexed. So: walk
+        // each project's INCLUDE closure (the compiler's own rule for which declarations are in), collect
+        // the MODULE/LINK names on the classes found there, resolve each through the project's .red, and
+        // parse it as a member file. Files under the Clarion install (%ROOT%: ABC libsrc, accessory) are
+        // left alone - every generated app would otherwise pull in all of ABC.
+        // ---------------------------------------------------------------------------------------------
+
+        internal const string PassModule = "pass2c-module";
+
+        // Pass 2c and 2d resolve the same names (an .inc INCLUDEd in global data is also walked for MODULE/LINK), so
+        // they share one cache: project folder + search-path set + name -> full path, or null for "does not
+        // resolve". Reset per IndexSolution run; the .red cannot change within one.
+        private readonly Dictionary<string, string> _resolveCache = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// <paramref name="name"/> resolved for <paramref name="projectDir"/> by the run's SourceResolver (its .source,
+        /// root, <paramref name="searchPaths"/>, then the project's .red), as a full path; null when it does not resolve.
+        /// Pass null search paths for a .clw (the .red decides where the compiler finds it), the library paths for an
+        /// INCLUDE target, as Pass 2b does.
+        /// </summary>
+        private string ResolveCached(string projectDir, string name, List<string> searchPaths)
+        {
+            string key = projectDir + "|" + (searchPaths == null ? "R|" : "L|") + name;
+            string hit;
+            if (_resolveCache.TryGetValue(key, out hit)) return hit;
+            var list = _resolver.Resolve(projectDir, new List<string> { name }, searchPaths);
+            hit = list.Count > 0 && list[0].Found ? FullPathOrSelf(list[0].FullPath) : null;
+            _resolveCache[key] = hit;
+            return hit;
+        }
+
+        /// <summary>What one .inc INCLUDEs, and which .clw its classes name in MODULE/LINK.</summary>
+        internal sealed class IncScan
+        {
+            public List<string> Includes = new List<string>();
+            /// <summary>(module file name, declaring file path)</summary>
+            public List<KeyValuePair<string, string>> Modules = new List<KeyValuePair<string, string>>();
+        }
+
+        /// <summary>A file an earlier run reached without the .cwproj (indexed_files row, incremental runs).</summary>
+        internal sealed class ReachedFile
+        {
+            public string FileName;
+            public string Path;
+            public string Pass;
+        }
+
+        private static string FullPathOrSelf(string path)
+        {
+            try { return Path.GetFullPath(path); } catch { return path; }
+        }
+
+        private static bool IsUnder(string fullPath, string root)
+        {
+            return root != null && fullPath != null &&
+                   (fullPath.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) ||
+                    fullPath.StartsWith(root + Path.AltDirectorySeparatorChar, StringComparison.OrdinalIgnoreCase));
+        }
+
+        private static IncScan ScanOf(string filePath, ParseResult parsed)
+        {
+            var scan = new IncScan();
+            foreach (var sym in parsed.Symbols)
+            {
+                if (sym.Type == "include")
+                    scan.Includes.Add(sym.Name);
+                else if (sym.Type == "class" && sym.ImplementationModules != null)
+                    foreach (string m in sym.ImplementationModules)
+                        scan.Modules.Add(new KeyValuePair<string, string>(m, filePath));
+            }
+            return scan;
+        }
+
+        /// <summary>The INCLUDE symbols of a .cwproj-listed .inc, by its bare file name (how an INCLUDE names it).</summary>
+        private static void RememberListedIncIncludes(Dictionary<int, Dictionary<string, List<ClarionSymbol>>> listed,
+            int projectId, string fileName, ParseResult parsed)
+        {
+            Dictionary<string, List<ClarionSymbol>> byName;
+            if (!listed.TryGetValue(projectId, out byName))
+            {
+                byName = new Dictionary<string, List<ClarionSymbol>>(StringComparer.OrdinalIgnoreCase);
+                listed[projectId] = byName;
+            }
+            string key = Path.GetFileName(fileName ?? "");
+            if (key.Length == 0 || byName.ContainsKey(key)) return;
+            var includes = new List<ClarionSymbol>();
+            foreach (var s in parsed.Symbols)
+                if (s.Type == "include") includes.Add(s);
+            byName[key] = includes;
+        }
+
+        private static void RememberIncScan(Dictionary<string, IncScan> scans, string filePath, ParseResult parsed)
+        {
+            string full = FullPathOrSelf(filePath);
+            if (!scans.ContainsKey(full)) scans[full] = ScanOf(full, parsed);
+        }
+
+        /// <summary>MODULE/LINK names on the classes a parsed .clw declares (a CLASS,TYPE in a PROGRAM's global data, say).</summary>
+        private static void AddModuleSeeds(Dictionary<int, List<KeyValuePair<string, string>>> seeds, int projectId, ParseResult parsed)
+        {
+            foreach (var sym in parsed.Symbols)
+            {
+                if (sym.Type != "class" || sym.ImplementationModules == null) continue;
+                List<KeyValuePair<string, string>> list;
+                if (!seeds.TryGetValue(projectId, out list))
+                {
+                    list = new List<KeyValuePair<string, string>>();
+                    seeds[projectId] = list;
+                }
+                foreach (string m in sym.ImplementationModules)
+                    list.Add(new KeyValuePair<string, string>(m, sym.FilePath));
+            }
+        }
+
+        /// <summary>The .inc's scan, parsing it (symbols discarded) the first time a walk meets a file no pass parsed.</summary>
+        private IncScan GetIncScan(Dictionary<string, IncScan> scans, string fullPath)
+        {
+            IncScan scan;
+            if (scans.TryGetValue(fullPath, out scan)) return scan;
+            try { scan = ScanOf(fullPath, _clarionParser.ParseIncFile(fullPath, -1)); }
+            catch { scan = new IncScan(); }
+            scans[fullPath] = scan;
+            return scan;
+        }
+
+        /// <summary>Pass 2b / 2c rows an earlier run recorded, per project (incremental runs only).</summary>
+        private Dictionary<int, List<ReachedFile>> LoadReachedFiles()
+        {
+            var byProject = new Dictionary<int, List<ReachedFile>>();
+            try
+            {
+                var dt = _db.ExecuteQuery(
+                    "SELECT project_id, file_name, resolved_path, pass FROM indexed_files " +
+                    "WHERE pass IN ('pass2b-include','" + PassModule + "','" + PassGlobalData + "') AND resolved_path IS NOT NULL " +
+                    "AND outcome IN ('resolved_parsed','resolved_no_symbols')");
+                foreach (System.Data.DataRow row in dt.Rows)
+                {
+                    if (row["project_id"] == DBNull.Value) continue;
+                    int pid = Convert.ToInt32(row["project_id"]);
+                    List<ReachedFile> list;
+                    if (!byProject.TryGetValue(pid, out list))
+                    {
+                        list = new List<ReachedFile>();
+                        byProject[pid] = list;
+                    }
+                    list.Add(new ReachedFile
+                    {
+                        FileName = row["file_name"].ToString(),
+                        Path = row["resolved_path"].ToString(),
+                        Pass = row["pass"] != DBNull.Value ? row["pass"].ToString() : null
+                    });
+                }
+            }
+            catch { }
+            return byProject;
+        }
+
+        /// <summary>True when a file an earlier run reached outside the .cwproj changed (or vanished) since then.</summary>
+        private static bool ReachedFilesChanged(Dictionary<int, List<ReachedFile>> prior, int projectId, DateTime lastIndexed)
+        {
+            List<ReachedFile> list;
+            if (prior == null || !prior.TryGetValue(projectId, out list)) return false;
+            foreach (var f in list)
+            {
+                try
+                {
+                    if (!File.Exists(f.Path) || File.GetLastWriteTime(f.Path) > lastIndexed) return true;
+                }
+                catch { return true; }
+            }
+            return false;
+        }
+
+        private void FollowClassModuleTargets(
+            List<SolutionProject> projects,
+            HashSet<int> changedProjects,
+            Dictionary<int, string> projectDirs,
+            Dictionary<int, string> mainFiles,
+            Dictionary<int, List<ResolvedFile>> memberFiles,
+            Dictionary<int, List<ResolvedFile>> incFiles,
+            Dictionary<int, HashSet<string>> discoveredIncludeNames,
+            Dictionary<int, List<KeyValuePair<string, string>>> clwModuleSeeds,
+            Dictionary<string, IncScan> incScans,
+            Dictionary<int, List<ReachedFile>> priorReached,
+            List<string> libraryPaths,
+            string clarionRoot,
+            IndexResult result)
+        {
+            // Every .clw some project already indexes, solution-wide: a MODULE target that is one of them is
+            // not parsed again. Dedup is by resolved path and solution-wide - a shared class library used by
+            // ten apps is indexed ONCE (under the first project that reaches it), so a call from any of them
+            // resolves to that one copy rather than to one of ten equal-rank duplicates.
+            var claimed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var kv in memberFiles)
+                foreach (var f in kv.Value)
+                    if (f.Found) claimed.Add(FullPathOrSelf(f.FullPath));
+            foreach (var kv in mainFiles)
+                claimed.Add(FullPathOrSelf(kv.Value));
+
+            // Incremental: an unchanged project keeps the MODULE-reached files an earlier run gave it, and
+            // they are rescanned for relationships like its .cwproj files (Pass 3 rebuilds every edge).
+            foreach (var proj in projects)
+            {
+                if (changedProjects.Contains(proj.Id)) continue;
+                List<ReachedFile> prior;
+                List<ResolvedFile> members;
+                if (!priorReached.TryGetValue(proj.Id, out prior) || !memberFiles.TryGetValue(proj.Id, out members)) continue;
+                foreach (var p in prior)
+                {
+                    if (p.Pass != PassModule) continue;
+                    string full = FullPathOrSelf(p.Path);
+                    if (!File.Exists(full) || !claimed.Add(full)) continue;
+                    members.Add(new ResolvedFile { FileName = p.FileName, FullPath = full, Found = true });
+                }
+            }
+
+            // Under the Clarion install (ABC libsrc, accessory) nothing is followed, so the walk STOPS at such an
+            // .inc instead of reading it and resolving everything it INCLUDEs and names: every generated app
+            // includes dozens of them. One skipped_clarion_install row per stopping point per run (not per project)
+            // still says, in indexed_files, where the walk stopped and why.
+            var rootSkipsRecorded = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            Func<int, string, string, bool> skipUnderRoot = delegate(int projectId, string name, string fullPath)
+            {
+                if (!IsUnder(fullPath, clarionRoot)) return false;
+                if (rootSkipsRecorded.Add(fullPath))
+                    _db.InsertIndexedFile(projectId, name, fullPath, "skipped_clarion_install", 0, PassModule);
+                return true;
+            };
+
+            int followed = 0, unresolved = 0, skipped = 0;
+            foreach (var proj in projects)
+            {
+                int pid = proj.Id;
+                if (!changedProjects.Contains(pid)) continue;
+                string projectDir;
+                List<ResolvedFile> members;
+                if (!projectDirs.TryGetValue(pid, out projectDir) || !memberFiles.TryGetValue(pid, out members)) continue;
+
+                var incQueue = new Queue<string>();                                  // .inc full paths
+                var visitedInc = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var includeNamesSeen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var moduleQueue = new Queue<KeyValuePair<string, string>>();          // (module name, declared in)
+                var moduleNamesSeen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                // INCLUDE of a .clw is a source fragment and .equ/.def are equates (see Pass 2b): only .inc
+                // files are walked. Include names resolve the way Pass 2b resolves them.
+                Action<string> enqueueInclude = delegate(string name)
+                {
+                    if (string.IsNullOrEmpty(name) || !name.EndsWith(".inc", StringComparison.OrdinalIgnoreCase)) return;
+                    if (!includeNamesSeen.Add(name)) return;
+                    string full = ResolveCached(projectDir, name, libraryPaths);
+                    if (full == null || !visitedInc.Add(full)) return;
+                    if (skipUnderRoot(pid, Path.GetFileName(full), full)) { skipped++; return; }
+                    incQueue.Enqueue(full);
+                };
+
+                List<ResolvedFile> knownIncs;
+                if (incFiles.TryGetValue(pid, out knownIncs))
+                    foreach (var f in knownIncs)
+                    {
+                        string full = FullPathOrSelf(f.FullPath);
+                        if (!visitedInc.Add(full)) continue;
+                        if (skipUnderRoot(pid, f.FileName, full)) { skipped++; continue; }
+                        incQueue.Enqueue(full);
+                    }
+                HashSet<string> seedNames;
+                if (discoveredIncludeNames.TryGetValue(pid, out seedNames))
+                    foreach (string n in seedNames) enqueueInclude(n);
+                List<KeyValuePair<string, string>> seedModules;
+                if (clwModuleSeeds.TryGetValue(pid, out seedModules))
+                    foreach (var m in seedModules) moduleQueue.Enqueue(m);
+
+                while (incQueue.Count > 0 || moduleQueue.Count > 0)
+                {
+                    ThrowIfCancelled();
+                    if (incQueue.Count > 0)
+                    {
+                        var scan = GetIncScan(incScans, incQueue.Dequeue());
+                        foreach (string n in scan.Includes) enqueueInclude(n);
+                        foreach (var m in scan.Modules) moduleQueue.Enqueue(m);
+                        continue;
+                    }
+
+                    var mod = moduleQueue.Dequeue();
+                    if (!moduleNamesSeen.Add(mod.Key)) continue;
+
+                    // MODULE/LINK names resolve through the .red only (plus the project's own folders), not
+                    // through the .inc library folders: that is where the compiler looks for a .clw.
+                    string target = ResolveCached(projectDir, mod.Key, null);
+                    if (target == null)
+                    {
+                        _db.InsertIndexedFile(pid, mod.Key, null, "unresolved", 0, PassModule);
+                        unresolved++;
+                        continue;
+                    }
+                    if (claimed.Contains(target)) continue; // a .cwproj lists it, or another project reached it first
+                    // A project's own class naming a .clw under the install (the .inc walk already stops at the
+                    // install's own .inc files): not followed, recorded once per run.
+                    if (skipUnderRoot(pid, mod.Key, target)) { skipped++; continue; }
+                    claimed.Add(target);
+
+                    var parsed = _clarionParser.ParseMemberFile(target, pid, null);
+                    foreach (var sym in parsed.Symbols)
+                    {
+                        sym.Id = _db.InsertSymbol(sym);
+                        if (sym.Type == "include") enqueueInclude(sym.Name);
+                        else if (sym.Type == "class" && sym.ImplementationModules != null)
+                            foreach (string m in sym.ImplementationModules)
+                                moduleQueue.Enqueue(new KeyValuePair<string, string>(m, target));
+                    }
+                    result.SymbolCount += parsed.Symbols.Count;
+                    result.FileCount++;
+                    _db.InsertIndexedFile(pid, Path.GetFileName(target), target,
+                        parsed.Symbols.Count > 0 ? "resolved_parsed" : "resolved_no_symbols",
+                        parsed.Symbols.Count, PassModule);
+                    members.Add(new ResolvedFile { FileName = Path.GetFileName(target), FullPath = target, Found = true });
+                    followed++;
+                }
+            }
+
+            ReportProgress(string.Format("  MODULE/LINK: {0} implementation file(s) indexed, {1} unresolved, {2} under the Clarion install skipped",
+                followed, unresolved, skipped));
+        }
+
+        // ---------------------------------------------------------------------------------------------
+        // Pass 2d (GH #246): global data declared in INCLUDEd files.
+        //
+        //   b4.clw (PROGRAM)         INCLUDE('GlobalMirroredData.inc'),ONCE     <- in the global data section
+        //   GlobalMirroredData.inc   ActiveThreads   ctQ_ActiveThreads:ThreadSafe
+        //
+        // ActiveThreads is program-global, but ParseIncFile never emits file-level data, so it had no row and
+        // "ActiveThreads.Add(...)" in 22 modules linked to nothing. Each file the PROGRAM INCLUDEs in its global
+        // data (and each file THAT one INCLUDEs at its own data level) is read once more as global data, and only
+        // its variables are kept: its classes, equates and includes are ParseIncFile's rows already. Per project,
+        // since each program owns its own instance of the globals. Same admission rule as Pass 2c: never under
+        // the Clarion install.
+        // ---------------------------------------------------------------------------------------------
+
+        internal const string PassGlobalData = "pass2d-global-data";
+
+        private static readonly System.Text.RegularExpressions.Regex TypeAttrRegex = new System.Text.RegularExpressions.Regex(
+            @",\s*TYPE\b", System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled);
+
+        private void IndexGlobalDataIncludeFiles(
+            List<SolutionProject> projects,
+            HashSet<int> changedProjects,
+            Dictionary<int, string> projectDirs,
+            Dictionary<int, List<KeyValuePair<string, bool>>> seeds,
+            List<string> libraryPaths,
+            string clarionRoot,
+            IndexResult result)
+        {
+            int files = 0, variables = 0;
+            foreach (var proj in projects)
+            {
+                int pid = proj.Id;
+                List<KeyValuePair<string, bool>> seedNames;
+                string projectDir;
+                if (!changedProjects.Contains(pid) || !seeds.TryGetValue(pid, out seedNames) ||
+                    !projectDirs.TryGetValue(pid, out projectDir)) continue;
+
+                var queue = new Queue<string>();
+                foreach (var seed in seedNames) queue.Enqueue(seed.Key);
+                var namesSeen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var pathsSeen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                // For the unresolved_conditional decision after the walk (GH #271), as Pass 2b makes it: the file each
+                // name resolved to, and the INCLUDEs each read file makes, with whether each one is conditional.
+                var nameToPath = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                var includesOf = new Dictionary<string, List<KeyValuePair<string, bool>>>(StringComparer.OrdinalIgnoreCase);
+                var unresolved = new List<string>();
+                const int MaxFiles = 500; // belt-and-braces against a pathological include web
+                while (queue.Count > 0 && pathsSeen.Count < MaxFiles)
+                {
+                    ThrowIfCancelled();
+                    string name = queue.Dequeue();
+                    if (!namesSeen.Add(name)) continue;
+                    // .inc and .clw fragments only: .equ/.trn and the like hold equates, which ParseIncFile or
+                    // nothing at all covers.
+                    if (!name.EndsWith(".inc", StringComparison.OrdinalIgnoreCase) &&
+                        !name.EndsWith(".clw", StringComparison.OrdinalIgnoreCase)) continue;
+
+                    string full = ResolveCached(projectDir, name, libraryPaths);
+                    if (full == null)
+                    {
+                        unresolved.Add(name);
+                        continue;
+                    }
+                    nameToPath[name] = full;
+                    if (!pathsSeen.Add(full)) continue;
+                    if (IsUnder(full, clarionRoot))
+                    {
+                        _db.InsertIndexedFile(pid, name, full, "skipped_clarion_install", 0, PassGlobalData);
+                        continue;
+                    }
+
+                    var parsed = _clarionParser.ParseGlobalDataInclude(full, pid);
+                    var children = new List<KeyValuePair<string, bool>>();
+                    includesOf[full] = children;
+                    int kept = 0;
+                    foreach (var sym in parsed.Symbols)
+                    {
+                        if (sym.Type == "include")
+                        {
+                            if (sym.InGlobalData)
+                            {
+                                queue.Enqueue(sym.Name);
+                                children.Add(new KeyValuePair<string, bool>(sym.Name, sym.Conditional));
+                            }
+                            continue;
+                        }
+                        if (sym.Type != "variable" || sym.Scope != "global") continue;
+                        if (string.Equals(sym.Params, "EQUATE", StringComparison.OrdinalIgnoreCase)) continue;
+                        // A ",TYPE" structure (QUEUE,TYPE / GROUP,TYPE) declares a type, not data: no global exists.
+                        if (sym.SourcePreview != null && TypeAttrRegex.IsMatch(sym.SourcePreview)) continue;
+                        sym.Id = _db.InsertSymbol(sym);
+                        kept++;
+                    }
+                    result.SymbolCount += kept;
+                    variables += kept;
+                    files++;
+                    _db.InsertIndexedFile(pid, Path.GetFileName(full), full,
+                        kept > 0 ? "resolved_parsed" : "resolved_no_symbols", kept, PassGlobalData);
+                }
+
+                if (unresolved.Count == 0) continue;
+                // Required = some route from the PROGRAM is unconditional all the way. This walk also reads files
+                // Pass 2b does not descend into (outside the solution folder), so it decides for itself; a name Pass
+                // 2b found required through another route (a MEMBER module) stays a gap here too.
+                var required = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var requiredWork = new Queue<string>();
+                foreach (var seed in seedNames)
+                    if (!seed.Value && required.Add(seed.Key)) requiredWork.Enqueue(seed.Key);
+                while (requiredWork.Count > 0)
+                {
+                    string path;
+                    List<KeyValuePair<string, bool>> children;
+                    if (!nameToPath.TryGetValue(requiredWork.Dequeue(), out path) ||
+                        !includesOf.TryGetValue(path, out children)) continue;
+                    foreach (var child in children)
+                        if (!child.Value && required.Add(child.Key)) requiredWork.Enqueue(child.Key);
+                }
+                var gapsElsewhere = IncludeNamesWithOutcome(pid, "unresolved");
+                foreach (string name in unresolved)
+                    _db.InsertIndexedFile(pid, name, null,
+                        required.Contains(name) || gapsElsewhere.Contains(name) ? "unresolved" : OutcomeUnresolvedConditional,
+                        0, PassGlobalData);
+            }
+            ReportProgress(string.Format("  Global data: {0} INCLUDEd file(s) read, {1} global variable(s)", files, variables));
+        }
+
+        /// <summary>The INCLUDE() targets Pass 2b recorded with <paramref name="outcome"/> for a project.</summary>
+        private HashSet<string> IncludeNamesWithOutcome(int projectId, string outcome)
+        {
+            var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                var dt = _db.ExecuteQuery(
+                    "SELECT file_name FROM indexed_files WHERE project_id = @pid AND pass = 'pass2b-include' AND outcome = @outcome",
+                    new Dictionary<string, object> { { "@pid", projectId }, { "@outcome", outcome } });
+                foreach (System.Data.DataRow row in dt.Rows)
+                    names.Add(row["file_name"].ToString());
+            }
+            catch { }
+            return names;
+        }
+
+        /// <summary>indexed_files outcome of a Pass 2b INCLUDE() target that did not resolve and is only ever INCLUDEd
+        /// inside a conditional COMPILE('t', expr) / OMIT('t', expr) block (GH #271).</summary>
+        internal const string OutcomeUnresolvedConditional = "unresolved_conditional";
+
+        /// <summary>Where an INCLUDE() target was seen, for the Pass 2b log line. Conditional stays true only while
+        /// every INCLUDE of the name seen so far sits in a conditional COMPILE/OMIT block; whether a target is
+        /// required at all is decided over every route after the Pass 2b walk.</summary>
+        private sealed class IncludeOrigin
+        {
+            public string File;
+            public int Line;
+            public bool Conditional;
+            // True once a parsed SOURCE file (a seed of the walk) INCLUDEs the name outside a conditional block. Kept
+            // apart from Conditional, which INCLUDEs inside the walked .inc files also clear: an unconditional INCLUDE
+            // inside an .inc that is itself only reached conditionally does not make the name a required seed.
+            public bool SeedUnconditional;
+        }
+
+        /// <summary>GH #278 / review D5: one log line per .red {include} that was not followed, worded for why.</summary>
+        private void ReportRedSkippedIncludes(ClarionAssistant.Services.RedFileService red, string projectName)
+        {
+            var kinds = red.SkippedIncludeKinds;
+            for (int k = 0; k < red.SkippedIncludes.Count; k++)
+            {
+                var kind = k < kinds.Count ? kinds[k] : ClarionAssistant.Services.RedIncludeSkip.FileNotFound;
+                ReportProgress(RedSkippedIncludeLine(red.SkippedIncludes[k], kind, projectName,
+                    string.IsNullOrEmpty(red.RedFilePath) ? null : Path.GetFileName(red.RedFilePath)));
+            }
+        }
+
+        internal static string RedSkippedIncludeLine(string entry, ClarionAssistant.Services.RedIncludeSkip kind,
+            string projectName, string redFileName)
+        {
+            string whose = projectName == null ? "" : " (project " + projectName + "'s own " + (redFileName ?? ".red") + ")";
+            switch (kind)
+            {
+                case ClarionAssistant.Services.RedIncludeSkip.AlreadyLoaded:
+                    // A .red that includes itself (a local Clarion110.red naming %BIN%\Clarion110.red when %BIN% is the
+                    // local folder): its entries are already in. Harmless - not a warning.
+                    return "  .red {include} skipped" + whose + ", that file is already loaded (harmless, its search paths are in): " + entry;
+                case ClarionAssistant.Services.RedIncludeSkip.FileNotFound:
+                    return "WARNING: .red {include} not followed" + whose + " - the file it names does not exist (an undefined %MACRO%?), so its search paths are missing: " + entry;
+                case ClarionAssistant.Services.RedIncludeSkip.TooDeep:
+                    return "WARNING: .red {include} not followed" + whose + " - nested too deep, so its search paths are missing: " + entry;
+                case ClarionAssistant.Services.RedIncludeSkip.Unreadable:
+                    return "WARNING: .red {include} not followed" + whose + " - the file could not be read, so its search paths are missing: " + entry;
+                default:
+                    return "WARNING: .red {include} not followed" + whose + " - the line could not be read as {include path}, so what it adds is missing: " + entry;
+            }
+        }
+
+        /// <summary>Remember an include symbol as a Pass 2b seed, and where it came from.</summary>
+        private static void NoteInclude(Dictionary<int, HashSet<string>> names,
+            Dictionary<int, Dictionary<string, IncludeOrigin>> origins, int projectId, ClarionSymbol sym)
+        {
+            HashSet<string> set;
+            if (!names.TryGetValue(projectId, out set))
+            {
+                set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                names[projectId] = set;
+            }
+            set.Add(sym.Name);
+            NoteIncludeOrigin(origins, projectId, sym, sym.Conditional);
+            if (!sym.Conditional) origins[projectId][sym.Name].SeedUnconditional = true;
+        }
+
+        private static void NoteIncludeOrigin(Dictionary<int, Dictionary<string, IncludeOrigin>> origins,
+            int projectId, ClarionSymbol sym, bool conditional)
+        {
+            Dictionary<string, IncludeOrigin> byName;
+            if (!origins.TryGetValue(projectId, out byName))
+            {
+                byName = new Dictionary<string, IncludeOrigin>(StringComparer.OrdinalIgnoreCase);
+                origins[projectId] = byName;
+            }
+            IncludeOrigin o;
+            if (!byName.TryGetValue(sym.Name, out o))
+                byName[sym.Name] = new IncludeOrigin { File = sym.FilePath, Line = sym.LineNumber, Conditional = conditional };
+            else if (o.Conditional && !conditional)
+            {
+                // One unconditional INCLUDE makes the file required; point the log at that one.
+                o.File = sym.FilePath;
+                o.Line = sym.LineNumber;
+                o.Conditional = false;
+            }
+        }
+
+        private static IncludeOrigin OriginOf(Dictionary<int, Dictionary<string, IncludeOrigin>> origins, int projectId, string name)
+        {
+            Dictionary<string, IncludeOrigin> byName;
+            IncludeOrigin o;
+            return origins.TryGetValue(projectId, out byName) && byName.TryGetValue(name, out o) ? o : null;
+        }
+
+        /// <summary>
+        /// #244 item 3: fill the coverage counts from the per-file audit (the whole database, so an incremental
+        /// run reports what the index now holds, not just what this run touched) and decide the status.
+        /// </summary>
+        private void FinishCoverage(IndexResult result)
+        {
+            try
+            {
+                var dt = _db.ExecuteQuery("SELECT outcome, pass, COUNT(*) AS n FROM indexed_files GROUP BY outcome, pass");
+                foreach (System.Data.DataRow row in dt.Rows)
+                {
+                    string outcome = row["outcome"].ToString();
+                    string pass = row["pass"] != DBNull.Value ? row["pass"].ToString() : "";
+                    int n = Convert.ToInt32(row["n"]);
+                    // A global-data reading (Pass 2d) is a second look at a file another pass already counted.
+                    if (pass == PassGlobalData)
+                    {
+                        if (outcome == "resolved_parsed" || outcome == "resolved_no_symbols") result.GlobalDataFilesRead += n;
+                        continue;
+                    }
+                    bool module = pass == PassModule;
+                    if (outcome == "resolved_parsed" || outcome == "resolved_no_symbols")
+                    {
+                        result.FilesParsed += n;
+                        if (module) result.ModuleFilesIndexed += n;
+                    }
+                    else if (outcome == "unresolved")
+                    {
+                        result.FilesUnresolved += n;
+                        if (module) result.ModuleTargetsUnresolved += n;
+                        if (pass == "pass2b-include") result.IncludeTargetsUnresolved += n;
+                    }
+                    else if (outcome == OutcomeUnresolvedConditional)
+                    {
+                        result.FilesSkipped += n;
+                        result.IncludeTargetsConditional += n;
+                    }
+                    else if (outcome.StartsWith("skipped", StringComparison.Ordinal))
+                    {
+                        result.FilesSkipped += n;
+                        if (module) result.ModuleTargetsSkipped += n;
+                    }
+                }
+            }
+            catch { }
+            try
+            {
+                // Name each unresolved INCLUDE and a file that INCLUDEs it (its include symbol), so the warning
+                // answers "which file, from where" without a query (GH #271). That is the first such INCLUDE
+                // indexed, not necessarily the one that makes the file required; the Pass 2b log names that one.
+                const string firstInclude = "FROM symbols s WHERE s.type = 'include' AND s.project_id = f.project_id " +
+                    "AND s.name = f.file_name COLLATE NOCASE ORDER BY s.id LIMIT 1";
+                var dt = _db.ExecuteQuery(string.Format(
+                    "SELECT f.file_name AS name, (SELECT s.file_path " + firstInclude + ") AS origin_file, " +
+                    "(SELECT s.line_number " + firstInclude + ") AS origin_line FROM indexed_files f " +
+                    "WHERE f.outcome = 'unresolved' AND f.pass = 'pass2b-include' ORDER BY f.file_name LIMIT {0}",
+                    IndexResult.MaxNamedIncludes));
+                foreach (System.Data.DataRow row in dt.Rows)
+                {
+                    string originFile = row["origin_file"] != DBNull.Value ? row["origin_file"].ToString() : null;
+                    result.UnresolvedIncludeNames.Add(string.IsNullOrEmpty(originFile)
+                        ? row["name"].ToString()
+                        : string.Format("{0} ({1}:{2})", row["name"], Path.GetFileName(originFile), row["origin_line"]));
+                }
+            }
+            catch { }
+            result.Decide();
         }
 
         /// <summary>Returns the number of relationships inserted (surfaced on IndexResult for
@@ -1554,6 +2456,10 @@ namespace ClarionCodeGraph.Graph
 
                     for (int i = target.StartLine; i < lines.Length; i++)
                     {
+                        // 583abdec review D1: one generated module can be 80k+ lines and take seconds here, so the
+                        // cancel probe (an Interlocked read - and in the indexer child, the host-died signal) is
+                        // also polled every 4096 lines, not only between files.
+                        if (((i - target.StartLine) & CancelPollLineMask) == CancelPollLineMask) ThrowIfCancelled();
                         string line = lines[i];
                         string trimmed = line.TrimStart();
 
@@ -1900,6 +2806,10 @@ namespace ClarionCodeGraph.Graph
                             // resolve (issue #54, Bug 1).
                             string lookupOwner = objName;
                             bool foundLocalVar = false;
+                            // True once lookupOwner came from a declared class TYPE (not the literal name):
+                            // only then is an inherited method looked for on the ancestors (GH #246).
+                            bool typedOwner = false;
+                            bool ownerAmbiguous = false;
                             if (currentFileVars != null)
                             {
                                 foreach (var varInfo in currentFileVars)
@@ -1923,7 +2833,10 @@ namespace ClarionCodeGraph.Graph
                                     foundLocalVar = true;
                                     string varTypeName;
                                     if (TryResolveVariableClassType(varInfo.Params, out varTypeName))
+                                    {
                                         lookupOwner = varTypeName;
+                                        typedOwner = true;
+                                    }
                                     break;
                                 }
                             }
@@ -1967,14 +2880,52 @@ namespace ClarionCodeGraph.Graph
                                     {
                                         string varTypeName;
                                         if (TryResolveVariableClassType(memberVar.Params, out varTypeName))
+                                        {
                                             lookupOwner = varTypeName;
+                                            typedOwner = true;
+                                        }
                                     }
                                 }
+                            }
+
+                            // GH #246: a GLOBAL object - declared in the PROGRAM, or in an .inc INCLUDEd into its
+                            // global data - is in no member module's own variable list, so "ActiveThreads.Add(...)"
+                            // in 22 modules resolved to the literal "ActiveThreads.Add" and linked nothing. Same
+                            // project-first narrowing as the references fallback; a local or file variable of the
+                            // same name (found above) still wins.
+                            if (!foundLocalVar && !typedOwner && globalVarsByName.Count > 0)
+                            {
+                                VariableInfo globalObj = resolveGlobalVar(objName, target.ProjectId, out ownerAmbiguous);
+                                string varTypeName;
+                                if (globalObj != null && TryResolveVariableClassType(globalObj.Params, out varTypeName))
+                                {
+                                    lookupOwner = varTypeName;
+                                    typedOwner = true;
+                                }
+                                else
+                                    ownerAmbiguous = false;
                             }
 
                             string fullName = lookupOwner + "." + methodName;
                             bool dottedAmbiguous;
                             long targetId = resolveCallTarget(fullName, target.ProjectId, target.Path, trimmed, out dottedAmbiguous);
+                            // Not overridden on the object's class: the nearest ancestor that declares it
+                            // (ActiveThreads is a ctQ_ActiveThreads:ThreadSafe; Count lives on ctQ_ActiveThreads).
+                            if (targetId < 0 && typedOwner)
+                            {
+                                string ancestor = lookupOwner;
+                                for (int hop = 0; hop < 25 && targetId < 0; hop++)
+                                {
+                                    string parentClassName;
+                                    if (!classParentByName.TryGetValue(ancestor, out parentClassName) ||
+                                        string.IsNullOrEmpty(parentClassName) ||
+                                        string.Equals(parentClassName, ancestor, StringComparison.OrdinalIgnoreCase))
+                                        break;
+                                    ancestor = parentClassName;
+                                    targetId = resolveCallTarget(ancestor + "." + methodName, target.ProjectId, target.Path, trimmed, out dottedAmbiguous);
+                                }
+                            }
+                            dottedAmbiguous = dottedAmbiguous || ownerAmbiguous;
                             if (targetId >= 0)
                             {
                                 string relKey = string.Format("{0}|{1}|calls|{2}", currentFromId, targetId, i + 1);
@@ -2904,6 +3855,158 @@ namespace ClarionCodeGraph.Graph
         public int SymbolCount { get; set; }
         public int RelationshipCount { get; set; }
         public long DurationMs { get; set; }
+
+        // ---- Coverage (#244 item 3): how much of the solution the index actually holds ----
+
+        /// <summary>.cwproj files the .sln names that exist on disk / that do not.</summary>
+        public int ProjectsResolved { get; set; }
+        public int ProjectsUnresolved { get; set; }
+        public List<string> UnresolvedProjectNames { get; } = new List<string>();
+
+        /// <summary>Files the .cwproj files list (Compile items: .clw and .inc), and how many of them did not resolve.</summary>
+        public int CwprojFilesListed { get; set; }
+        public int CwprojFilesUnresolved { get; set; }
+
+        /// <summary>From the indexed_files audit, every pass: files parsed (with or without symbols), unresolved, skipped.</summary>
+        public int FilesParsed { get; set; }
+        public int FilesUnresolved { get; set; }
+        public int FilesSkipped { get; set; }
+
+        /// <summary>CLASS MODULE()/LINK() targets (Pass 2c): indexed, unresolved, skipped (under the Clarion install).</summary>
+        public int ModuleFilesIndexed { get; set; }
+        public int ModuleTargetsUnresolved { get; set; }
+        public int ModuleTargetsSkipped { get; set; }
+
+        /// <summary>INCLUDE() targets (Pass 2b) that did not resolve.</summary>
+        public int IncludeTargetsUnresolved { get; set; }
+
+        /// <summary>The first <see cref="MaxNamedIncludes"/> of them, as "Name.inc (Includer.clw:line)".</summary>
+        public List<string> UnresolvedIncludeNames { get; } = new List<string>();
+        public const int MaxNamedIncludes = 10;
+
+        /// <summary>INCLUDE() targets (Pass 2b) that did not resolve, all inside a conditional COMPILE/OMIT block:
+        /// not counted as a gap (GH #271).</summary>
+        public int IncludeTargetsConditional { get; set; }
+
+        /// <summary>Files INCLUDEd into a PROGRAM's global data whose declarations were indexed as globals (Pass 2d).</summary>
+        public int GlobalDataFilesRead { get; set; }
+
+        /// <summary>The indexer build and feature level that wrote this run (also stored in index_metadata).</summary>
+        public string IndexerVersion { get; set; }
+        public int FeatureLevel { get; set; }
+
+        /// <summary>What the caller asked for, and what ran: an incremental request on a database below the current
+        /// feature level (or a new one) runs full (ef2fd2a9 / cea47717).</summary>
+        public bool RequestedIncremental { get; set; }
+        public bool Incremental { get; set; }
+
+        /// <summary>-1: no upgrade. Otherwise the feature level the database recorded when an incremental request ran
+        /// full because of it (0 = a new database, nothing indexed before).</summary>
+        public int UpgradedFromFeatureLevel { get; set; } = -1;
+
+        /// <summary>An incremental run found no changed project: nothing was re-parsed or written, so the symbol and
+        /// relationship counts (this run's) are 0 over a database that keeps everything it had.</summary>
+        public bool UpToDate { get; set; }
+
+        /// <summary>The "Mode:" every host reports - says when an incremental request ran full, and why.</summary>
+        public string ModeText
+        {
+            get
+            {
+                if (Incremental)
+                    return UpToDate
+                        ? "incremental (up to date: no source changes since the last index, nothing re-parsed - the database keeps its existing symbols; the symbol and relationship counts are this run's)"
+                        : "incremental";
+                if (UpgradedFromFeatureLevel == 0)
+                    return "full (new database: no earlier index to update incrementally)";
+                if (UpgradedFromFeatureLevel > 0)
+                    return string.Format("full (upgraded from feature level {0} to {1}; incremental would have missed the new passes)",
+                        UpgradedFromFeatureLevel, CodeGraphIndexer.FeatureLevel);
+                return "full";
+            }
+        }
+
+        public const string StatusOk = "ok";
+        public const string StatusWarning = "warning";
+        public const string StatusPartial = "partial";
+
+        /// <summary>"ok", "warning" (something did not resolve) or "partial" (most of it did not).</summary>
+        public string Status { get; private set; } = StatusOk;
+        public bool IsPartial { get { return Status == StatusPartial; } }
+        public List<string> Warnings { get; } = new List<string>();
+
+        /// <summary>Decide <see cref="Status"/> and <see cref="Warnings"/> from the counts. Idempotent.</summary>
+        public void Decide()
+        {
+            Warnings.Clear();
+            bool partial = false;
+            int projectTotal = ProjectsResolved + ProjectsUnresolved;
+            if (projectTotal == 0)
+            {
+                Warnings.Add("the solution names no Clarion projects (.cwproj) - nothing was indexed");
+                partial = true;
+            }
+            else if (ProjectsUnresolved > 0)
+            {
+                Warnings.Add(string.Format("{0} of {1} .cwproj file(s) not found: {2}", ProjectsUnresolved, projectTotal,
+                    string.Join(", ", UnresolvedProjectNames)));
+                if (ProjectsUnresolved * 2 > projectTotal) partial = true;
+            }
+            if (CwprojFilesUnresolved > 0)
+            {
+                Warnings.Add(string.Format("{0} of {1} .cwproj-listed file(s) did not resolve through the .red - " +
+                    "SELECT * FROM indexed_files WHERE outcome='unresolved' AND pass='resolve'", CwprojFilesUnresolved, CwprojFilesListed));
+                if (CwprojFilesUnresolved * 2 > CwprojFilesListed) partial = true;
+            }
+            int moduleTotal = ModuleFilesIndexed + ModuleTargetsUnresolved;
+            if (ModuleTargetsUnresolved > 0)
+            {
+                Warnings.Add(string.Format("{0} of {1} CLASS MODULE()/LINK() file(s) did not resolve - " +
+                    "SELECT * FROM indexed_files WHERE outcome='unresolved' AND pass='pass2c-module'", ModuleTargetsUnresolved, moduleTotal));
+                if (ModuleTargetsUnresolved * 2 > moduleTotal) partial = true;
+            }
+            if (IncludeTargetsUnresolved > 0)
+            {
+                string named = UnresolvedIncludeNames.Count == 0 ? "" : ": " + string.Join(", ", UnresolvedIncludeNames) +
+                    (IncludeTargetsUnresolved > UnresolvedIncludeNames.Count
+                        ? string.Format(" and {0} more", IncludeTargetsUnresolved - UnresolvedIncludeNames.Count) : "");
+                Warnings.Add(string.Format("{0} INCLUDE()d .inc file(s) did not resolve{1} - SELECT * FROM indexed_files WHERE outcome='unresolved' AND pass='pass2b-include'",
+                    IncludeTargetsUnresolved, named));
+            }
+            Status = partial ? StatusPartial : (Warnings.Count > 0 ? StatusWarning : StatusOk);
+        }
+
+        /// <summary>First line of a result message, worded by <see cref="Status"/>.</summary>
+        public string Headline
+        {
+            get
+            {
+                if (Status == StatusPartial) return "CodeGraph index is PARTIAL - most of the solution did not resolve, so queries will miss code:";
+                if (Status == StatusWarning) return "CodeGraph indexed with warnings:";
+                return "CodeGraph indexed successfully:";
+            }
+        }
+
+        /// <summary>The coverage block every host appends to its result message ("  Name: value" lines, newline-separated).</summary>
+        public string CoverageText()
+        {
+            Decide();
+            var sb = new System.Text.StringBuilder();
+            sb.Append("  Status: ").Append(Status).Append('\n');
+            sb.AppendFormat("  Projects resolved: {0} of {1}\n", ProjectsResolved, ProjectsResolved + ProjectsUnresolved);
+            sb.AppendFormat("  Files parsed: {0}, unresolved: {1}, skipped: {2} (indexed_files)\n", FilesParsed, FilesUnresolved, FilesSkipped);
+            sb.AppendFormat("  CLASS MODULE/LINK files: {0} indexed, {1} unresolved, {2} skipped (Clarion install)\n",
+                ModuleFilesIndexed, ModuleTargetsUnresolved, ModuleTargetsSkipped);
+            sb.AppendFormat("  Global data INCLUDE files read: {0}\n", GlobalDataFilesRead);
+            if (IncludeTargetsConditional > 0)
+                sb.AppendFormat("  INCLUDE()d files inside a conditional COMPILE/OMIT block, not found and not counted: {0} (outcome='{1}')\n",
+                    IncludeTargetsConditional, CodeGraphIndexer.OutcomeUnresolvedConditional);
+            if (!string.IsNullOrEmpty(IndexerVersion))
+                sb.AppendFormat("  Indexer: {0} (feature level {1})\n", IndexerVersion, FeatureLevel);
+            foreach (string w in Warnings)
+                sb.Append("  WARNING: ").Append(w).Append('\n');
+            return sb.ToString().TrimEnd('\n');
+        }
     }
 
     internal class VariableInfo

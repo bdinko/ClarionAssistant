@@ -22,9 +22,9 @@ namespace ClarionAssistant.Services
     /// IDE lives. A record whose pid is no longer running is ignored, so an IDE that crashed without
     /// cleaning up cannot hand a stale solution to anyone.
     ///
-    /// SCOPE, deliberately narrow: the standalone uses this ONLY as the LSP's fallback when it was
-    /// given no --solution. It does not re-point the CodeGraph/solution tools - those keep the
-    /// launch-time --solution semantics they document.
+    /// SCOPE (widened by 9e1bd280): the standalone FOLLOWS this for every tool, not only the LSP -
+    /// SolutionFollower serves the solution named here, --solution only until the IDE publishes one,
+    /// and none once the IDE closes it. Owner decision: a tab answers for what the header shows.
     ///
     /// IDE-free (compiled into both the addin and the standalone), and never throws.
     /// </summary>
@@ -32,6 +32,18 @@ namespace ClarionAssistant.Services
     {
         /// <summary>Test hook: redirects the record directory. Null in production.</summary>
         internal static string RootOverride { get; set; }
+
+        /// <summary>b8f9431c review L2: a test-only environment hook (CA_IDE_RECORD_DIR, CA_IDE_IMAGE_NAME), honoured only
+        /// with CA_TEST_HOOKS=1 - the same rule as IdeEndpointRecord.TestHook (a copy: this file compiles alone).</summary>
+        private static string TestHook(string name)
+        {
+            try
+            {
+                if (Environment.GetEnvironmentVariable("CA_TEST_HOOKS") != "1") return null;
+                return Environment.GetEnvironmentVariable(name);
+            }
+            catch { return null; }
+        }
 
         private static readonly object _lock = new object();
         private static string _lastPublished;   // what this process last wrote ("" = removed)
@@ -51,6 +63,19 @@ namespace ClarionAssistant.Services
         /// own preferences when the live choice is unavailable.</summary>
         public static Func<string> ConfigDirProvider { get; set; }
 
+        /// <summary>5a5581e6: addin side, the IDE's LIVE build configuration for its open solution (Build &gt; Set
+        /// Configuration; SharpDevelop's OpenSolution.Preferences), or null. Published with the solution so the
+        /// standalone resolves .red sections for the configuration the IDE builds now, not the one it last saved.</summary>
+        public static Func<BuildConfiguration> BuildConfigurationProvider { get; set; }
+
+        /// <summary>5a5581e6: a solution's active build configuration ("Debug", "Release", ...) and platform ("Win32").</summary>
+        public sealed class BuildConfiguration
+        {
+            public string Solution { get; set; }
+            public string Configuration { get; set; }
+            public string Platform { get; set; }
+        }
+
         public static string DirectoryPath
         {
             get
@@ -59,7 +84,7 @@ namespace ClarionAssistant.Services
                 // 44a1b10c: a cross-PROCESS test override (RootOverride is in-process only), shared with
                 // IdeEndpointRecord (its RecordDirEnv), so a harness can point a real standalone exe at a temp
                 // directory. A literal here so the files that compile this one alone need nothing new.
-                string env = Environment.GetEnvironmentVariable("CA_IDE_RECORD_DIR");
+                string env = TestHook("CA_IDE_RECORD_DIR");   // L2: only with CA_TEST_HOOKS=1
                 if (!string.IsNullOrEmpty(env)) return Path.Combine(env, "ide-solution");
                 return Path.Combine(
                     Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -86,9 +111,17 @@ namespace ClarionAssistant.Services
                     ? solutionPath : "";
                 string version = value.Length == 0 ? null : Ask(VersionChoiceProvider);
                 string configDir = value.Length == 0 ? null : Ask(ConfigDirProvider);
+                BuildConfiguration build = null;
+                if (value.Length > 0)
+                {
+                    try { build = BuildConfigurationProvider != null ? BuildConfigurationProvider() : null; } catch { }
+                    // Only the configuration OF this solution (5a5581e6).
+                    if (build != null && (string.IsNullOrEmpty(build.Configuration) || !SameFile(build.Solution, value))) build = null;
+                }
                 // The change key covers the version too: a Set Clarion Version switch with the same solution
-                // open must reach the standalone (0ce0b5e2).
-                string key = value.Length == 0 ? "" : value + "|" + version + "|" + configDir;
+                // open must reach the standalone (0ce0b5e2). And the build configuration (5a5581e6).
+                string key = value.Length == 0 ? "" : value + "|" + version + "|" + configDir
+                    + (build != null ? "|" + build.Configuration + "|" + build.Platform : "");
                 lock (_lock)
                 {
                     if (_lastPublished != null && string.Equals(_lastPublished, key, StringComparison.OrdinalIgnoreCase))
@@ -109,8 +142,24 @@ namespace ClarionAssistant.Services
                             { "pid", pid },
                             { "writtenAt", DateTime.Now.ToString("o") }
                         };
+                        // 9e1bd280 run 1: who wrote it, so a reader can tell this IDE from a later process that
+                        // reused its pid (see VerifyWriter).
+                        try
+                        {
+                            using (var me = System.Diagnostics.Process.GetCurrentProcess())
+                            {
+                                rec["startTime"] = me.StartTime.ToUniversalTime().ToString("o");
+                                rec["processName"] = me.ProcessName;
+                            }
+                        }
+                        catch { }
                         if (version != null) rec["clarionVersion"] = version;
                         if (configDir != null) rec["configDir"] = configDir;
+                        if (build != null)
+                        {
+                            rec["buildConfiguration"] = build.Configuration;
+                            if (!string.IsNullOrEmpty(build.Platform)) rec["buildPlatform"] = build.Platform;
+                        }
                         // Write-then-copy so a reader never sees a half-written file.
                         string tmp = file + ".tmp";
                         File.WriteAllText(tmp, new JavaScriptSerializer().Serialize(rec), EncodingHelper.Utf8NoBom);
@@ -137,6 +186,13 @@ namespace ClarionAssistant.Services
             string sln;
             lock (_lock) { sln = _lastSolution; }
             if (!string.IsNullOrEmpty(sln)) Publish(sln);
+        }
+
+        private static bool SameFile(string a, string b)
+        {
+            if (string.IsNullOrEmpty(a) || string.IsNullOrEmpty(b)) return false;
+            try { a = Path.GetFullPath(a); b = Path.GetFullPath(b); } catch { }
+            return string.Equals(a, b, StringComparison.OrdinalIgnoreCase);
         }
 
         private static string Ask(Func<string> provider)
@@ -185,6 +241,10 @@ namespace ClarionAssistant.Services
             public string ConfigDir { get; internal set; }
             /// <summary>The publishing IDE's process id.</summary>
             public int Pid { get; internal set; }
+            /// <summary>5a5581e6: the IDE's live build configuration for the solution ("Release"), or null.</summary>
+            public string BuildConfiguration { get; internal set; }
+            /// <summary>5a5581e6: its platform ("Win32"), or null.</summary>
+            public string BuildPlatform { get; internal set; }
         }
 
         /// <summary>As <see cref="Read(int, out string, out bool)"/>, with everything the record carries.</summary>
@@ -236,6 +296,12 @@ namespace ClarionAssistant.Services
                     note = "the IDE that published the record (pid " + pid + ") is no longer running";
                     return null;
                 }
+                string staleWhy;
+                if (!VerifyWriter(rec, pid, out staleWhy))
+                {
+                    note = staleWhy;
+                    return null;
+                }
                 if (string.IsNullOrEmpty(sln) || !File.Exists(sln))
                 {
                     note = "the published solution '" + sln + "' does not exist";
@@ -247,7 +313,9 @@ namespace ClarionAssistant.Services
                     Solution = sln,
                     VersionChoice = rec.TryGetValue("clarionVersion", out v) ? v as string : null,
                     ConfigDir = rec.TryGetValue("configDir", out v) ? v as string : null,
-                    Pid = pid
+                    Pid = pid,
+                    BuildConfiguration = rec.TryGetValue("buildConfiguration", out v) ? v as string : null,
+                    BuildPlatform = rec.TryGetValue("buildPlatform", out v) ? v as string : null
                 };
             }
             catch (Exception ex)
@@ -257,6 +325,86 @@ namespace ClarionAssistant.Services
                 return null;
             }
         }
+        /// <summary>
+        /// 9e1bd280 run 1 (Codex): is the live process on <paramref name="pid"/> the one that WROTE the record? A crashed
+        /// IDE leaves its record behind, and Windows recycles pids: without this, a new process on that pid made a dead
+        /// IDE's solution "live" again. The record carries the writer's start time and image name (Publish); the live
+        /// process must match both, and be a Clarion IDE (image "Clarion", or CA_IDE_IMAGE_NAME in tests - the rule
+        /// IdeEndpointRecord applies). A record without a start time (an addin from before this) is accepted as before.
+        ///
+        /// FAILS CLOSED (run 2, Codex): when the record carries a start time and the live process's name or start time
+        /// cannot be read (access denied - a protected or elevated process now on a dead IDE's pid), the writer is
+        /// unverified, so there is no record. This cannot reject a legitimate IDE: this server is the IDE's own child,
+        /// running with the same token, so it can always read its parent's name and start time.
+        ///
+        /// NOT DEFENDED, deliberately: a forged record from a process running as the same user. Such a process can
+        /// already read and write this folder, the IDE's own settings and the server's stdio; per-launch nonces, ACLs
+        /// or authenticated IPC would add machinery without adding a boundary (declined in review).
+        /// </summary>
+        private static bool VerifyWriter(Dictionary<string, object> rec, int pid, out string why)
+        {
+            why = null;
+            object v;
+            DateTime start;
+            // Only an ABSENT start time is the old addin's record. A present but unreadable one (null, not a string,
+            // garbled) is a record that claimed an identity it can't back, so it fails closed too (run 3, Codex).
+            if (!rec.TryGetValue("startTime", out v))
+                return true;
+            if (!DateTime.TryParse(v as string, null, System.Globalization.DateTimeStyles.RoundtripKind, out start))
+            {
+                why = "the record for pid " + pid + " is ignored: its startTime '" + (v ?? "null")
+                    + "' is unreadable, so the IDE identity could not be verified";
+                return false;
+            }
+            string recordedName = rec.TryGetValue("processName", out v) ? v as string : null;
+            string liveName;
+            DateTime liveStart;
+            try
+            {
+                var lookup = ProcessIdentityLookup ?? ReadProcessIdentity;
+                lookup(pid, out liveName, out liveStart);
+            }
+            catch (Exception ex)
+            {
+                why = "the record for pid " + pid + " is ignored: the IDE identity could not be verified ("
+                    + ex.GetType().Name + ": " + ex.Message + ")";
+                return false;
+            }
+
+            string image = TestHook("CA_IDE_IMAGE_NAME");   // L2: only with CA_TEST_HOOKS=1
+            if (string.IsNullOrEmpty(image)) image = "Clarion";
+            if (liveName == null || !liveName.StartsWith(image, StringComparison.OrdinalIgnoreCase)
+                || (!string.IsNullOrEmpty(recordedName) && !string.Equals(liveName, recordedName, StringComparison.OrdinalIgnoreCase)))
+            {
+                why = "the record for pid " + pid + " is stale: that pid is now '" + liveName
+                    + "', not the IDE that wrote it (pid reused) - ignored";
+                return false;
+            }
+            if (Math.Abs((liveStart.ToUniversalTime() - start.ToUniversalTime()).TotalSeconds) > 2)
+            {
+                why = "the record for pid " + pid + " is stale: that pid was started at "
+                    + liveStart.ToUniversalTime().ToString("o") + ", not the recorded "
+                    + start.ToUniversalTime().ToString("o") + " (pid reused) - ignored";
+                return false;
+            }
+            return true;
+        }
+
+        /// <summary>Reads a live process's image name and start time. Throws when either cannot be read.</summary>
+        internal delegate void ProcessIdentityReader(int pid, out string name, out DateTime startTime);
+
+        /// <summary>Test seam (run 2): replaces the process lookup VerifyWriter uses, e.g. with one that throws. Null in production.</summary>
+        internal static ProcessIdentityReader ProcessIdentityLookup { get; set; }
+
+        private static void ReadProcessIdentity(int pid, out string name, out DateTime startTime)
+        {
+            using (var p = System.Diagnostics.Process.GetProcessById(pid))
+            {
+                name = p.ProcessName;
+                startTime = p.StartTime;
+            }
+        }
+
         private static bool IsAlive(int pid)
         {
             try
@@ -327,6 +475,36 @@ namespace ClarionAssistant.Services
                 return _cacheValue;
             }
         }
+        /// <summary>
+        /// e1df6c2e: the records of EVERY live IDE that has <paramref name="solutionPath"/> open, whoever launched this
+        /// process. A server started by the Claude Code plugin has no --ide-pid, yet an IDE running on the same
+        /// solution knows things it cannot (its /ConfigDir settings folder). Each record is read and verified exactly
+        /// as <see cref="ReadDetails"/> does (pid, liveness, writer identity), so a dead or reused-pid record is never
+        /// returned. Empty, never null; never throws.
+        /// </summary>
+        public static List<Details> FindLiveForSolution(string solutionPath)
+        {
+            var found = new List<Details>();
+            try
+            {
+                if (string.IsNullOrEmpty(solutionPath)) return found;
+                string dir = DirectoryPath;
+                if (!Directory.Exists(dir)) return found;
+                foreach (string f in Directory.GetFiles(dir, "ide-*.json"))
+                {
+                    string stem = Path.GetFileNameWithoutExtension(f);
+                    int pid;
+                    if (!int.TryParse(stem.Substring(4), out pid) || pid <= 0) continue;
+                    string note;
+                    bool transient;
+                    var d = ReadDetails(pid, out note, out transient);
+                    if (d != null && SameFile(d.Solution, solutionPath)) found.Add(d);
+                }
+            }
+            catch { }
+            return found;
+        }
+
         /// <summary>Test hook: forget what this process last wrote, so Publish writes again.</summary>
         internal static void ResetForTest()
         {
