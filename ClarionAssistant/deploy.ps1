@@ -1,17 +1,10 @@
 ﻿# ClarionAssistant Deploy Script
 # Builds and deploys the addin for Clarion 10, 11, 11.1, 12, or all.
-# Usage: .\deploy.ps1 [-Version 10|11|11.1|12|all] [-Root <paths>] [-NoBuild] [-Kill] [-SkipBomGuard] [-AllowRunning] [-AllowUnpinnedLsp]
+# Usage: .\deploy.ps1 [-Version 10|11|11.1|12|all] [-NoBuild] [-Kill] [-SkipBomGuard] [-AllowRunning] [-AllowUnpinnedLsp]
 
 param(
     [ValidateSet("10","11","11.1","12","all")]
     [string]$Version = "all",  # Which Clarion version(s) to build/deploy
-    # Restrict the run to specific install roots. ONE version can resolve to SEVERAL installs
-    # (Resolve-ClarionRoots returns every glob match -- 11.1 alone found four here), so -Version
-    # by itself cannot express "only C:\Clarion11.1-13810". This filters the resolved roots, so
-    # both the build (which binds against roots[0]) and the deploy see only what you asked for.
-    # A -Root entry that matches no resolved install is a hard error, never a silent no-op.
-    #   .\deploy.ps1 -Version all -Root C:\Clarion10,C:\Clarion11.1-13810,C:\Clarion12
-    [string[]]$Root,
     [switch]$NoBuild,          # Skip build, just copy
     [switch]$Kill,             # Kill Clarion IDE before deploying
     [switch]$SkipBomGuard,     # Ship without the BOM check (loud, deliberate; see the gate below)
@@ -46,6 +39,9 @@ function Resolve-MSBuild {
 
 $ProjectDir  = $PSScriptRoot
 $ProjectFile = Join-Path $ProjectDir "ClarionAssistant.csproj"
+# The Clarion IDE's process names: Clarion.exe, and ClarionLAA.exe (SoftVelocity's LargeAddressAware build). Keep in
+# step with Services\ClarionIdeProcess.cs IdeImageNames (1976d2e9).
+$IdeImageNames = @("Clarion", "ClarionLAA")
 $MSBuild     = Resolve-MSBuild
 
 # Indexer build output. VENDORED into this repo as indexer/ (GitHub #30) — self-contained,
@@ -174,42 +170,14 @@ if ($Version -eq "all") {
 # previously a missing version aborted the whole run because MSBuild's own hardcoded
 # ClarionRoot default in Directory.Build.props errored out mid-build.
 $ResolvedRoots = @{}
-$MatchedRoots  = @()   # resolved roots that a -Root entry actually selected (typo check below)
 foreach ($ver in $TargetVersions) {
     $cfg   = $Versions[$ver]
     $roots = Resolve-ClarionRoots -RegistryKeys $cfg.RegistryKeys -Fallbacks $cfg.Fallbacks -GlobPatterns $cfg.GlobPatterns
     if ($roots -and $roots.Count -gt 0) {
-        if ($Root) {
-            # Normalise the trailing slash so C:\Clarion12 and C:\Clarion12\ are one root.
-            $roots = @($roots | Where-Object {
-                $resolved = $_.TrimEnd('\')
-                @($Root | Where-Object { $_.TrimEnd('\') -ieq $resolved }).Count -gt 0
-            })
-            $MatchedRoots += $roots
-        }
-        if (-not $roots -or $roots.Count -eq 0) {
-            Write-Host "Clarion ${ver}: no install left after -Root filter - will skip" -ForegroundColor DarkGray
-            continue
-        }
         $ResolvedRoots[$ver] = $roots
         Write-Host "Clarion ${ver}: $($roots -join ', ')" -ForegroundColor DarkGray
     } else {
         Write-Host "Clarion ${ver}: no install found (registry / known paths / drive scan) - will skip" -ForegroundColor DarkGray
-    }
-}
-
-# A -Root entry that selected nothing is almost always a typo or a path that is not actually
-# an install. Failing here is deliberate: the alternative is a run that reports success while
-# deploying to fewer installs than asked for -- the exact failure -Root exists to prevent.
-if ($Root) {
-    $selected = @($MatchedRoots | ForEach-Object { $_.TrimEnd('\') })
-    $unmatched = @($Root | Where-Object { $selected -notcontains $_.TrimEnd('\') })
-    if ($unmatched.Count -gt 0) {
-        Write-Host ""
-        Write-Host "-Root matched no resolved install: $($unmatched -join ', ')" -ForegroundColor Red
-        Write-Host "Resolved installs for the requested version(s):" -ForegroundColor Yellow
-        foreach ($k in $ResolvedRoots.Keys) { Write-Host "  ${k}: $($ResolvedRoots[$k] -join ', ')" -ForegroundColor Yellow }
-        exit 1
     }
 }
 
@@ -599,7 +567,8 @@ function Get-DeployBlockers {
                 $blockers += [PSCustomObject]@{ Name = $p.ProcessName; Id = $p.Id; Why = $path }
                 break
             }
-            if ($p.ProcessName -eq "Clarion" -and $path -like "$rr\*") {
+            # Clarion.exe or ClarionLAA.exe, SoftVelocity's LargeAddressAware build beside it (1976d2e9).
+            if ($IdeImageNames -contains $p.ProcessName -and $path -like "$rr\*") {
                 $blockers += [PSCustomObject]@{ Name = $p.ProcessName; Id = $p.Id; Why = "$path (loads the addin)" }
                 break
             }
@@ -609,7 +578,7 @@ function Get-DeployBlockers {
 }
 
 if ($Kill) {
-    $proc = Get-Process -Name "Clarion" -ErrorAction SilentlyContinue
+    $proc = Get-Process -Name $IdeImageNames -ErrorAction SilentlyContinue
     if ($proc) {
         Write-Host ""
         Write-Host "Stopping Clarion IDE..." -ForegroundColor Yellow
@@ -698,9 +667,11 @@ if (-not $NoBuild) {
     if (Test-Path $McpServerFile) {
         Write-Host ""
         Write-Host "Building standalone MCP server..." -ForegroundColor Cyan
-        # /t:Restore FIRST: this project is not $ProjectFile, so the restore above never covered it.
-        # Without it the PdfPig PackageReference stays unresolved and the shared DocGraphService.cs
-        # fails with CS0103 on UglyToad -- which exit 1's below and aborts the whole deploy.
+        # RESTORE FIRST. The restore above covers $ProjectFile only, and this project carries its
+        # own PackageReference (PdfPig, for the shared DocGraphService.cs it compiles in). With no
+        # obj\project.assets.json of its own the compile fails with CS0103 "UglyToad does not exist"
+        # - which is every FRESH CHECKOUT's first deploy, the same blind spot as 0cd0b20c. Cheap to
+        # repeat: restore is a no-op once the assets file is there.
         & $MSBuild $McpServerFile /t:Restore /p:Configuration=Debug /p:Platform=x86 /v:minimal
         if ($LASTEXITCODE -ne 0) { Write-Host "MCP server restore failed." -ForegroundColor Red; exit 1 }
         & $MSBuild $McpServerFile /p:Configuration=Debug /p:Platform=x86 /v:minimal
@@ -1026,9 +997,9 @@ foreach ($ver in $TargetVersions) {
         # copy's return: this is the check that actually proved an install undamaged on 2026-09-10.
         $DeployedDll = Join-Path $DeployDir "ClarionAssistant.dll"
         $BuiltDll    = Join-Path $BuildOutput "ClarionAssistant.dll"
-        if ((Test-Path $DeployedDll) -and (Test-Path $BuiltDll)) {
+        if ((Test-Path -LiteralPath $DeployedDll) -and (Test-Path -LiteralPath $BuiltDll)) {
             try {
-                if ((Get-FileHash $DeployedDll -Algorithm SHA256).Hash -ne (Get-FileHash $BuiltDll -Algorithm SHA256).Hash) {
+                if ((Get-FileHash -LiteralPath $DeployedDll -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath $BuiltDll -Algorithm SHA256).Hash) {
                     Write-Host "  FAIL  ClarionAssistant.dll does NOT match the build it came from." -ForegroundColor Red
                     Write-Host "        deployed: $DeployedDll" -ForegroundColor Red
                     Write-Host "        built:    $BuiltDll" -ForegroundColor Red

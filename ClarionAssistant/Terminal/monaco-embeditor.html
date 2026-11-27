@@ -372,6 +372,62 @@
         color: var(--title-color); font-family: var(--mono, monospace); font-size: 11px;
         white-space: pre; overflow: hidden; user-select: none;
     }
+    /* Diagnostics count at the right end of the status bar: what the squiggles show for this text, counted
+       from the model's markers. Hidden until the page has asked for diagnostics at least once. */
+    #statusPos { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; }
+    #statusDiag { flex: 0 0 auto; display: flex; align-items: center; gap: 10px; margin-left: 12px;
+        padding: 0 6px; height: 100%; cursor: pointer; }
+    #statusDiag.hidden { display: none; }
+    #statusDiag:hover { background: var(--toolbar-border); }
+    #statusDiag.open { background: var(--toolbar-border); }
+    #statusDiag .sd-item { display: inline-flex; align-items: center; gap: 4px; }
+    #statusDiag .codicon, #diagPopup .dp-row .codicon { font-size: 13px; }
+    .sd-err { color: #f38ba8; }
+    .sd-warn { color: var(--warn-fg); }
+    .sd-ok { color: #a6e3a1; }
+    .sd-unknown { color: var(--muted-fg); }
+    body.light .sd-err { color: #d20f39; }
+    body.light .sd-ok { color: #40a02b; }
+    /* Problems pop-up: grows up out of the status bar's count, anchored bottom-right, no bottom border so
+       it reads as an extension of the bar. Lists the same markers the count counts. */
+    #diagPopup {
+        position: absolute; right: 6px; bottom: var(--status-bar-h); z-index: 40;
+        width: 580px; max-width: calc(100% - 12px); max-height: 45%;
+        display: flex; flex-direction: column; box-sizing: border-box;
+        background: var(--toolbar-bg); color: var(--fg);
+        border: 1px solid var(--toolbar-border); border-bottom: none; border-radius: 6px 6px 0 0;
+        box-shadow: 0 -6px 18px rgba(0,0,0,0.25); font-size: 12px;
+        transform-origin: bottom right; animation: diagPopIn 0.14s ease-out;
+        --dp-row-h: 20px;
+    }
+    /* Dark theme: softer than the toolbar palette - the editor's own background, dimmer message text, a
+       softer red and a quieter selection/shadow. Light theme keeps the palette above. */
+    body:not(.light) #diagPopup { background: var(--bg); color: #bac2de; box-shadow: 0 -4px 14px rgba(0,0,0,0.35); }
+    body:not(.light) #diagPopup .sd-err { color: #eba0ac; }
+    body:not(.light) #diagPopup .dp-row.sel { background: rgba(137,180,250,0.12); }
+    #diagPopup.hidden { display: none; }
+    @keyframes diagPopIn { from { opacity: 0; transform: translateY(8px) scale(0.97); } to { opacity: 1; transform: none; } }
+    @media (prefers-reduced-motion: reduce) { #diagPopup { animation: none; } }
+    #diagPopupHeader { display: flex; align-items: center; gap: 6px; padding: 4px 4px 4px 10px; flex-shrink: 0;
+        border-bottom: 1px solid var(--toolbar-border); color: var(--title-color); font-weight: 600; }
+    #diagPopupTitle { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    /* At most 10 rows tall (then it scrolls); the pop-up's own 45% cap still applies in a small window. */
+    #diagPopupList { flex: 1 1 auto; overflow: auto; outline: none; padding: 2px 0;
+        max-height: calc(10 * var(--dp-row-h) + 4px);
+        /* A thin, translucent scrollbar in the editor's own style; the browser default ignores the theme. */
+        scrollbar-width: thin; scrollbar-color: rgba(127,127,127,0.45) transparent; }
+    body.light #diagPopupList { scrollbar-color: rgba(100,100,100,0.40) transparent; }
+    #diagPopup .dp-row { display: flex; align-items: center; gap: 8px; height: var(--dp-row-h); box-sizing: border-box;
+        padding: 0 10px; cursor: pointer; white-space: nowrap; }
+    #diagPopup .dp-row:hover { background: var(--toolbar-border); }
+    #diagPopup .dp-row.sel { background: rgba(137,180,250,0.20); }
+    /* The line a Problems-list jump lands on, for a moment (flashDiagTarget). */
+    .diag-jump-flash { background: rgba(249,226,175,0.35); }
+    body:not(.light) .diag-jump-flash { background: rgba(249,226,175,0.18); }
+    body.light #diagPopup .dp-row.sel { background: rgba(30,102,245,0.14); }
+    #diagPopup .dp-msg { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; }
+    #diagPopup .dp-ln { flex: 0 0 auto; color: var(--muted-fg); font-family: var(--mono, monospace); font-size: 11px; }
+    #diagPopup .dp-empty { padding: 10px; color: var(--muted-fg); }
     /* Fold button shows the icon for what the NEXT click will do (#147). Only one of the two SVGs is
        ever visible; .expand is set by refreshFoldBtn() from the live folding model, never a remembered
        flag — so hand-folding a region can't leave the icon promising the wrong action. */
@@ -765,6 +821,12 @@
         box-shadow: 0 0 0 1px var(--vscode-textLink-foreground, #3794ff);
         filter: brightness(1.15);
     }
+    /* The references view's list (Shift+F12): Monaco sets its line height but no font size, so it took the
+       page's 13px while the preview beside it follows the editor's Font size. The variable is the editor's
+       font size (syncRefTreeFont). */
+    .monaco-editor .reference-zone-widget .ref-tree {
+        font-size: var(--ca-ref-tree-font-size, 13px);
+    }
     /* The hover footer row (hoverContentsWithFooter): a card's second content entry, drawn like the bar
        Monaco puts under a problem hover (View Problem / Quick Fix) — its background, a rule above it,
        12px text on a 22px line, the links 16px apart. Monaco renders every entry of one hover result as a
@@ -821,6 +883,7 @@
         <button id="outlineBtn" title="Document structure (outline)"><svg class="fico-sm" viewBox="0 0 20 20" fill="none" stroke="#2563eb" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M7 5 H16 M7 10 H16 M7 15 H16"/><circle cx="3.6" cy="5" r="1.1" fill="#2563eb" stroke="none"/><circle cx="3.6" cy="10" r="1.1" fill="#2563eb" stroke="none"/><circle cx="3.6" cy="15" r="1.1" fill="#2563eb" stroke="none"/></svg></button>
         <button id="foldBtn" title="Contract all (fold every structure) — right-click for both"><svg class="fico-sm ico-contract" viewBox="0 0 20 20" fill="none" stroke="#2563eb" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 4 H16.5 M3.5 16 H16.5"/><path d="M7 7.4 L10 10.4 L13 7.4"/></svg><svg class="fico-sm ico-expand" viewBox="0 0 20 20" fill="none" stroke="#2563eb" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 4 H16.5 M3.5 16 H16.5"/><path d="M7 11.2 L10 8.2 L13 11.2"/></svg></button>
         <button id="splitBtn" title="Split editor — two panes of the same file (compare/copy between areas)"><svg class="fico-sm" viewBox="0 0 20 20"><rect x="3" y="4" width="14" height="12" rx="1.6" fill="none" stroke="#475569" stroke-width="2"/><rect x="10" y="4" width="7" height="12" fill="#475569" opacity="0.22"/><path d="M10 4 V16" stroke="#475569" stroke-width="2"/></svg></button>
+        <button id="diffBtn" style="display:none" title="Compare with the saved file: shows your unsaved changes side by side with the file on disk"><svg class="fico-sm" viewBox="0 0 20 20" fill="none" stroke="#475569" stroke-width="1.8" stroke-linecap="round"><rect x="2.5" y="3.5" width="6.5" height="13" rx="1.2"/><rect x="11" y="3.5" width="6.5" height="13" rx="1.2"/><path d="M4 10 H7.5" stroke="#dc2626" stroke-width="2"/><path d="M12.5 10 H16 M14.25 8.25 V11.75" stroke="#16a34a" stroke-width="2"/></svg></button>
         <button id="settingsBtn" title="Editor settings"><svg class="fico-sm" viewBox="0 0 24 24" fill="#475569"><path d="M19.14 12.94c.04-.31.06-.63.06-.94s-.02-.63-.06-.94l2.03-1.58a.5.5 0 0 0 .12-.64l-1.92-3.32a.5.5 0 0 0-.6-.22l-2.39.96a7 7 0 0 0-1.62-.94l-.36-2.54A.5.5 0 0 0 13.9 2h-3.8a.5.5 0 0 0-.5.42l-.36 2.54a7 7 0 0 0-1.62.94l-2.39-.96a.5.5 0 0 0-.6.22L2.31 8.48a.5.5 0 0 0 .12.64l2.03 1.58c-.04.31-.06.63-.06.94s.02.63.06.94l-2.03 1.58a.5.5 0 0 0-.12.64l1.92 3.32a.5.5 0 0 0 .6.22l2.39-.96a7 7 0 0 0 1.62.94l.36 2.54a.5.5 0 0 0 .5.42h3.8a.5.5 0 0 0 .5-.42l.36-2.54a7 7 0 0 0 1.62-.94l2.39.96a.5.5 0 0 0 .6-.22l1.92-3.32a.5.5 0 0 0-.12-.64z" /><circle cx="12" cy="12" r="3.1" fill="#fff"/></svg></button>
         <button id="themeBtn" class="theme-toggle" title="Toggle light / dark"><svg class="tgl" width="34" height="16" viewBox="0 0 34 16"><rect x="0.5" y="0.5" width="33" height="15" rx="7.5" fill="#9aa5b5" stroke="rgba(0,0,0,0.3)"/><circle class="tgl-knob" cx="25" cy="8" r="6"/></svg></button>
         <button id="reloadBtn" style="display:none" title="Reload from disk (discards your edits — click twice to confirm)">&#10227; Reload</button>
@@ -861,6 +924,11 @@
                 <option value="auto">Show when needed</option>
                 <option value="visible">Show always</option>
                 <option value="hidden">Show never</option>
+            </select></label>
+        <label title="What Enter does on a reference in the References list (Shift+F12). Double-click always goes to it.">Enter in the References list
+            <select id="setReferencesEnter">
+                <option value="show">Show in preview (Monaco)</option>
+                <option value="goto">Go to the reference (VS Code)</option>
             </select></label>
         <label title="How many levels of the Document structure pane are visible when it opens. 1 = top level only; 3 = e.g. Class &#8250; Methods &#8250; method names. &#8220;All&#8221; opens it fully expanded.">Document structure: open at level
             <select id="setOutlineLevel">
@@ -976,7 +1044,16 @@
     <div id="navHist" class="hidden"></div>
     <div id="editor"></div>
     <div id="editor2"></div>
-    <div id="statusBar"></div>
+    <div id="statusBar"><span id="statusPos"></span><span id="statusDiag" class="hidden"
+        title="Problems in this text (the squiggles)&#10;Click: show / hide the list&#10;Shift+Click: next problem (F8)"></span></div>
+    <div id="diagPopup" class="hidden" role="dialog" aria-label="Problems">
+        <div id="diagPopupHeader">
+            <span id="diagPopupTitle"></span>
+            <button class="ol-tbtn" id="diagPopupClose" title="Close (Esc)"><span class="codicon codicon-close"></span></button>
+        </div>
+        <div id="diagPopupList" tabindex="0" role="listbox"
+            title="Up/Down: preview in the editor   Enter or double-click: go there   Esc: close"></div>
+    </div>
     <!-- Document structure fly-out (left column, Phase-1 outline prototype). -->
     <div id="outlinePanel" class="hidden">
         <div id="outlineHeader">
@@ -1633,6 +1710,10 @@
                     registerClarionFolding();
                     registerClarionProviders();
                 }
+                if (!monaco.languages.getLanguages().some(function (l) { return l.id === 'clarion-ref'; })) {
+                    monaco.languages.register({ id: 'clarion-ref' });   // references-view previews (see referenceLocationsFromHost)
+                    registerClarionLanguage('clarion-ref');
+                }
                 editor = monaco.editor.create(document.getElementById('editor'), {
                     value: '',
                     language: 'clarion',
@@ -1751,6 +1832,11 @@
                     hideToastAux();   // where that toast went if a change notice was up (showToast)
                     postToHost({ action: 'reload' });
                 });
+                // Compare with saved file (file mode): an on-demand look at the unsaved edits, the same
+                // disk-vs-live diff the external-change toast opens. The host titles it as a saved-vs-editor
+                // compare, reuses one diff tab per editor, and only toasts when there is nothing to show.
+                var diffBtn = document.getElementById('diffBtn');
+                if (diffBtn) diffBtn.addEventListener('click', function () { if (fileMode) postDiffWithDisk(true); });
                 var splitBtn = document.getElementById('splitBtn');
                 if (splitBtn) splitBtn.addEventListener('click', toggleSplit);   // split toggle (#15)
                 if (splitBtn) splitBtn.addEventListener('contextmenu', function (ev) {
@@ -1882,6 +1968,8 @@
         if (tp) tp.textContent = fileMode ? 'CA Editor' : 'CA Embeditor';
         var rb = document.getElementById('reloadBtn');
         if (rb) rb.style.display = fileMode ? '' : 'none';
+        var dfb = document.getElementById('diffBtn');
+        if (dfb) dfb.style.display = fileMode ? '' : 'none';
         ['prevEmbedBtn', 'nextEmbedBtn', 'prevFilledBtn', 'nextFilledBtn'].forEach(function (id) {
             var b = document.getElementById(id);
             if (b) b.style.display = fileMode ? 'none' : '';
@@ -2511,12 +2599,13 @@
     });
 
     // Shared "Show diff" toast action (live buffer, including unsaved edits, vs. disk) — used by both the
-    // content-changed toast and the became-read-only-while-dirty toast below.
-    function postDiffWithDisk() {
+    // content-changed toast and the became-read-only-while-dirty toast below, and (onDemand) by the
+    // toolbar's Compare-with-saved-file button.
+    function postDiffWithDisk(onDemand) {
         var ed = activeEd(), model = ed && ed.getModel();
         // Fall back to whatever the host last mirrored (_overlayLiveText) rather than sending
         // no text at all if the model is transiently unavailable.
-        postToHost({ action: 'diffWithDisk', text: model ? model.getValue() : undefined });
+        postToHost({ action: 'diffWithDisk', text: model ? model.getValue() : undefined, onDemand: onDemand === true });
     }
 
     // {"type":"externalFileState",...} from the host's disk watcher (CA Editor / file mode only — the
@@ -3876,13 +3965,16 @@
             var m = /([A-Za-z_][A-Za-z0-9_]*)$/.exec(before);
             if (!m) return;
             var word = m[1];
-            // Always-safe keywords case at any boundary; built-in FUNCTIONS only when the boundary
-            // just typed is '(' (a call) and the word isn't a method/prefixed field (.Open / Cus:Name) — #61.
+            // A word right after ':', '.' or '?' is part of a name -- a prefixed field (Cus:End), a member
+            // (Q.Loop, SELF.Case, .Open) or a control equate (?If) -- and keeps the developer's casing, keyword
+            // or built-in alike (#61, 46506010). A word BEFORE a ':' is never seen here: ':' is not a boundary.
             var wu = word.toUpperCase();
+            var chPrev = before.charAt(before.length - word.length - 1);
+            if (chPrev === ':' || chPrev === '.' || chPrev === '?') return;
+            // Always-safe keywords case at any boundary; built-in FUNCTIONS only when the boundary just typed
+            // is '(' (a call).
             if (!alwaysKwSet()[wu]) {
                 if (boundaryCh !== '(' || !builtinFnSet()[wu]) return;
-                var chBefore = before.charAt(before.length - word.length - 1);
-                if (chBefore === '.' || chBefore === ':') return;
             }
             var canonical = keywordCaseMode === 'lower' ? word.toLowerCase() : word.toUpperCase();
             if (word === canonical) return;
@@ -4874,6 +4966,7 @@
         // whichever split pane has focus.
         ed.onDidChangeModelContent(function () { updateStatusBar(ed); });
         ed.onDidFocusEditorText(function () { updateStatusBar(ed); });
+        wireDiagStatus();
         updateStatusBar(ed);   // seed on creation
     }
 
@@ -4897,8 +4990,332 @@
             var txt = 'Ln ' + grp(pos.lineNumber) + '    Col ' + grp(pos.column) + '    Pos ' + grp(offset);
             if (sel && !sel.isEmpty()) txt += '    Sel ' + grp(model.getValueLengthInRange(sel));
             txt += '    │    ' + grp(model.getLineCount()) + ' lines    ' + grp(model.getValueLength()) + ' chars';
-            bar.textContent = txt;
+            var posEl = document.getElementById('statusPos');
+            (posEl || bar).textContent = txt;
+            updateDiagStatus(model);
         } catch (e) { }
+    }
+
+    // ----- Diagnostics count in the status bar (prototype, replaces the retired chat-pane pill) -----
+    // Counted from the markers on the model, i.e. exactly what is squiggled, from every owner ('clarion' =
+    // the LSP pass, 'clarion-slot' = the host's slot checks). Three states, as the old pill had:
+    //   hidden  - this page has never asked for diagnostics (no LSP for this surface)
+    //   unknown - asked, but no answer yet for this source (a muted circle, never a false green OK)
+    //   counts  - errors / warnings, or a green check when the answer was "clean"
+    // Built from DOM nodes with textContent only, so nothing from a message can reach the DOM as markup.
+    var diagStatusAsked = false;      // a diagnostics pass has been dispatched for the current source
+    var diagStatusAnswered = false;   // a real (non-null, non-pending) answer has been painted for it
+    var diagStatusSig = null;         // last rendered state, so a cursor move does not rebuild the DOM
+    // The markers that belong to the text on screen. A new source reuses the same model (setSource ->
+    // model.setValue), and the previous source's LSP ('clarion') set stays registered on it until this
+    // source's first LSP reply replaces it: resetDiagnosticsForNewSource clears only the slot set. So until
+    // that reply lands, count only the slot checks, which are computed for this text.
+    function diagCurrentMarkers(model) {
+        if (!model || !monaco.editor.getModelMarkers) return [];
+        var q = diagStatusAnswered ? { resource: model.uri } : { owner: SLOT_MARKER_OWNER, resource: model.uri };
+        return monaco.editor.getModelMarkers(q) || [];
+    }
+    // Counts are cached and recomputed only when the markers or the asked/answered state change, never on
+    // a cursor move: updateStatusBar calls updateDiagStatus on every keystroke, and a broken generated
+    // module can carry tens of thousands of markers (PR #310 review).
+    var diagCountsDirty = true, diagCounts = { errs: 0, warns: 0, infos: 0 };
+    function updateDiagStatus(model) {
+        var el = document.getElementById('statusDiag');
+        if (!el) return;
+        if (!diagStatusAsked) {
+            if (diagStatusSig !== 'hidden') { el.classList.add('hidden'); el.textContent = ''; diagStatusSig = 'hidden'; }
+            return;
+        }
+        if (diagCountsDirty) {
+            diagCountsDirty = false;
+            diagCounts = { errs: 0, warns: 0, infos: 0 };
+            if (model) {
+                diagCurrentMarkers(model).forEach(function (m) {
+                    if (m.severity === monaco.MarkerSeverity.Error) diagCounts.errs++;
+                    else if (m.severity === monaco.MarkerSeverity.Warning) diagCounts.warns++;
+                    else if (m.severity === monaco.MarkerSeverity.Info) diagCounts.infos++;
+                });
+            }
+        }
+        var errs = diagCounts.errs, warns = diagCounts.warns, infos = diagCounts.infos;
+        var total = errs + warns + infos;
+        var state = (total === 0 && !diagStatusAnswered) ? 'unknown' : (total === 0 ? 'ok' : 'counts');
+        var sig = state + '|' + errs + '|' + warns + '|' + infos;
+        if (sig === diagStatusSig) return;
+        diagStatusSig = sig;
+        el.classList.remove('hidden');
+        el.textContent = '';
+        function item(icon, cls, text) {
+            var s = document.createElement('span'); s.className = 'sd-item ' + cls;
+            var i = document.createElement('span'); i.className = 'codicon codicon-' + icon;
+            var t = document.createElement('span'); t.textContent = text;
+            s.appendChild(i); s.appendChild(t); el.appendChild(s);
+        }
+        if (state === 'unknown') { item('circle-large-outline', 'sd-unknown', '…'); return; }
+        if (state === 'ok') { item('check', 'sd-ok', 'OK'); return; }
+        item('error', errs ? 'sd-err' : 'sd-unknown', String(errs));
+        item('warning', warns ? 'sd-warn' : 'sd-unknown', String(warns));
+        if (infos) item('info', 'sd-unknown', String(infos));
+    }
+    function diagStatusRefresh() { try { diagCountsDirty = true; var ed = activeEd(); updateDiagStatus(ed && ed.getModel()); renderDiagPopup(); } catch (e) { } }
+    // A burst of marker changes (the slot pass and the LSP pass land back to back) repaints once.
+    var diagRepaintTimer = null;
+    function scheduleDiagRepaint() {
+        diagCountsDirty = true;
+        if (diagRepaintTimer) return;
+        diagRepaintTimer = setTimeout(function () { diagRepaintTimer = null; diagStatusRefresh(); }, 100);
+    }
+    function diagStatusReset() {
+        // The text was just replaced (setSource): a preview's cursor line belongs to the old source, so it must
+        // not be recorded in Back/Forward history as the pop-up closes.
+        diagPreviewMoved = false;
+        closeDiagPopup(false); diagStatusAsked = false; diagStatusAnswered = false; diagStatusSig = null; diagStatusRefresh();
+    }
+
+    // ----- Problems pop-up over the status bar count -----
+    // Up/Down select AND preview (the editor scrolls to the line, focus stays in the list); Enter or a
+    // double-click goes there and closes; a single click selects + previews; Esc, the count again, the X,
+    // or a click anywhere else closes. Re-rendered live while open, from the same markers as the count.
+    var DIAG_POPUP_MAX_ROWS = 1000;
+    var diagPopupOpen = false, diagPopupSel = -1, diagPopupItems = [];
+    var diagPreviewMoved = false;   // a preview moved the cursor since the pop-up opened (not yet in history)
+    function diagSortedMarkers(model) {
+        var list = diagCurrentMarkers(model).filter(function (m) {
+            return m.severity === monaco.MarkerSeverity.Error || m.severity === monaco.MarkerSeverity.Warning ||
+                   m.severity === monaco.MarkerSeverity.Info;
+        });
+        list.sort(function (a, b) {
+            return (a.startLineNumber - b.startLineNumber) || (a.startColumn - b.startColumn) || (b.severity - a.severity);
+        });
+        return list;
+    }
+    function renderDiagPopup() {
+        if (!diagPopupOpen) return;
+        var listEl = document.getElementById('diagPopupList'), titleEl = document.getElementById('diagPopupTitle');
+        if (!listEl || !titleEl) return;
+        var ed = activeEd(), model = ed && ed.getModel();
+        var prev = diagPopupItems[diagPopupSel];
+        diagPopupItems = diagSortedMarkers(model);
+        var errs = 0, warns = 0, infos = 0;
+        diagPopupItems.forEach(function (m) {
+            if (m.severity === monaco.MarkerSeverity.Error) errs++;
+            else if (m.severity === monaco.MarkerSeverity.Warning) warns++;
+            else infos++;
+        });
+        function plural(n, w) { return n + ' ' + w + (n === 1 ? '' : 's'); }
+        var parts = ['Problems'];
+        if (errs || warns || infos) {
+            parts.push(plural(errs, 'error'), plural(warns, 'warning'));
+            if (infos) parts.push(infos + ' info');
+        }
+        titleEl.textContent = parts.join('  ·  ');
+        // Keep the selection on the same problem across a live re-render (matched by line + message).
+        diagPopupSel = -1;
+        if (prev) {
+            for (var k = 0; k < diagPopupItems.length; k++) {
+                if (diagPopupItems[k].startLineNumber === prev.startLineNumber && diagPopupItems[k].message === prev.message) { diagPopupSel = k; break; }
+            }
+        }
+        var scroll = listEl.scrollTop;
+        listEl.textContent = '';
+        if (diagPopupItems.length === 0) {
+            var empty = document.createElement('div'); empty.className = 'dp-empty';
+            empty.textContent = diagStatusAnswered ? 'No problems in this text.' : 'Waiting for the language server…';
+            listEl.appendChild(empty);
+            return;
+        }
+        var n = Math.min(diagPopupItems.length, DIAG_POPUP_MAX_ROWS);
+        for (var i = 0; i < n; i++) {
+            var m = diagPopupItems[i];
+            var row = document.createElement('div');
+            row.className = 'dp-row' + (i === diagPopupSel ? ' sel' : '');
+            row.setAttribute('role', 'option');
+            row.dataset.index = String(i);
+            row.title = m.message;
+            var sev = m.severity === monaco.MarkerSeverity.Error ? ['error', 'sd-err']
+                    : m.severity === monaco.MarkerSeverity.Warning ? ['warning', 'sd-warn'] : ['info', 'sd-unknown'];
+            var ic = document.createElement('span'); ic.className = 'codicon codicon-' + sev[0] + ' ' + sev[1];
+            var msg = document.createElement('span'); msg.className = 'dp-msg'; msg.textContent = m.message;
+            var ln = document.createElement('span'); ln.className = 'dp-ln'; ln.textContent = 'Ln ' + m.startLineNumber;
+            row.appendChild(ic); row.appendChild(msg); row.appendChild(ln);
+            listEl.appendChild(row);
+        }
+        if (diagPopupItems.length > n) {
+            var more = document.createElement('div'); more.className = 'dp-empty';
+            more.textContent = '…and ' + (diagPopupItems.length - n) + ' more (fix the first ones: later errors are often follow-on errors)';
+            listEl.appendChild(more);
+        }
+        listEl.scrollTop = scroll;
+    }
+    function selectDiagRow(i, preview) {
+        if (i < 0 || i >= Math.min(diagPopupItems.length, DIAG_POPUP_MAX_ROWS)) return;
+        var listEl = document.getElementById('diagPopupList');
+        var old = listEl.querySelector('.dp-row.sel'); if (old) old.classList.remove('sel');
+        diagPopupSel = i;
+        var row = listEl.querySelector('.dp-row[data-index="' + i + '"]');
+        if (row) { row.classList.add('sel'); row.scrollIntoView({ block: 'nearest' }); }
+        if (preview) revealDiag(diagPopupItems[i], false);
+    }
+    // A preview (click, Up/Down) moves the cursor without recording Back/Forward history: the position the
+    // pop-up was opened from is pinned instead. Going there (Enter, double-click) pins the target, as the
+    // page's other explicit jumps do (recordNavAt).
+    function revealDiag(m, go) {
+        try {
+            var ed = activeEd(); if (!ed || !m) return;
+            var pos = { lineNumber: m.startLineNumber, column: m.startColumn };
+            if (_navRecordTimer) { clearTimeout(_navRecordTimer); _navRecordTimer = null; }
+            navSuppress = true;
+            try { ed.setPosition(pos); ed.revealPositionInCenterIfOutsideViewport(pos); }
+            finally { navSuppress = false; }
+            if (go) {
+                // Live tests 2026-11-13 and 2026-11-27: after Enter the line showed but typing did not reach the
+                // editor. Each step gets its own try so none of them can skip the focus, and the focus is
+                // checked rather than assumed (focusAfterDiagJump).
+                try { recordNavAt(pos.lineNumber, pos.column); } catch (e3) { }
+                try { flashDiagTarget(ed, m); } catch (e4) { }
+                focusAfterDiagJump(ed);
+            }
+            else diagPreviewMoved = true;
+        } catch (e) { }
+    }
+    // Focus the editor after a Problems jump. The list that had focus is hidden in the same keydown, so focus
+    // now, again once the pop-up is gone (next tick and next frame), and if Monaco still reports no text focus
+    // after that, ask the host to activate this tab at the window level (the same path as a Data pad drop,
+    // where OS focus is elsewhere and a page-level focus() alone does not reach the editor).
+    function focusAfterDiagJump(ed) {
+        var focusNow = function () { try { window.focus(); ed.focus(); } catch (e) { } };
+        focusNow();
+        setTimeout(focusNow, 0);
+        try { requestAnimationFrame(focusNow); } catch (e) { }
+        setTimeout(function () {
+            try {
+                if (ed.hasTextFocus && ed.hasTextFocus()) return;
+                focusNow();
+                postToHost({ action: 'focusEditor' });
+            } catch (e) { }
+        }, 60);
+    }
+    // Going to a problem selects its text and flashes the whole line for a moment, so the jump is visible
+    // even where the problem is only a squiggle (live test 2026-11-13: only the line number turned bold).
+    var diagFlashIds = [], diagFlashTimer = null;
+    function flashDiagTarget(ed, m) {
+        try {
+            var model = ed.getModel(); if (!model) return;
+            var sl = m.startLineNumber, sc = m.startColumn, el = m.endLineNumber || sl, ec = m.endColumn || sc;
+            // navSuppress: the selection is part of this one jump, not a cursor move for the Back history.
+            if (el > sl || ec > sc) {
+                navSuppress = true;
+                try { ed.setSelection(new monaco.Selection(sl, sc, el, ec)); } finally { navSuppress = false; }
+            }
+            if (diagFlashTimer) { clearTimeout(diagFlashTimer); diagFlashTimer = null; }
+            diagFlashIds = model.deltaDecorations(diagFlashIds, [{
+                range: new monaco.Range(sl, 1, sl, 1),
+                options: { isWholeLine: true, className: 'diag-jump-flash' }
+            }]);
+            diagFlashTimer = setTimeout(function () {
+                diagFlashTimer = null;
+                try { diagFlashIds = model.deltaDecorations(diagFlashIds, []); } catch (e2) { diagFlashIds = []; }
+            }, 1500);
+        } catch (e) { }
+    }
+    function openDiagPopup() {
+        if (!diagStatusAsked) return;
+        try { var p0 = activeEd().getPosition(); if (p0) recordNavAt(p0.lineNumber, p0.column); } catch (e) { }   // Navigate Back returns here
+        diagPopupOpen = true; diagPopupSel = -1; diagPopupItems = []; diagPreviewMoved = false;
+        document.getElementById('diagPopup').classList.remove('hidden');
+        document.getElementById('statusDiag').classList.add('open');
+        var listEl = document.getElementById('diagPopupList');
+        listEl.scrollTop = 0;
+        renderDiagPopup();
+        try { listEl.focus({ preventScroll: true }); } catch (e) { }
+    }
+    function closeDiagPopup(focusEditor) {
+        if (!diagPopupOpen) return;
+        diagPopupOpen = false;
+        // Closed after a preview: the cursor sits on a line the previews did not record. Record it once, so
+        // the first Navigate Back returns to where the pop-up was opened instead of skipping past it.
+        if (diagPreviewMoved) {
+            diagPreviewMoved = false;
+            try { var p = activeEd().getPosition(); if (p) recordNavAt(p.lineNumber, p.column); } catch (e) { }
+        }
+        document.getElementById('diagPopup').classList.add('hidden');
+        document.getElementById('statusDiag').classList.remove('open');
+        if (focusEditor) { try { activeEd().focus(); } catch (e) { } }
+    }
+    function wireDiagPopup() {
+        var listEl = document.getElementById('diagPopupList');
+        var closeBtn = document.getElementById('diagPopupClose');
+        if (!listEl) return;
+        listEl.addEventListener('click', function (ev) {
+            var row = ev.target.closest && ev.target.closest('.dp-row');
+            if (row) selectDiagRow(parseInt(row.dataset.index, 10), true);
+        });
+        listEl.addEventListener('dblclick', function (ev) {
+            var row = ev.target.closest && ev.target.closest('.dp-row');
+            if (!row) return;
+            var m = diagPopupItems[parseInt(row.dataset.index, 10)];
+            closeDiagPopup(false); revealDiag(m, true);
+        });
+        listEl.addEventListener('keydown', function (ev) {
+            var last = Math.min(diagPopupItems.length, DIAG_POPUP_MAX_ROWS) - 1;
+            if (ev.key === 'ArrowDown') { selectDiagRow(Math.min(diagPopupSel + 1, last), true); ev.preventDefault(); }
+            else if (ev.key === 'ArrowUp') { selectDiagRow(Math.max(diagPopupSel - 1, 0), true); ev.preventDefault(); }
+            else if (ev.key === 'Home') { selectDiagRow(0, true); ev.preventDefault(); }
+            else if (ev.key === 'End') { selectDiagRow(last, true); ev.preventDefault(); }
+            else if (ev.key === 'Enter') {
+                var m = diagPopupItems[diagPopupSel];
+                if (m) { closeDiagPopup(false); revealDiag(m, true); }
+                ev.preventDefault();
+            }
+            else if (ev.key === 'Escape') { closeDiagPopup(true); ev.preventDefault(); ev.stopPropagation(); }
+        });
+        if (closeBtn) closeBtn.addEventListener('click', function () { closeDiagPopup(true); });
+        // Only the list takes focus. A press on the header or title would otherwise move focus to <body>, and
+        // Esc (handled on the list) would stop closing the pop-up. Keep focus where it is; clicks still fire.
+        var popupEl = document.getElementById('diagPopup');
+        if (popupEl) popupEl.addEventListener('mousedown', function (ev) {
+            if (!(ev.target.closest && ev.target.closest('#diagPopupList'))) ev.preventDefault();
+        });
+        // A press anywhere outside the pop-up and the count closes it (capture phase: Monaco may stop the
+        // event before it bubbles to the document).
+        document.addEventListener('mousedown', function (ev) {
+            if (!diagPopupOpen) return;
+            var t = ev.target;
+            if (t.closest && (t.closest('#diagPopup') || t.closest('#statusDiag'))) return;
+            closeDiagPopup(false);
+        }, true);
+    }
+    var diagStatusWired = false;
+    function wireDiagStatus() {
+        if (diagStatusWired) return;
+        diagStatusWired = true;
+        // Repaint whenever any owner's markers change on the model on screen.
+        if (monaco.editor.onDidChangeMarkers) {
+            monaco.editor.onDidChangeMarkers(function (uris) {
+                try {
+                    var ed = activeEd(), model = ed && ed.getModel();
+                    if (!model) return;
+                    var key = model.uri.toString();
+                    for (var i = 0; i < uris.length; i++) { if (uris[i].toString() === key) { scheduleDiagRepaint(); return; } }
+                } catch (e) { }
+            });
+        }
+        // Click = show/hide the Problems pop-up; Shift+Click = next problem (Monaco's own F8 navigation).
+        var el = document.getElementById('statusDiag');
+        if (el) el.addEventListener('click', function (ev) {
+            try {
+                if (ev.shiftKey) {
+                    closeDiagPopup(false);
+                    var ed = activeEd();
+                    if (!ed) return;
+                    ed.focus();
+                    ed.trigger('statusBar', 'editor.action.marker.next', null);
+                    return;
+                }
+                if (diagPopupOpen) closeDiagPopup(true); else openDiagPopup();
+            } catch (e) { }
+        });
+        wireDiagPopup();
     }
     function scheduleNavRecord() {
         if (_navRecordTimer) clearTimeout(_navRecordTimer);
@@ -5398,6 +5815,7 @@
         // The old source's slot squiggles go now; its late slot replies are dropped by the diagGen check.
         slotAskedKey = null;
         if (editor && editor.getModel()) monaco.editor.setModelMarkers(editor.getModel(), SLOT_MARKER_OWNER, []);
+        diagStatusReset();   // the new source has no answer yet: back to hidden until its first pass is asked
     }
 
     // ----- Slot checks, painted apart from the LSP pass (1c685f2e item 7) -----
@@ -5509,6 +5927,7 @@
         catch (e) { return; }
         var myGen = diagGen;
         diagInFlight = true;
+        if (!diagStatusAsked) { diagStatusAsked = true; diagStatusRefresh(); }   // status bar: hidden -> unknown
         requestFromHost('diagnostics', payload, timeoutMs)
             .then(function (resp) {
                 // An older source's request (setSource since): the slot and any rerun belong to the new one.
@@ -5551,7 +5970,9 @@
                 }
                 // Minus what the slot checks already squiggle on screen (1c685f2e item 7).
                 var markers = (resp.markers || []).map(toMarkerData);
+                diagStatusAnswered = true;   // before the paint, so the marker-change repaint can say "OK" for a clean file
                 monaco.editor.setModelMarkers(model, 'clarion', withoutDuplicatesOf(markers, markersOnScreen(model, SLOT_MARKER_OWNER)));
+                diagStatusRefresh();   // an empty set on an already-empty model fires no marker change
             })
             .catch(function () { if (myGen === diagGen) diagInFlight = false; /* never let a failed diagnostics round-trip disrupt editing */ });
     }
@@ -6065,10 +6486,9 @@
     // Hover (R7): the local card and the LSP card come from two providers, which Monaco renders as they
     // settle. Both share ONE localHover request per (model, version, position). The LSP provider waits for
     // that answer before it asks, and the host decides which of three ways the local card plays:
-    //   authoritative (a module procedure, a dictionary card, an index card that is not a procedure):
-    //       no LSP request at all;
+    //   authoritative (a dictionary card, an index card that is not a procedure): no LSP request at all;
     //   fallback (a keyword card, GH #250; a DATA label - local, module data, structure; a routine; a
-    //       parameter; a procedure from the index): the local provider shows nothing; the LSP provider asks the
+    //       parameter; a procedure, from the buffer or the index; a local class member): the local provider shows nothing; the LSP provider asks the
     //       server and shows ITS card, or the local card when the server has nothing, is down, or misses
     //       FALLBACK_LSP_DEADLINE_MS - one card either way;
     //   otherwise: both, and the LSP card is dropped when it names the same symbol as the local card, so
@@ -6591,13 +7011,18 @@
         // A card that is nothing but its links keeps them: Monaco skips an empty entry, so the footer would
         // be the row's only entry and draw as a card anyway.
         if (parts.length && !/\S/.test(kept.join(''))) { kept = lines; parts = []; }
+        var references = parts.length ? referencesActionFor(model, position) : '';
+        if (references) parts.push(references);
         var designer = designerActionFor(content.value, model, position);
         if (designer) parts.push(designer);
         if (!parts.length) return [content];
         var body = { value: kept.join('\n').replace(/\n{3,}/g, '\n\n').replace(/\s+$/, '') };
         if (content.isTrusted) body.isTrusted = content.isTrusted;
         var footer = { value: parts.join(' ') };
-        if (designer) footer.isTrusted = { enabledCommands: [STRUCTURE_DESIGNER_COMMAND] };
+        var commands = [];
+        if (references) commands.push(FIND_REFERENCES_COMMAND);
+        if (designer) commands.push(STRUCTURE_DESIGNER_COMMAND);
+        if (commands.length) footer.isTrusted = { enabledCommands: commands };
         return [body, footer];
     }
 
@@ -6633,7 +7058,165 @@
             return true;
         } catch (e) { return false; }
     }
+
+    // Clarion structure/statement keywords, offered as completion items so typing a full keyword has an
+    // exact-match, preselected item that outranks look-alike equates (END vs EndKey/ENDPAGE). Combined
+    // with acceptSuggestionOnEnter:'smart', an exact keyword match is a no-op accept, so Enter inserts a
+    // newline instead of clobbering the word. (task 8933fa05) Also the words the hover footer offers no
+    // Find References on (referencesActionFor).
+    var CLARION_KEYWORDS = [
+        'END', 'RETURN', 'EXIT', 'CYCLE', 'BREAK', 'LOOP', 'CASE', 'IF', 'ELSE', 'ELSIF', 'OF', 'OROF',
+        'WHILE', 'UNTIL', 'DO', 'THEN', 'BEGIN', 'EXECUTE', 'ACCEPT', 'CODE', 'DATA', 'MAP', 'MODULE',
+        'CLASS', 'INTERFACE', 'GROUP', 'QUEUE', 'RECORD', 'FILE', 'VIEW', 'WINDOW', 'REPORT',
+        'PROCEDURE', 'FUNCTION', 'ROUTINE', 'MEMBER', 'PROGRAM', 'SECTION'
+    ];
+    var CLARION_KEYWORD_SET = {};
+    CLARION_KEYWORDS.forEach(function (k) { CLARION_KEYWORD_SET[k] = true; });
+
+    // The footer's "Find References" action, offered on a card that has location links (a symbol with a
+    // declaration) hovered over a name, not a keyword (a LOOP card links its END, but LOOP has no references).
+    // Shift+F12 is Monaco's own key for it (editor.action.goToReferences).
+    var FIND_REFERENCES_COMMAND = 'clarion.findReferences';
+    var referencesCardTarget = null;   // { model, line, column } — where the card last offering it was hovered
+    function referencesActionFor(model, position) {
+        if (!model || !position) return '';
+        var word = '', line = model.getLineContent(position.lineNumber), rx = /[A-Za-z_][A-Za-z0-9_:]*/g, m;
+        while ((m = rx.exec(line)) !== null) {
+            if (position.column - 1 >= m.index && position.column - 1 <= m.index + m[0].length) { word = m[0]; break; }
+        }
+        if (!word || CLARION_KEYWORD_SET[word.toUpperCase()]) return '';
+        referencesCardTarget = { model: model, line: position.lineNumber, column: position.column };
+        return '[Find References (Shift+F12)](command:' + FIND_REFERENCES_COMMAND + ' "Show every reference to this symbol")';
+    }
+    // Clicked: put the cursor where the card was hovered and run Go to References there, as Shift+F12 would.
+    function findReferencesFromCard() {
+        var t = referencesCardTarget;
+        try {
+            if (!t || !t.model || t.model.isDisposed()) return false;
+            var ed = editorShowingModel(t.model);
+            if (!ed) return false;
+            hideHoverCard(ed);
+            ed.setPosition({ lineNumber: t.line, column: t.column });
+            ed.focus();
+            // trigger, not getAction: Monaco registers Go to References with registerAction2, which getAction
+            // never returns (it knows only editor actions and addAction ones). trigger falls through to the
+            // command service, which runs it on the focused editor.
+            ed.trigger('hover', 'editor.action.goToReferences', null);
+            return true;
+        } catch (e) { return false; }
+    }
     // ---- end hover footer row ----
+
+    // ---- Find All References: Shift+F12, right-click Go to References / Peek References, the footer link ----
+    // The host answers {locations: [{path, line, column, endLine, endColumn}], files: {path: preview}}, 1-based.
+    // Every hit is shown on a preview model under the ca-ref: scheme, in language 'clarion-ref' (same grammar,
+    // none of the 'clarion' providers), because the references view names a group by its model's URI: the
+    // editor's own model has Monaco's default inmemory://model/1, which it listed as "1".
+    //   * path null = a line of this editor's own document (the host has mapped it): a copy of this editor's
+    //     text, named after the file (CA Editor) or the procedure (CA Embeditor, whose lines are not the
+    //     module's). Opening one reveals the line here (revealLineFromHost, so Back returns).
+    //   * any other file: its text is SPARSE (only the lines near a hit, see the host's ReferenceLocations),
+    //     and opening one goes to the IDE (openLocation).
+    // The preview editor is read-only either way.
+    var REFERENCES_TIMEOUT_MS = 20000;
+    var REF_SELF_KEY = '\u0000self';
+    var refPreviewModels = {};   // lower-cased path (or REF_SELF_KEY) -> preview model
+    var refPreviewPaths = {};    // preview model uri -> path ('' for this editor's own document)
+    function refPreviewModel(key, path, uriPath, text) {
+        var m = refPreviewModels[key];
+        if (m && !m.isDisposed() && m.uri.path !== uriPath) { delete refPreviewPaths[m.uri.toString()]; m.dispose(); m = null; }
+        if (m && !m.isDisposed()) { if (m.getValue() !== text) m.setValue(text); return m; }
+        m = monaco.editor.createModel(text, 'clarion-ref', monaco.Uri.from({ scheme: 'ca-ref', path: uriPath }));
+        refPreviewModels[key] = m;
+        refPreviewPaths[m.uri.toString()] = path;
+        return m;
+    }
+    // The URI path naming this editor's own document in the references view.
+    function refSelfUriPath() {
+        if (fileMode && currentFilePath) return '/' + String(currentFilePath).replace(/\\/g, '/');
+        var module = String(embedDocPath || '').replace(/^.*[\\\/]/, '');
+        var name = String(baseTitle || 'Embeditor').replace(/[\\\/]/g, '_');
+        return (module ? '/' + module : '') + '/' + name;
+    }
+    function referenceLocationsFromHost(model, resp) {
+        var locs = (resp && resp.locations) || [], files = (resp && resp.files) || {};
+        // used: key -> this search's preview model. Each preview is built once per search, not once per hit:
+        // model.getValue() (and refPreviewModel's reuse compare) joins the whole text, and a generated module
+        // of 60k lines with up to 1000 hits made that seconds of a frozen page.
+        var used = {}, out = [];
+        for (var i = 0; i < locs.length; i++) {
+            var l = locs[i], key = l.path ? String(l.path).toLowerCase() : REF_SELF_KEY, target = used[key];
+            if (!target) {
+                if (!l.path) target = refPreviewModel(REF_SELF_KEY, '', refSelfUriPath(), model.getValue());
+                else {
+                    var text = files[l.path];
+                    target = typeof text === 'string'
+                        ? refPreviewModel(key, l.path, '/' + String(l.path).replace(/\\/g, '/'), text)
+                        : refPreviewModels[key];
+                    if (!target || target.isDisposed()) continue;   // no preview: the file is not on disk
+                }
+                used[key] = target;
+            }
+            out.push({ uri: target.uri, range: new monaco.Range(l.line, l.column, l.endLine || l.line, l.endColumn || l.column) });
+        }
+        // Previews of an earlier search this one does not show.
+        Object.keys(refPreviewModels).forEach(function (k) {
+            if (used[k]) return;
+            var m = refPreviewModels[k];
+            delete refPreviewModels[k];
+            if (m && !m.isDisposed()) { delete refPreviewPaths[m.uri.toString()]; m.dispose(); }
+        });
+        return out;
+    }
+    // Every editor but the page's own two is the references view's preview: read-only. Its models are copies
+    // (sparse ones for other files), so an edit there would go nowhere. The page's main editor instead keeps
+    // the list's font size in step with its own (see the .ref-tree CSS rule).
+    // Deferred: monaco.editor.create announces the editor before `editor`/`editor2` are assigned.
+    function markRefPreviewEditor(ed) {
+        setTimeout(function () {
+            try {
+                if (ed === editor) { syncRefTreeFont(); ed.onDidChangeConfiguration(syncRefTreeFont); }
+                else if (ed !== editor2) { ed.updateOptions({ readOnly: true }); refPreviewEditor = ed; }
+            } catch (e) { }
+        }, 0);
+    }
+    // Enter on a reference in the list. Monaco shows it in the preview and only a double-click goes to it;
+    // the gear setting "Enter in the References list" = 'goto' makes Enter go to it too, as in VS Code.
+    // Monaco binds Enter to that (revealReference) as well, but in a standalone editor the list consumes
+    // the key first, and the command only reveals in the preview anyway. So the key is left to Monaco,
+    // which shows the reference in the preview; then the preview's file and selection are the target:
+    // the list is closed and the target opened the way a double-click opens it (see registerEditorOpener).
+    // Enter on a file line is left alone: it expands or collapses the file.
+    var refsEnterAction = 'show';   // 'show' (Monaco) | 'goto' (VS Code); from the gear setting
+    var refPreviewEditor = null;    // the references view's preview editor (markRefPreviewEditor)
+    function setRefsEnterAction(v) { refsEnterAction = (v === 'goto') ? 'goto' : 'show'; }
+    function onRefTreeEnter(ev) {
+        if (refsEnterAction !== 'goto') return;
+        if (ev.key !== 'Enter' || ev.ctrlKey || ev.altKey || ev.shiftKey || ev.metaKey) return;
+        var tree = ev.target && ev.target.closest ? ev.target.closest('.reference-zone-widget .ref-tree') : null;
+        var row = tree ? tree.querySelector('.monaco-list-row.focused') : null;
+        if (!row || row.querySelector('.reference-file')) return;
+        var owner = [editor, editor2].filter(function (e) { return e && e.getDomNode() && e.getDomNode().contains(tree); })[0];
+        if (owner) setTimeout(function () { gotoPreviewedReference(owner); }, 50);   // after Monaco's preview update
+    }
+    function gotoPreviewedReference(owner) {
+        try {
+            var m = refPreviewEditor && refPreviewEditor.getModel(), sel = m && refPreviewEditor.getSelection();
+            var path = m ? refPreviewPaths[m.uri.toString()] : undefined;
+            if (!sel || path === undefined) return;
+            owner.trigger('keyboard', 'closeReferenceSearch', null);
+            if (path === '') revealLineFromHost({ line: sel.startLineNumber, column: sel.startColumn });
+            else postToHost({ action: 'openLocation', path: path, line: sel.startLineNumber });
+        } catch (e) { }
+    }
+    document.addEventListener('keydown', onRefTreeEnter, true);
+    function syncRefTreeFont() {
+        try {
+            var px = editor.getOption(monaco.editor.EditorOption.fontSize);
+            if (px > 0) document.documentElement.style.setProperty('--ca-ref-tree-font-size', px + 'px');
+        } catch (e) { }
+    }
+    // ---- end Find All References ----
 
     function registerClarionProviders() {
         // ----- Column-1 typing = no completion (native Clarion parity, task 8933fa05) -----
@@ -6659,18 +7242,6 @@
             return false;
         }
 
-        // Clarion structure/statement keywords, offered as completion items so typing a full keyword has an
-        // exact-match, preselected item that outranks look-alike equates (END vs EndKey/ENDPAGE). Combined
-        // with acceptSuggestionOnEnter:'smart', an exact keyword match is a no-op accept, so Enter inserts a
-        // newline instead of clobbering the word. (task 8933fa05)
-        var CLARION_KEYWORDS = [
-            'END', 'RETURN', 'EXIT', 'CYCLE', 'BREAK', 'LOOP', 'CASE', 'IF', 'ELSE', 'ELSIF', 'OF', 'OROF',
-            'WHILE', 'UNTIL', 'DO', 'THEN', 'BEGIN', 'EXECUTE', 'ACCEPT', 'CODE', 'DATA', 'MAP', 'MODULE',
-            'CLASS', 'INTERFACE', 'GROUP', 'QUEUE', 'RECORD', 'FILE', 'VIEW', 'WINDOW', 'REPORT',
-            'PROCEDURE', 'FUNCTION', 'ROUTINE', 'MEMBER', 'PROGRAM', 'SECTION'
-        ];
-        var CLARION_KEYWORD_SET = {};
-        CLARION_KEYWORDS.forEach(function (k) { CLARION_KEYWORD_SET[k] = true; });
         // Build keyword suggestions for the word being typed (bare context only — not after '.'/':' where the
         // server owns member access). Exact match (case-insensitive) is preselected so it wins over equates.
         function clarionKeywordSuggestions(before, range, seenLabels) {
@@ -6946,6 +7517,11 @@
                     openDesignerFromCard();
                     return true;
                 }
+                // The hover footer's Find References action (see referencesActionFor).
+                if (uri && uri.scheme === 'command' && uri.path === FIND_REFERENCES_COMMAND) {
+                    findReferencesFromCard();
+                    return true;
+                }
                 if (isAttributeLinkUri(uri)) {
                     var payload = attributeEditPayloadOfUri(uri);
                     if (payload) applyAttributeEditLink(payload);
@@ -6979,6 +7555,31 @@
                 return true;   // handled — suppresses the external-open fallback
             }
         });
+        // Find All References (see referenceLocationsFromHost). Registering the provider is what gives
+        // Shift+F12 and the right-click Go to References / Peek References; a single hit jumps straight to it.
+        monaco.languages.registerReferenceProvider('clarion', {
+            provideReferences: function (model, position) {
+                if (isInClarionComment(model.getLineContent(position.lineNumber), position.column - 1)) return [];
+                return whenIdleSynced(model, { line: position.lineNumber, column: position.column })
+                    .then(function (payload) { return payload ? requestFromHost('references', payload, REFERENCES_TIMEOUT_MS) : null; })
+                    .then(function (resp) { return referenceLocationsFromHost(model, resp); })
+                    .catch(function () { return []; });
+            }
+        });
+        // Opening a hit (double-click / Enter in the references view, or the single-hit jump): one in this
+        // editor's own document is revealed here; one in another file is opened by the IDE, as for a hover link.
+        monaco.editor.registerEditorOpener({
+            openCodeEditor: function (source, resource, selectionOrPosition) {
+                var path = resource ? refPreviewPaths[resource.toString()] : undefined;
+                if (path === undefined) return false;
+                var sp = selectionOrPosition || {};
+                var line = sp.startLineNumber || sp.lineNumber || 1, column = sp.startColumn || sp.column || 1;
+                if (path === '') revealLineFromHost({ line: line, column: column });
+                else postToHost({ action: 'openLocation', path: path, line: line });
+                return true;
+            }
+        });
+        monaco.editor.onDidCreateEditor(markRefPreviewEditor);
         // Signature help — parameter hints when typing '(' or ',' at a call site (mirrors VS Code).
         // The host answers {signatureHelp: {signatures, activeSignature, activeParameter}|null}; a null
         // (comment position, no LSP, bare identifier) simply keeps the widget hidden.
@@ -7381,6 +7982,7 @@
         opts.wordWrap = s.wordWrap ? 'on' : 'off';
         opts.minimap = { enabled: !!s.minimap };
         opts.scrollbar = { horizontal: s.horizontalScrollbar || 'auto' };   // auto | visible | hidden (task 37e2079f)
+        setRefsEnterAction(s.referencesEnter);   // not an editor option: onRefTreeEnter reads it
         opts.autoIndent = effIde(followIde, 'autoIndent', s.autoIndent ? 'full' : 'keep');
         // --- Swept Options → Text Editor keys. None of these ever had a gear pref: the `stored` argument is
         // the literal that used to be hardcoded at editor-create time, so with follow-mode OFF this block is
@@ -7534,6 +8136,7 @@
         }
         if ((el = document.getElementById('setOccurrenceHighlight'))) el.checked = (s.occurrenceHighlight !== false);   // default ON (#62)
         if ((el = document.getElementById('setHorizontalScrollbar'))) el.value = s.horizontalScrollbar || 'auto';
+        if ((el = document.getElementById('setReferencesEnter'))) el.value = (s.referencesEnter === 'goto') ? 'goto' : 'show';
         if ((el = document.getElementById('setOutlineLevel'))) el.value = String(typeof s.outlineLevel === 'number' ? s.outlineLevel : 0);
         if ((el = document.getElementById('setOutlineSortLevel'))) el.checked = !!s.outlineSortLevel;
         syncOutlineSettingsUi();
@@ -7622,6 +8225,7 @@
             fontFamily: storedPref('fontFamily', (function () { var e = document.getElementById('setFontFamily'); return e ? e.value.trim().slice(0, 64) : ''; })()),
             occurrenceHighlight: (function () { var e = document.getElementById('setOccurrenceHighlight'); return e ? !!e.checked : true; })(),
             horizontalScrollbar: sel('setHorizontalScrollbar', 'auto'),
+            referencesEnter: sel('setReferencesEnter', 'show'),
             outlineLevel: Math.max(0, Math.min(4, parseInt(sel('setOutlineLevel', '0'), 10) || 0)),
             outlineSortLevel: chk('setOutlineSortLevel'),
             // ----- Smart Formatter -----
@@ -8333,7 +8937,7 @@
             // reopening later must not offer a stale "current → imported" the developer has since changed.
             if (p.classList.contains('hidden')) vscHide();
         });
-        var ids = ['setCursorBehindEol', 'setTabSize', 'setInsertSpaces', 'setAutoIndent', 'setWordWrap', 'setMinimap', 'setCompleteOnInsertKey', 'setFontSize', 'setFontFamily', 'setOccurrenceHighlight', 'setHorizontalScrollbar', 'setOutlineLevel', 'setOutlineSortLevel',
+        var ids = ['setCursorBehindEol', 'setTabSize', 'setInsertSpaces', 'setAutoIndent', 'setWordWrap', 'setMinimap', 'setCompleteOnInsertKey', 'setFontSize', 'setFontFamily', 'setOccurrenceHighlight', 'setHorizontalScrollbar', 'setReferencesEnter', 'setOutlineLevel', 'setOutlineSortLevel',
             // Smart Formatter controls
             'setPreferredColumn', 'setContLineMultiplier', 'setIndentComments', 'setDontIndentCol1Comments', 'setFormatLineOnEnter',
             'setAutoSpaceEquals', 'setLiveKeywordCase',
@@ -8494,9 +9098,9 @@
                     requestFromHost('implementation', withBuffer(editor.getModel(), { line: ipos.lineNumber, column: ipos.column }));
                 }
             } else if (!ev.shiftKey && (ev.keyCode === 123 || ev.key === 'F12')) {          // F12 → go to definition (#40)
-                // NOT Shift+F12: that is Find All References elsewhere, and this editor has no references UI.
-                // It used to match here and silently go to definition (77aceec5); now it falls through to
-                // Monaco, whose references action is inert without a reference provider.
+                // NOT Shift+F12: that is Find All References. It used to match here and silently go to
+                // definition (77aceec5); now it falls through to Monaco's references action, which the
+                // reference provider answers (GH #287, registerReferenceProvider).
                 ev.preventDefault(); ev.stopImmediatePropagation();
                 var dpos = editor && editor.getPosition();
                 if (dpos) {

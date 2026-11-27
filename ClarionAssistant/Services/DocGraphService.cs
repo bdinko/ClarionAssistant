@@ -1478,7 +1478,7 @@ namespace ClarionAssistant.Services
             if (string.IsNullOrWhiteSpace(text))
                 return 0;
 
-            var chunks = ChunkMarkdown(text, source.Library);
+            var chunks = MarkdownChunker.Chunk(text, source.Library);
             if (chunks.Count == 0)
                 return 0;
 
@@ -1490,160 +1490,6 @@ namespace ClarionAssistant.Services
             }
 
             return chunks.Count;
-        }
-
-        /// <summary>
-        /// Chunks Markdown text by ATX heading (# .. ######). Each heading starts
-        /// a new chunk that runs until the next heading or end of file. The first
-        /// fenced code block in each section is extracted as CodeExample; the
-        /// remaining prose has markdown syntax markers stripped for cleaner FTS.
-        /// </summary>
-        private List<DocChunk> ChunkMarkdown(string text, string library)
-        {
-            var chunks = new List<DocChunk>();
-            // Normalise line endings so the splitter works on any platform.
-            string normalised = text.Replace("\r\n", "\n").Replace('\r', '\n');
-            string[] lines = normalised.Split('\n');
-
-            string currentHeading = null;
-            int currentLevel = 0;
-            var buffer = new StringBuilder();
-            bool inFence = false;
-
-            Action flush = () =>
-            {
-                string body = buffer.ToString().Trim();
-                if (string.IsNullOrEmpty(body) && string.IsNullOrEmpty(currentHeading))
-                    return;
-
-                string heading = currentHeading ?? library;
-                string codeExample = ExtractFirstFencedCodeBlock(body);
-                string prose = StripMarkdownSyntax(body);
-
-                if (string.IsNullOrWhiteSpace(prose) && string.IsNullOrWhiteSpace(codeExample))
-                    return;
-
-                chunks.Add(new DocChunk
-                {
-                    ClassName = library,
-                    MethodName = null,
-                    Topic = currentLevel > 0 ? ("h" + currentLevel) : "section",
-                    Heading = heading,
-                    Content = prose,
-                    CodeExample = codeExample,
-                    Signature = null,
-                    Anchor = SlugifyHeading(heading)
-                });
-            };
-
-            var headingRegex = new Regex(@"^(#{1,6})\s+(.*?)\s*#*\s*$");
-
-            foreach (string rawLine in lines)
-            {
-                string line = rawLine;
-
-                // Track fenced code blocks so headings inside them are not treated as chunk boundaries.
-                if (Regex.IsMatch(line, @"^\s{0,3}(```|~~~)"))
-                {
-                    inFence = !inFence;
-                    buffer.AppendLine(line);
-                    continue;
-                }
-
-                if (!inFence)
-                {
-                    var m = headingRegex.Match(line);
-                    if (m.Success)
-                    {
-                        flush();
-                        buffer.Length = 0;
-                        currentLevel = m.Groups[1].Value.Length;
-                        currentHeading = m.Groups[2].Value.Trim();
-                        continue;
-                    }
-                }
-
-                buffer.AppendLine(line);
-            }
-
-            flush();
-
-            // Fallback: if the file had no headings at all, store the whole file as a single chunk.
-            if (chunks.Count == 0)
-            {
-                string body = normalised.Trim();
-                string codeExample = ExtractFirstFencedCodeBlock(body);
-                string prose = StripMarkdownSyntax(body);
-                if (!string.IsNullOrWhiteSpace(prose) || !string.IsNullOrWhiteSpace(codeExample))
-                {
-                    chunks.Add(new DocChunk
-                    {
-                        ClassName = library,
-                        MethodName = null,
-                        Topic = "document",
-                        Heading = library,
-                        Content = prose,
-                        CodeExample = codeExample,
-                        Signature = null,
-                        Anchor = SlugifyHeading(library)
-                    });
-                }
-            }
-
-            return chunks;
-        }
-
-        private static string ExtractFirstFencedCodeBlock(string body)
-        {
-            if (string.IsNullOrEmpty(body)) return null;
-            var m = Regex.Match(body, @"(?:```|~~~)[^\n]*\n(.*?)\n\s{0,3}(?:```|~~~)", RegexOptions.Singleline);
-            if (!m.Success) return null;
-            string code = m.Groups[1].Value.TrimEnd();
-            return string.IsNullOrWhiteSpace(code) ? null : code;
-        }
-
-        private static string StripMarkdownSyntax(string body)
-        {
-            if (string.IsNullOrEmpty(body)) return body;
-
-            // Remove fenced code blocks entirely (already captured separately).
-            body = Regex.Replace(body, @"(?:```|~~~)[^\n]*\n.*?\n\s{0,3}(?:```|~~~)", "", RegexOptions.Singleline);
-            // HTML comments.
-            body = Regex.Replace(body, @"<!--.*?-->", "", RegexOptions.Singleline);
-            // Images ![alt](url) → alt
-            body = Regex.Replace(body, @"!\[([^\]]*)\]\([^\)]*\)", "$1");
-            // Links [text](url) → text
-            body = Regex.Replace(body, @"\[([^\]]+)\]\([^\)]*\)", "$1");
-            // Reference-style link definitions: [label]: url → drop the line
-            body = Regex.Replace(body, @"^\s*\[[^\]]+\]:\s*\S+.*$", "", RegexOptions.Multiline);
-            // Bold / italic markers (keep the text).
-            body = Regex.Replace(body, @"\*\*([^*]+)\*\*", "$1");
-            body = Regex.Replace(body, @"__([^_]+)__", "$1");
-            body = Regex.Replace(body, @"(?<![*\w])\*([^*\n]+)\*(?!\w)", "$1");
-            body = Regex.Replace(body, @"(?<![_\w])_([^_\n]+)_(?!\w)", "$1");
-            // Inline code `text` → text
-            body = Regex.Replace(body, @"`([^`]+)`", "$1");
-            // Blockquote markers at start of line.
-            body = Regex.Replace(body, @"^\s{0,3}>\s?", "", RegexOptions.Multiline);
-            // List bullets / ordered list numbers at start of line.
-            body = Regex.Replace(body, @"^\s*[-*+]\s+", "", RegexOptions.Multiline);
-            body = Regex.Replace(body, @"^\s*\d+\.\s+", "", RegexOptions.Multiline);
-            // Horizontal rules.
-            body = Regex.Replace(body, @"^\s*([-*_])\1{2,}\s*$", "", RegexOptions.Multiline);
-            // Collapse runs of blank lines.
-            body = Regex.Replace(body, @"\n{3,}", "\n\n");
-
-            return body.Trim();
-        }
-
-        private static string SlugifyHeading(string heading)
-        {
-            if (string.IsNullOrEmpty(heading)) return null;
-            string s = heading.ToLowerInvariant();
-            s = Regex.Replace(s, @"[^a-z0-9\s-]", "");
-            s = Regex.Replace(s, @"\s+", "-");
-            s = s.Trim('-');
-            return string.IsNullOrEmpty(s) ? null : s;
         }
 
         #endregion
@@ -1891,7 +1737,16 @@ namespace ClarionAssistant.Services
                 // 1. Exact method/heading matches get priority tier (low number = better)
                 // 2. Within a tier, FTS5 BM25 rank scores by term frequency & doc length
                 // 3. Bonus for content-rich chunks (penalize thin TOC/nav chunks)
-                string firstWord = query.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? query;
+                //
+                // GH #313: the tier is decided by ONE word, and it used to be the raw first token, so "the X" tiered
+                // on "the". It is now the first word SanitizeFtsQuery searches for (stop words gone). The other
+                // words only fed the FTS OR query, where a word that is in every section ("Parameters") counts for
+                // next to nothing, so "HttpSubmitRequest Parameters" ranked that function's Parameters section
+                // LAST of its sections. Within a tier, a heading containing more of those other words now sorts
+                // first; with no other words there is no such key and the order is exactly what it was.
+                string[] queryWords = GetQueryWords(query);
+                string firstWord = queryWords.Length > 0 ? queryWords[0] : query;
+                string exactLike = EscapeLike(firstWord);
 
                 string sql = @"
                     SELECT
@@ -1914,10 +1769,12 @@ namespace ClarionAssistant.Services
                             -- a page number is occasionally what you want -- just never above prose.
                             WHEN dc.topic = 'index' THEN 9
                             WHEN dc.method_name = @exact THEN 0
-                            WHEN dc.method_name LIKE '%' || @exact || '%' THEN 1
-                            WHEN dc.heading = @exact THEN 2
-                            WHEN dc.heading LIKE '%' || @exact || '%' THEN 3
-                            WHEN dc.signature LIKE '%' || @exact || '%' THEN 4
+                            WHEN dc.method_name LIKE '%' || @exactLike || '%' ESCAPE '\' THEN 1
+                            -- A heading is 'Parent > Section' since PR #312 (and PDF/HTML headings were already),
+                            -- so a query naming the section matches the LAST segment exactly, not just the whole.
+                            WHEN dc.heading = @exact OR dc.heading LIKE '% > ' || @exactLike ESCAPE '\' THEN 2
+                            WHEN dc.heading LIKE '%' || @exactLike || '%' ESCAPE '\' THEN 3
+                            WHEN dc.signature LIKE '%' || @exactLike || '%' ESCAPE '\' THEN 4
                             ELSE 5
                         END as tier,
                         rank as bm25_score,
@@ -1930,6 +1787,30 @@ namespace ClarionAssistant.Services
                 var parameters = new List<SQLiteParameter>();
                 parameters.Add(new SQLiteParameter("@query", ftsQuery));
                 parameters.Add(new SQLiteParameter("@exact", firstWord));
+                // LIKE treats % and _ as wildcards: a query word containing them must match them literally.
+                parameters.Add(new SQLiteParameter("@exactLike", exactLike));
+
+                // One "heading contains word N" term per remaining query word (parameter names only are
+                // concatenated into the SQL, never the words themselves). Distinct words only, and at most
+                // MaxHeadingRankWords of them: query_docs takes the query from an MCP caller, and every term is a
+                // parameter plus a LIKE per candidate row, so a query of thousands of words must not become an
+                // ORDER BY past SQLite's variable / expression-depth limits. Real queries are a handful of words;
+                // the FTS query itself still uses every word.
+                var headingHits = new List<string>();
+                var rankWords = queryWords.Skip(1)
+                    .Where(w => !string.Equals(w, firstWord, StringComparison.OrdinalIgnoreCase))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .Take(MaxHeadingRankWords)
+                    .ToArray();
+                for (int i = 0; i < rankWords.Length; i++)
+                {
+                    string name = "@w" + i.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                    headingHits.Add("(dc.heading LIKE '%' || " + name + " || '%' ESCAPE '\\')");
+                    parameters.Add(new SQLiteParameter(name, EscapeLike(rankWords[i])));
+                }
+                // No other words: no extra key at all. (Not a constant 0: SQLite reads an integer constant in
+                // ORDER BY as a result-column NUMBER, so "(0) DESC" is an error, not a no-op.)
+                string headingHitKey = headingHits.Count == 0 ? "" : "(" + string.Join(" + ", headingHits) + ") DESC, ";
 
                 if (!string.IsNullOrEmpty(library))
                 {
@@ -1956,9 +1837,9 @@ namespace ClarionAssistant.Services
                     parameters.Add(new SQLiteParameter("@class", className));
                 }
 
-                // Sort by: tier first, then BM25 within tier (rank is negative, lower = better),
-                // then prefer longer content as tiebreaker
-                sql += " ORDER BY tier, bm25_score, content_len DESC LIMIT @limit";
+                // Sort by: tier first, then (GH #313) how many of the other query words the heading contains,
+                // then BM25 within that (rank is negative, lower = better), then prefer longer content.
+                sql += " ORDER BY tier, " + headingHitKey + "bm25_score, content_len DESC LIMIT @limit";
                 parameters.Add(new SQLiteParameter("@limit", limit));
 
                 using (var cmd = new SQLiteCommand(sql, conn))
@@ -2426,12 +2307,16 @@ namespace ClarionAssistant.Services
             "but", "or", "if", "while", "because", "until", "although"
         };
 
-        private string SanitizeFtsQuery(string query)
+        /// <summary>
+        /// The words a query searches for: split on whitespace, double quotes removed, stop words dropped (all of
+        /// them kept when every word is a stop word). SanitizeFtsQuery builds the FTS query from this list and
+        /// QueryDocs ranks headings by it (GH #313), so the two always agree on what the words are.
+        /// </summary>
+        private static string[] GetQueryWords(string query)
         {
             if (string.IsNullOrEmpty(query))
-                return null;
+                return new string[0];
 
-            // Split into words, remove stop words, wrap each in quotes for safe FTS5 matching
             var words = query.Split(new[] { ' ', '\t', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries)
                 .Select(w => w.Replace("\"", "").Trim())
                 .Where(w => w.Length > 0 && !_stopWords.Contains(w))
@@ -2445,6 +2330,26 @@ namespace ClarionAssistant.Services
                     .Where(w => w.Length > 0)
                     .ToArray();
             }
+            return words;
+        }
+
+        /// <summary>How many of a query's other words QueryDocs ranks headings by (GH #313). See QueryDocs.</summary>
+        private const int MaxHeadingRankWords = 8;
+
+        /// <summary>Escape a value for a LIKE pattern with ESCAPE '\': \, % and _ match themselves.</summary>
+        private static string EscapeLike(string value)
+        {
+            if (string.IsNullOrEmpty(value)) return value ?? "";
+            return value.Replace("\\", "\\\\").Replace("%", "\\%").Replace("_", "\\_");
+        }
+
+        private string SanitizeFtsQuery(string query)
+        {
+            if (string.IsNullOrEmpty(query))
+                return null;
+
+            // Split into words, remove stop words, wrap each in quotes for safe FTS5 matching
+            var words = GetQueryWords(query);
 
             if (words.Length == 0)
                 return null;
@@ -2637,28 +2542,4 @@ namespace ClarionAssistant.Services
 
         #endregion
     }
-
-    #region Models
-
-    public class DocSource
-    {
-        public string Vendor { get; set; }
-        public string Library { get; set; }
-        public string FilePath { get; set; }
-        public string Format { get; set; }
-    }
-
-    public class DocChunk
-    {
-        public string ClassName { get; set; }
-        public string MethodName { get; set; }
-        public string Topic { get; set; }
-        public string Heading { get; set; }
-        public string Content { get; set; }
-        public string CodeExample { get; set; }
-        public string Signature { get; set; }
-        public string Anchor { get; set; }
-    }
-
-    #endregion
 }

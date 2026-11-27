@@ -13,8 +13,11 @@
 // on Enter). The diff editor is read-only, so those rules never fire there — harmless.
 // Keep the grammar in THIS file only; do not re-inline copies into the HTML.
 
-function registerClarionLanguage() {
-    monaco.languages.setLanguageConfiguration('clarion', {
+// langId defaults to 'clarion'. The editor page also registers 'clarion-ref', the same grammar for the
+// read-only previews in its references view, so none of the 'clarion' providers run on those.
+function registerClarionLanguage(langId) {
+    langId = langId || 'clarion';
+    monaco.languages.setLanguageConfiguration(langId, {
         comments: { lineComment: '!' },
         brackets: [['(', ')'], ['[', ']'], ['{', '}']],
         // Treat the Clarion prefix separator ':' as part of a word so double-click selects
@@ -37,11 +40,18 @@ function registerClarionLanguage() {
             // WINDOW/REPORT bodies, legitimately bare — e.g. "OPTION,USE(?opt)") and are split
             // out alongside it for the same reason (e.g. "option     LONG(0)", a plain local
             // variable named "option", was misread as opening a block).
-            increaseIndentPattern: /^\s*(?:(?:IF|LOOP|CASE|BEGIN|EXECUTE|ACCEPT|GROUP|QUEUE|RECORD|FILE|VIEW|REPORT|WINDOW|APPLICATION|CLASS|INTERFACE|MAP|MODULE|ITEMIZE|JOIN|OF|OROF|ELSE|ELSIF)\b|(?:TOOLBAR|MENUBAR|MENU|SHEET|TAB|OPTION)\b(?=\s*(?:[(,!]|$)))(?![^!]*\.\s*$).*$/i,
-            decreaseIndentPattern: /^\s*(END\b|\.\s*$|OF\b|OROF\b|ELSE\b|ELSIF\b|UNTIL\b|WHILE\b)/i
+            // A keyword that is part of a NAME is not the keyword (46506010). \b alone matches before ':' and
+            // '.', so 'While:Count += 1' outdented and the line after 'Loop:Idx = 1' or 'Queue.Id = 3'
+            // indented. Increase: (?![:.]) -- a prefix (Loop:Idx) or a structure label used as a qualifier
+            // (Queue.Id, Group.Name, Window.x: GROUP..CLASS may be labels; the reserved words IF/LOOP/CASE...
+            // may not, so they never come before a '.'). Decrease: (?!:) -- END/OF/ELSE/... are reserved
+            // words, so only a prefix (End:Date) reaches them. TOOLBAR..OPTION already require '(', ',', '!'
+            // or end of line after the keyword. A control equate (?If) starts with '?' and never matches.
+            increaseIndentPattern: /^\s*(?:(?:IF|LOOP|CASE|BEGIN|EXECUTE|ACCEPT|GROUP|QUEUE|RECORD|FILE|VIEW|REPORT|WINDOW|APPLICATION|CLASS|INTERFACE|MAP|MODULE|ITEMIZE|JOIN|OF|OROF|ELSE|ELSIF)\b(?![:.])|(?:TOOLBAR|MENUBAR|MENU|SHEET|TAB|OPTION)\b(?=\s*(?:[(,!]|$)))(?![^!]*\.\s*$).*$/i,
+            decreaseIndentPattern: /^\s*(?:(?:END|OF|OROF|ELSE|ELSIF|UNTIL|WHILE)\b(?!:)|\.\s*$)/i
         }
     });
-    monaco.languages.setMonarchTokensProvider('clarion', {
+    monaco.languages.setMonarchTokensProvider(langId, {
         ignoreCase: true,
         keywords: [
             'PROGRAM', 'MEMBER', 'MAP', 'MODULE', 'CLASS', 'INTERFACE', 'PROCEDURE', 'FUNCTION',

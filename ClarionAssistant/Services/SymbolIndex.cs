@@ -447,10 +447,15 @@ namespace ClarionAssistant.Services
         ///   - a file-level EQUATE from an include file the context file does not include (see
         ///     <see cref="IncludeClosure"/>; <paramref name="dbPaths"/> = project DB first, then library). With
         ///     no context file, or no closure to filter by, equates are not filtered.
+        ///   - an 'include' row. It is named after the included file but records the INCLUDE statement's SITE
+        ///     (file_path = the including file), so it never declares the name. Ctrl+Click on 'CWSyncHM.inc' in
+        ///     an INCLUDE jumped to the line in ABFILE.INC that includes it, the first such row by path.
+        ///   - with <paramref name="callableOnly"/>, any row that is not a procedure or function (the cursor is on a
+        ///     built-in-named call; see <see cref="CodeGraphProvider.IsCallableType"/>).
         /// Null when no row is visible. The closure is built only when an equate row is reached. Never throws.
         /// </summary>
         public static CodeGraphSymbol FirstVisibleByName(CodeGraphProvider p, string word, string contextFile, string[] dbPaths,
-                                                         Func<CodeGraphSymbol, bool> unreachable = null)
+                                                         Func<CodeGraphSymbol, bool> unreachable = null, bool callableOnly = false)
         {
             try
             {
@@ -460,6 +465,9 @@ namespace ClarionAssistant.Services
                 // Bounded as ExactSqlAll is: a common equate name is declared in many library include files.
                 foreach (var s in p.FindAllSymbolsByName(word, 500))
                 {
+                    if (string.Equals(s.Type, "include", StringComparison.OrdinalIgnoreCase)) continue;
+                    // A built-in-named call (callableOnly): only a procedure/function of that name can be meant.
+                    if (callableOnly && !CodeGraphProvider.IsCallableType(s.Type)) continue;
                     if (string.Equals(s.Type, "variable", StringComparison.OrdinalIgnoreCase) &&
                         (string.Equals(s.Scope, "local", StringComparison.OrdinalIgnoreCase) ||
                          string.Equals(s.Scope, "parameter", StringComparison.OrdinalIgnoreCase)))

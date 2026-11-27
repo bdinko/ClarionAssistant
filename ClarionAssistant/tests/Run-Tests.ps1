@@ -108,6 +108,12 @@ if (-not $NodeOnly -and -not $InstallerOnly) {
             @{ Name = "TextLines.Test"
                Sources = @("tests\TextLines.Test.cs", "Services\TextLines.cs")
                Refs = @("System.dll", "System.Core.dll") }
+            # DocGraph Markdown ingest: a section's heading carries its parents ("FooInitialize Function >
+            # Parameters"); nothing but the heading changes, checked on every .md in this repo too.
+            @{ Name = "MarkdownChunker.Test"
+               Sources = @("tests\MarkdownChunker.Test.cs", "Services\MarkdownChunker.cs", "Services\DocGraphModels.cs")
+               Refs = @("System.dll", "System.Core.dll")
+               Args = @($RootDir) }
             # 1d8d1c49: streamed LSP text messages must parse identically to Serialize+GetBytes, far cheaper.
             @{ Name = "JsonTextStream.Test"
                Sources = @("tests\JsonTextStream.Test.cs", "Services\JsonTextStream.cs")
@@ -133,6 +139,11 @@ if (-not $NodeOnly -and -not $InstallerOnly) {
             @{ Name = "TabManager.Close.Test"
                Sources = @("tests\TabManager.Close.Test.cs", "tests\TabManager.Close.Stubs.cs", "Terminal\TerminalTab.cs", "Terminal\TabManager.cs")
                Refs = @("System.dll", "System.Drawing.dll", "System.Windows.Forms.dll") }
+            # Tabs wider than the strip: they shrink, then scroll behind an overflow menu, so every tab's
+            # close button stays reachable (it was drawn off-screen). Also the middle-click close.
+            @{ Name = "TabManager.Overflow.Test"
+               Sources = @("tests\TabManager.Overflow.Test.cs", "tests\TabManager.Close.Stubs.cs", "Terminal\TerminalTab.cs", "Terminal\TabManager.cs")
+               Refs = @("System.dll", "System.Core.dll", "System.Drawing.dll", "System.Windows.Forms.dll") }
             # 0f928849: models.json went stale (no Opus 5.5, retired Copilot/Codex ids). Checks the
             # registry's internal consistency and the retired-model remap. Gets the project dir to
             # read the shipped models.json and the Codex launcher's hard-coded default.
@@ -140,12 +151,28 @@ if (-not $NodeOnly -and -not $InstallerOnly) {
                Sources = @("tests\ModelRegistry.Test.cs", "Services\SettingsService.cs")
                Refs = @("System.dll", "System.Web.Extensions.dll")
                Args = @($RepoDir) }
+            # 1976d2e9: Clarion.exe and ClarionLAA.exe are both the IDE. Gets the project dir for the call-site checks.
+            @{ Name = "ClarionIdeProcess.Test"
+               Sources = @("tests\ClarionIdeProcess.Test.cs", "Services\ClarionIdeProcess.cs")
+               Refs = @("System.dll", "System.Core.dll")
+               Args = @($RepoDir) }
             # c175492a: two IDEs' CA tabs could not tell which MultiTerminal name was theirs. Gets the
             # project dir so it can check the launch resolves the name before composing the prompt.
             @{ Name = "CaAgentIdentity.Test"
                Sources = @("tests\CaAgentIdentity.Test.cs", "Services\CaAgentIdentity.cs")
                Refs = @("System.dll")
                Args = @($RepoDir) }
+            # f9843525: the Home tab's resume list. Fixture transcripts in %TEMP%; gets the project dir for
+            # the check that BuildInitialPrompt's greetings come from the catalog.
+            @{ Name = "ClaudeSessionCatalog.Test"
+               Sources = @("tests\ClaudeSessionCatalog.Test.cs", "Services\ClaudeSessionCatalog.cs")
+               Refs = @("System.dll", "System.Core.dll", "System.Web.Extensions.dll")
+               Args = @($RepoDir) }
+            # Chat transcript export: a chat session is written to <solution>\.CAChats as Markdown named with its first and
+            # last day, when its tab closes or the IDE does. Real exporter + real catalog, fixture transcripts.
+            @{ Name = "SessionTranscriptExporter.Test"
+               Sources = @("tests\SessionTranscriptExporter.Test.cs", "Services\SessionTranscriptExporter.cs", "Services\ClaudeSessionCatalog.cs")
+               Refs = @("System.dll", "System.Core.dll", "System.Web.Extensions.dll") }
             # GH #263 Q2: a generated module opened as a plain file shows attribute names, not chips.
             @{ Name = "GeneratedModuleMatch.Test"
                Sources = @("tests\GeneratedModuleMatch.Test.cs", "Services\GeneratedModuleMatch.cs")
@@ -233,6 +260,12 @@ if (-not $NodeOnly -and -not $InstallerOnly) {
                Sources = @("tests\EmbedLspContext.SelfLinks.cs", "tests\EmbedLspContext.LineMapping.Stubs.cs",
                            "Services\EmbedLspContext.cs", "Services\RedFileService.cs", "Services\EncodingHelper.cs")
                Refs = @("System.dll", "System.Core.dll") }
+            # GH #287: Find All References. The reply the Monaco page gets: own-document hits mapped (and
+            # dropped in the embeditor's header), other files with a sparse preview, dedup, the 1000 cap.
+            @{ Name = "ReferenceLocations.Build"
+               Sources = @("tests\ReferenceLocations.Build.cs", "tests\ReferenceLocations.Build.Stubs.cs",
+                           "Services\ReferenceLocations.cs", "Services\EncodingHelper.cs")
+               Refs = @("System.dll", "System.Core.dll") }
             # 16d140e9: the CA Explorer header's APP/VERSION/ROOT values and the path check in front of
             # the "open in Windows Explorer" clicks. Existence probes injected; touches no real path.
             @{ Name = "ExplorerHeader.Test"
@@ -276,6 +309,18 @@ if (-not $NodeOnly -and -not $InstallerOnly) {
                Sources = @("tests\RedFileService.SearchPaths.Test.cs", "tests\EmbedLspContext.RedResolve.Stubs.cs",
                            "Services\EmbedLspContext.cs", "Services\RedFileService.cs", "Services\EncodingHelper.cs",
                            "Services\RedResolution.cs", "CodeGraph\Parsing\SolutionParser.cs", "CodeGraph\Parsing\Models\SolutionProject.cs")
+               Refs = @("System.dll", "System.Core.dll") }
+            # Ctrl+Click on the file name in INCLUDE/MODULE/MEMBER/LINK: which name the cursor is on, and where the
+            # .red puts it for the clicked file's project (not a CodeGraph name lookup, which opened the includer).
+            @{ Name = "FileRefTarget.Test"
+               Sources = @("tests\FileRefTarget.Test.cs", "tests\EmbedLspContext.RedResolve.Stubs.cs",
+                           "Services\FileRefTarget.cs", "Services\RedFileService.cs", "Services\EncodingHelper.cs")
+               Refs = @("System.dll", "System.Core.dll") }
+            # F12 / Find All References on a built-in call (ERRORCODE()): the CodeGraph name fallback must not
+            # answer with a same-named field or variable when the language server returns nothing.
+            @{ Name = "BuiltinCallSite.Test"
+               Sources = @("tests\BuiltinCallSite.Test.cs", "Services\BuiltinCallSite.cs",
+                           "CodeGraph\Parsing\ClarionBuiltins.cs")
                Refs = @("System.dll", "System.Core.dll") }
             # PR #208: a hung instance stays swept, a busy one re-registers, beats never overlap.
             # The vendored SQLite is x86-only (SQLite.Interop.dll), hence Platform and the copies.
@@ -383,7 +428,7 @@ if (-not $NodeOnly -and -not $InstallerOnly) {
                            "CodeGraph\Graph\CodeGraphProvider.cs", "CodeGraph\Graph\CodeGraphDatabase.cs",
                            "CodeGraph\Parsing\Models\ClarionSymbol.cs", "CodeGraph\Parsing\Models\ClarionRelationship.cs",
                            "CodeGraph\Parsing\Models\SolutionProject.cs", "CodeGraph\Parsing\Models\ParseResult.cs",
-                           "CodeGraph\Parsing\ClarionBuiltins.cs",
+                           "CodeGraph\Parsing\ClarionBuiltins.cs", "Services\BuiltinCallSite.cs",
                            "Services\LspClient.cs", "Services\LspTextDiff.cs", "Services\JsonTextStream.cs", "Services\LspTrace.cs", "Services\EncodingHelper.cs")
                Refs = @("System.dll", "System.Core.dll", "System.Xml.dll", "System.Data.dll", "System.Web.Extensions.dll")
                RepoRefs = @("lib\sqlite-fts5\System.Data.SQLite.dll")
@@ -452,6 +497,16 @@ if (-not $NodeOnly -and -not $InstallerOnly) {
                Copy = @("lib\sqlite-fts5\System.Data.SQLite.dll", "lib\sqlite-fts5\SQLite.Interop.dll")
                Platform = "x86"
                Args = @((Join-Path $TestDir "fixtures\schemagraph-gh267\attrs.dctx")) }
+            # GH #313 (bb480461): query_docs ranks the section a multi-word query names first - the heading tier
+            # used only the first word - with LIKE wildcards literal and single-word order unchanged.
+            @{ Name = "DocGraphService.QueryDocs.Test"
+               Sources = @("tests\DocGraphService.QueryDocs.Test.cs", "tests\DocGraphService.QueryDocs.Stubs.cs",
+                           "Services\DocGraphService.cs", "Services\MarkdownChunker.cs", "Services\DocGraphModels.cs",
+                           "Services\EncodingHelper.cs")
+               Refs = @("System.dll", "System.Core.dll", "System.Data.dll", "System.Xml.dll", "System.Web.Extensions.dll")
+               RepoRefs = @("lib\sqlite-fts5\System.Data.SQLite.dll")
+               Copy = @("lib\sqlite-fts5\System.Data.SQLite.dll", "lib\sqlite-fts5\SQLite.Interop.dll")
+               Platform = "x86" }
             # PR #237: the active tab re-selected on solution reopen - a view opening before the reopen loop
             # (the .app tab from Recent Applications) neither gives up the restore nor lets the loop record
             # over the saved choice; the store's temp file is per process and never left behind. IDE stubbed.
@@ -478,6 +533,13 @@ if (-not $NodeOnly -and -not $InstallerOnly) {
                RepoRefs = @("lib\sqlite-fts5\System.Data.SQLite.dll")
                Copy = @("lib\sqlite-fts5\System.Data.SQLite.dll", "lib\sqlite-fts5\SQLite.Interop.dll")
                Platform = "x86" }
+            # A GROUP/QUEUE nested in a DATA-section structure must not close the outer one: the fields after it
+            # were emitted as variables (globals, through a global-data INCLUDE). Also a '.' terminator + comment.
+            @{ Name = "ClarionParser.NestedGroup.Test"
+               Sources = @("tests\ClarionParser.NestedGroup.Test.cs", "CodeGraph\Parsing\ClarionParser.cs", "CodeGraph\Parsing\ClarionBuiltins.cs",
+                           "CodeGraph\Parsing\Models\ClarionSymbol.cs", "CodeGraph\Parsing\Models\ClarionRelationship.cs",
+                           "CodeGraph\Parsing\Models\ParseResult.cs", "Services\EncodingHelper.cs")
+               Refs = @("System.dll", "System.Core.dll") }
             # A CLASS / INTERFACE whose label contains a colon must be indexed, with its methods and
             # the instances/references typed by it (GH #246).
             @{ Name = "ClarionParser.ColonClass.Test"
@@ -631,8 +693,20 @@ if (-not $NodeOnly -and -not $InstallerOnly) {
                              Refs = @("System.dll", "System.Web.Extensions.dll") }
         }
 
+        # 1976d2e9: these Services files ask Services\ClarionIdeProcess.cs which processes are the IDE (Clarion.exe or
+        # ClarionLAA.exe). Every harness that compiles one gets the helper too, so the 17 lists that name them need
+        # no edit - and a harness added later cannot forget it.
+        $needsIdeProcess = @("Services\IdeEndpointRecord.cs", "Services\IdeSolutionRecord.cs", "Services\ClarionVersionService.cs", "Services\MemoryHeadroom.cs")
+        foreach ($h in $harnesses) {
+            if (($h.Sources | Where-Object { $needsIdeProcess -contains $_ }) -and -not ($h.Sources -contains "Services\ClarionIdeProcess.cs")) {
+                $h.Sources = @($h.Sources) + "Services\ClarionIdeProcess.cs"
+                $h.AutoAdded = "Services\ClarionIdeProcess.cs"
+            }
+        }
+
         foreach ($h in $harnesses) {
             Section $h.Name
+            if ($h.AutoAdded) { Write-Host "  (auto-added to the compile set: $($h.AutoAdded))" -ForegroundColor DarkGray }
             $exe  = Join-Path $OutDir ($h.Name + ".exe")
             $srcs = $h.Sources | ForEach-Object { Join-Path $RepoDir $_ }
 
@@ -755,6 +829,11 @@ if (-not $CSharpOnly -and -not $NodeOnly) {
     # Auto-discovered, like the installer family below, so a new harness is picked up by being
     # written rather than by also remembering to edit this file. Run-Tests.ps1 EXCLUDES ITSELF —
     # it lives in this directory and would otherwise recurse.
+    #
+    # The *.SourceScan.ps1 harnesses here pin IDE-coupled or declarative sources a compiled harness
+    # cannot reach. InstallerMarkdownDuplicate.SourceScan.ps1 (GH #289 / #290) is the one over
+    # installer\ClarionAssistant.iss: the Markdown Editor duplicate scan across accessory\addins,
+    # the per-root frozen verdict, and the v-pin agreeing across the .iss, snapshot and notices.
     $caTests = Get-ChildItem $PSScriptRoot -Filter *.ps1 -ErrorAction SilentlyContinue |
                Where-Object { $_.Name -ne 'Run-Tests.ps1' } |
                Sort-Object Name
