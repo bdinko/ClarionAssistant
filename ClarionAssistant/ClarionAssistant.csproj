@@ -150,6 +150,8 @@
     <Compile Include="Services\CaFindSettings.cs" />
     <Compile Include="Options\CAEditorSurfacesOptionPanel.cs" />
     <Compile Include="Options\CAFindOptionPanel.cs" />
+    <Compile Include="Options\CAChatTranscriptsOptionPanel.cs" />
+    <Compile Include="Services\CaChatTranscriptSettings.cs" />
     <Compile Include="Services\McpServer.cs" />
     <Compile Include="Services\McpJsonRpc.cs" />
     <Compile Include="Services\McpDispatcher.cs" />
@@ -165,6 +167,7 @@
     <Compile Include="Services\ClarionDeclarationParser.cs" />
     <Compile Include="Services\EmbedEditorMonitorService.cs" />
     <Compile Include="Services\MemoryHeadroom.cs" />
+    <Compile Include="Services\ClarionIdeProcess.cs" />
     <Compile Include="Services\TextLines.cs" />
     <Compile Include="Services\JsonTextStream.cs" />
     <Compile Include="Services\ShutdownLog.cs" />
@@ -177,6 +180,8 @@
     <Compile Include="Services\SolutionVersionResolver.cs" />
     <Compile Include="Services\IdeVersionFollower.cs" />
     <Compile Include="Services\LspStartGate.cs" />
+    <Compile Include="Services\FileRefTarget.cs" />
+    <Compile Include="Services\BuiltinCallSite.cs" />
     <Compile Include="Services\RedFileService.cs" />
     <Compile Include="Services\RedResolution.cs" />
     <Compile Include="Services\LspTrace.cs" />
@@ -187,6 +192,7 @@
     <Compile Include="Services\IdeSolutionRecord.cs" />
     <Compile Include="Services\SolutionFollower.cs" />
     <Compile Include="Services\IdeEndpointRecord.cs" />
+    <Compile Include="Services\ReferenceLocations.cs" />
     <Compile Include="Services\SharedLspBridge.cs" />
     <Compile Include="Services\ColonQualifierScope.cs" />
     <Compile Include="Services\LocalScopeIndex.cs" />
@@ -248,6 +254,7 @@
     <Compile Include="Dialogs\ClaudeChatSettingsDialog.cs" />
     <Compile Include="Dialogs\CheatSheetDialog.cs" />
     <Compile Include="Dialogs\CreateProjectFolderDialog.cs" />
+    <Compile Include="Dialogs\MiddleClickCloseDialog.cs" />
     <Compile Include="Terminal\NativeMethods.cs" />
     <Compile Include="Terminal\ConPtyTerminal.cs" />
     <Compile Include="Terminal\WebViewTerminalRenderer.cs" />
@@ -273,7 +280,11 @@
     <Compile Include="Services\EncodingHelper.cs" />
     <Compile Include="Services\ClaudeMdDeployer.cs" />
     <Compile Include="Services\ClaudePluginLocator.cs" />
+    <Compile Include="Services\ClaudeSessionCatalog.cs" />
+    <Compile Include="Services\SessionTranscriptExporter.cs" />
     <Compile Include="Services\DocGraphService.cs" />
+    <Compile Include="Services\DocGraphModels.cs" />
+    <Compile Include="Services\MarkdownChunker.cs" />
     <Compile Include="Services\InstanceCoordinationService.cs" />
     <Compile Include="Services\ClarionTraceService.cs" />
     <Compile Include="Services\EverythingService.cs" />

@@ -146,6 +146,7 @@
     <Compile Include="..\Services\RedResolution.cs"><Link>Services\RedResolution.cs</Link></Compile>
     <Compile Include="..\Services\ClarionConfigDirectory.cs"><Link>Services\ClarionConfigDirectory.cs</Link></Compile>
     <Compile Include="..\Services\ClarionVersionService.cs"><Link>Services\ClarionVersionService.cs</Link></Compile>
+    <Compile Include="..\Services\ClarionIdeProcess.cs"><Link>Services\ClarionIdeProcess.cs</Link></Compile>
     <Compile Include="..\Services\EffectiveClarionVersion.cs"><Link>Services\EffectiveClarionVersion.cs</Link></Compile>
     <Compile Include="..\Services\SolutionVersionResolver.cs"><Link>Services\SolutionVersionResolver.cs</Link></Compile>
     <Compile Include="..\Services\LspStartGate.cs"><Link>Services\LspStartGate.cs</Link></Compile>
@@ -154,6 +155,8 @@
     <Compile Include="..\Services\ClarionClassParser.cs"><Link>Services\ClarionClassParser.cs</Link></Compile>
     <Compile Include="..\Services\ClarionTraceService.cs"><Link>Services\ClarionTraceService.cs</Link></Compile>
     <Compile Include="..\Services\DocGraphService.cs"><Link>Services\DocGraphService.cs</Link></Compile>
+    <Compile Include="..\Services\DocGraphModels.cs"><Link>Services\DocGraphModels.cs</Link></Compile>
+    <Compile Include="..\Services\MarkdownChunker.cs"><Link>Services\MarkdownChunker.cs</Link></Compile>
     <Compile Include="..\Services\EverythingService.cs"><Link>Services\EverythingService.cs</Link></Compile>
     <Compile Include="..\Services\McpPathPolicy.cs"><Link>Services\McpPathPolicy.cs</Link></Compile>
     <Compile Include="..\Services\McpPathGate.cs"><Link>Services\McpPathGate.cs</Link></Compile>
@@ -220,6 +223,8 @@
     <Compile Include="..\Services\ColonQualifierScope.cs"><Link>Services\ColonQualifierScope.cs</Link></Compile>
     <Compile Include="..\Services\LocalScopeIndex.cs"><Link>Services\LocalScopeIndex.cs</Link></Compile>
     <Compile Include="..\Services\SymbolIndex.cs"><Link>Services\SymbolIndex.cs</Link></Compile>
+    <Compile Include="..\Services\FileRefTarget.cs"><Link>Services\FileRefTarget.cs</Link></Compile>
+    <Compile Include="..\Services\BuiltinCallSite.cs"><Link>Services\BuiltinCallSite.cs</Link></Compile>
     <Compile Include="..\Services\LiveDictionaryIndex.cs"><Link>Services\LiveDictionaryIndex.cs</Link></Compile>
     <Compile Include="..\Services\McpToolRegistry.cs"><Link>Services\McpToolRegistry.cs</Link></Compile>
     <Compile Include="..\Services\EmbedOverlayGuard.cs"><Link>Services\EmbedOverlayGuard.cs</Link></Compile>

@@ -154,6 +154,24 @@ static class LocalScopeIndexTest
         var pg = Labels(At(c18, "Pg"));
         Check(gr.Contains("GrpA") && gr.Contains("GrpB") && !pg.Contains("PgX"), "1.8", "'Gr' -> GrpA GrpB; 'Pg' has no bare PgX: " + string.Join(",", pg));
 
+        // 1.8b: a TYPE structure declares no data - its fields (and a nested group's) are never bare labels,
+        // while a no-PRE instance declared inline still is; TYPE inside a string or a comment is not the attribute.
+        string c18b = InsertAfter(_two, "ModCounter           LONG                          ! module counter",
+            "OrderQType           QUEUE,TYPE\r\n" +
+            "OrdId                  LONG\r\n" +
+            "OrdInner               GROUP\r\n" +
+            "OrdNested                LONG\r\n" +
+            "                       END\r\n" +
+            "                     END\r\n" +
+            "OrderQ               QUEUE(OrderQType) END\r\n" +
+            "OrdNamed             QUEUE,NAME('X,TYPE')  ! ,TYPE\r\n" +
+            "OrdLive                LONG\r\n" +
+            "                     END");
+        c18b = WithLine(c18b, "Gr", "  Ord");
+        var ord = Labels(At(c18b, "Ord"));
+        Check(!ord.Contains("OrdId") && !ord.Contains("OrdInner") && !ord.Contains("OrdNested") && ord.Contains("OrdLive"), "1.8b",
+              "'Ord' -> OrdLive only; no TYPE fields (OrdId/OrdInner/OrdNested): " + string.Join(",", ord));
+
         // 1.9: DO -> routines of the current procedure only.
         var doB = Labels(At(_two, "DO R"));
         string c19 = WithLine(_two, "Mo", "  DO R");
@@ -227,7 +245,8 @@ static class LocalScopeIndexTest
               h19a.Markdown.Contains("RtnA ROUTINE"), "1.19", "routines RtnB / RtnA -> a fallback (the server's card links the ROUTINE line): " + Md(h19a));
 
         var h20 = HoverOn(_two, "ReturnValue = LocalHelper(pMode)", "LocalHelper");
-        Check(h20 != null && h20.Authoritative, "1.20", "LocalHelper (MAP) -> authoritative: " + Md(h20));
+        Check(h20 != null && !h20.Authoritative && h20.Fallback, "1.20",
+              "LocalHelper (MAP) -> a fallback (the server's card links the prototype and the implementation): " + Md(h20));
 
         string c21 = WithLine(_two, "Loc", "  x = SomeGlobal");
         Check(HoverOn(c21, "x = SomeGlobal", "SomeGlobal") == null, "1.21", "SomeGlobal -> null (not declared here)");
@@ -254,8 +273,14 @@ static class LocalScopeIndexTest
         var hCls = HoverOn(cCls, "x = ThisWindow", "ThisWindow");
         Check(hCls != null && !hCls.Authoritative && hCls.Fallback, "1.fb3",
               "ThisWindow (local CLASS) -> fallback, not authoritative: " + Md(hCls));
-        var h20b = HoverOn(_two, "ReturnValue = LocalHelper(pMode)", "LocalHelper");
-        Check(h20b != null && !h20b.Fallback, "1.fb4", "LocalHelper (MAP procedure) -> still not a fallback: " + Md(h20b));
+        var hMember = HoverOn(WithLine(_two, "SELF.", "  SELF.Kill()"), "SELF.Kill()", "Kill");
+        Check(hMember != null && !hMember.Authoritative && hMember.Fallback && hMember.Kind == "member", "1.fb4",
+              "a local CLASS member -> a fallback, not authoritative: " + Md(hMember));
+        // The method name in an implementation header: the same member card, also the server's fallback (shown
+        // beside the server's, the page's same-symbol rule dropped the server's card).
+        var hImpl = HoverOn(_two, "ThisWindow.Init      PROCEDURE(BYTE pMode)", "Init");
+        Check(hImpl != null && !hImpl.Authoritative && hImpl.Fallback && hImpl.Kind == "member" && hImpl.Markdown.Contains("member of ThisWindow"), "1.fb4a",
+              "Init in 'ThisWindow.Init PROCEDURE' -> the member card, a fallback: " + Md(hImpl));
         // Parameters: the server's card names the procedure and links its PROCEDURE line - a method's own
         // parameter, and the owning procedure's parameter seen from a local class method, both fall back.
         var hOwn = HoverOn(_two, "ReturnValue = LocalHelper(pMode)", "pMode");
@@ -265,6 +290,26 @@ static class LocalScopeIndexTest
         var hOwner = HoverOn(cOwner, "x = pId", "pId");
         Check(hOwner != null && !hOwner.Authoritative && hOwner.Fallback && hOwner.Markdown.Contains("LONG"), "1.fb6",
               "pId (ProcA's parameter, seen from ThisWindow.Init) -> fallback: " + Md(hOwner));
+
+        // The hosts pass the file's full path. The card's detail line names the file only, escaped for markdown:
+        // pasted as it was, "C:\_src\..." rendered as "C:_src\..." ("\_" is an escaped "_").
+        {
+            int fl = Line(_two, "ReturnValue = LocalHelper(pMode)");
+            int fc = LineText(_two, fl).IndexOf("pMode", StringComparison.Ordinal) + 1;
+            var hPath = LocalScopeIndex.Hover(_two, fl, fc, @"C:\_src\My_App\two_procs.clw");
+            Check(hPath != null && hPath.Markdown.EndsWith(" · two\\_procs.clw") && !hPath.Markdown.Contains("My_App"), "1.fn1",
+                  "a full path -> the escaped file name only: " + Md(hPath));
+            Check(LocalScopeIndex.Scope.CardFileName(@"C:\x\a[1]`b*.clw") == "a\\[1\\]\\`b\\*.clw", "1.fn2",
+                  "markdown characters in a file name are escaped: " + LocalScopeIndex.Scope.CardFileName(@"C:\x\a[1]`b*.clw"));
+            // A name .NET Framework's Path.GetFileName rejects still shows as the escaped file name only.
+            string bad = LocalScopeIndex.Scope.CardFileName("C:\\_src\\My_App\\a|b_c.clw");
+            Check(bad == "a|b\\_c.clw", "1.fn4", "a path GetFileName rejects -> the escaped file name only: " + bad);
+            // A path that ends in a separator names no file: the card has no empty trailing segment.
+            var hDir = LocalScopeIndex.Hover(_two, fl, fc, @"C:\_src\My_App\");
+            Check(hDir != null && !hDir.Markdown.TrimEnd().EndsWith("·"), "1.fn5", "a folder path -> no dangling separator: " + Md(hDir));
+            var hBare = HoverOn(_two, "ReturnValue = LocalHelper(pMode)", "pMode");
+            Check(hBare != null && hBare.Markdown.EndsWith(" · two-procs.clw"), "1.fn3", "a bare file name is shown as it was: " + Md(hBare));
+        }
 
         // Local class member access (SELF.Init inside ThisWindow.Init): non-authoritative member hover.
         string cm = WithLine(_two, "SELF.", "  SELF.Kill()");
@@ -352,7 +397,7 @@ static class LocalScopeIndexTest
 
         // pk.1 - John's case: hovering the procedure on its own PROCEDURE line, and at a call.
         var g1 = HoverOn(MemberNoMap, "InventoryDetailToolBar PROCEDURE", "InventoryDetailToolBar");
-        Check(What(g1) == "procedure" && g1.Authoritative && g1.Markdown.Contains("InventoryDetailToolBar PROCEDURE"), "pk.1",
+        Check(What(g1) == "procedure" && !g1.Authoritative && g1.Fallback && g1.Markdown.Contains("InventoryDetailToolBar PROCEDURE"), "pk.1",
               "a procedure implemented here, in no MAP of this buffer -> 'procedure', never 'local procedure': " + Md(g1));
         var g1b = HoverOn(MemberNoMap, "InventoryDetailToolBar()", "InventoryDetailToolBar");
         Check(What(g1b) == "procedure", "pk.1b", "...and the same at a call site: " + Md(g1b));
@@ -375,7 +420,7 @@ static class LocalScopeIndexTest
         // pk.3 - the same MAP in a PROGRAM file is the global MAP.
         string prog = WithLine(_two, "MEMBER()", "                     PROGRAM");
         var gp = HoverOn(prog, "ReturnValue = LocalHelper(pMode)", "LocalHelper");
-        Check(What(gp) == "global procedure", "pk.3a", "a PROGRAM file's MAP -> 'global procedure': " + Md(gp));
+        Check(What(gp) == "global procedure" && gp.Fallback && !gp.Authoritative, "pk.3a", "a PROGRAM file's MAP -> 'global procedure', a fallback: " + Md(gp));
         Check(DetailOf(At(prog, "Loc"), "LocalHelper") == "LocalHelper PROCEDURE(LONG)  (global procedure) [kind 3]", "pk.3b",
               "completion detail: " + DetailOf(At(prog, "Loc"), "LocalHelper"));
         string progCommented = "! a leading comment\r\n" + prog;
@@ -384,7 +429,8 @@ static class LocalScopeIndexTest
 
         // pk.4 - a procedure's local MAP.
         var li = HoverOn(LocalMapBuf, "Inner(LOC:Before + LOC:After)", "Inner");
-        Check(What(li) == "local procedure of Outer" && li.Kind == "procedure" && li.Markdown.Contains("Inner PROCEDURE(LONG)"), "pk.4a",
+        Check(What(li) == "local procedure of Outer" && li.Kind == "procedure" && li.Fallback && !li.Authoritative &&
+              li.Markdown.Contains("Inner PROCEDURE(LONG)"), "pk.4a",
               "Inner, in Outer's local MAP -> 'local procedure of Outer', the MAP prototype as signature: " + Md(li));
         var li2 = HoverOn(LocalMapBuf, "Inner2('x')", "Inner2");
         Check(What(li2) == "local procedure of Outer" && li2.Kind == "procedure", "pk.4b",

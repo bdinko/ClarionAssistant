@@ -293,9 +293,8 @@ namespace ClarionAssistant.Services
             try
             {
                 if (p.HasExited) { why = "stale: IDE " + pid + ":" + port + " has exited"; return null; }
-                string image = TestHook(ImageNameEnv);
-                if (string.IsNullOrEmpty(image)) image = "Clarion";
-                if (!string.Equals(p.ProcessName, image, StringComparison.OrdinalIgnoreCase))
+                // The IDE is Clarion.exe or ClarionLAA.exe (1976d2e9); a test names its stand-in through the hook.
+                if (!ClarionIdeProcess.Matches(p.ProcessName, TestHook(ImageNameEnv)))
                 { why = "stale: pid " + pid + " is now '" + p.ProcessName + "', not the IDE (pid reused)"; return null; }
                 if (Math.Abs((p.StartTime.ToUniversalTime() - start.ToUniversalTime()).TotalSeconds) > 2)
                 { why = "stale: pid " + pid + " was started at " + p.StartTime.ToUniversalTime().ToString("o")

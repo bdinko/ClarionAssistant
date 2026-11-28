@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://github.com/ClarionLive/ClarionAssistant/releases/latest"><img src="https://img.shields.io/github/v/release/ClarionLive/ClarionAssistant?include_prereleases&label=download&style=for-the-badge" alt="Download"></a>
   <img src="https://img.shields.io/badge/Clarion-10%20%7C%2011%20%7C%2011.1%20%7C%2012-blue?style=for-the-badge" alt="Clarion 10 | 11 | 11.1 | 12">
-  <img src="https://img.shields.io/badge/version-6.2-blue?style=for-the-badge" alt="v6.2">
+  <img src="https://img.shields.io/badge/version-6.4-blue?style=for-the-badge" alt="v6.4">
 </p>
 
 <p align="center">
@@ -54,6 +54,271 @@ Ask it to write Clarion code, explain procedures, refactor classes, build COM co
 - **Zoom persistence** &mdash; Ctrl+mousewheel zoom is saved and restored across sessions
 
 ---
+
+## What's New in v6.4
+
+6.4 adds Find All References (Shift+F12) to the CA Editor and CA Embeditor, puts a diagnostics count and a Problems list in their status bar, keeps every chat tab reachable when the tab strip overflows, and adds a **Compare with saved file** button to the CA Editor. Each CA chat can be saved as a Markdown file in the solution folder. The bundled language server moves to Clarion Extension v1.0.11, and the plugin's safety hook now checks PowerShell commands too: the plugin is version 2.1.3, update it as described below. Full notes: **[docs/releases/v6.4.0.md](docs/releases/v6.4.0.md)**.
+
+### Upgrade notes
+
+Do these once after installing this release:
+
+- **Update the Claude Code plugin to 2.1.3**: `claude plugin update clarion-assistant@clarionassistant-marketplace`. If you chose the **Shared folder** plugin location, run `git pull` in the shared folder instead.
+- **Run a full Reindex of your solution** (Update is not enough) to clear CodeGraph rows the old parser wrote for fields after a nested structure. An incremental index only re-parses projects whose files changed, so those rows stay until then.
+- **Run `ingest_docs` again on Markdown documentation** you ingested before, if you want its sections to carry their parent headings. Existing entries keep the old headings until then.
+- **Close Claude Code and MultiTerminal sessions before running the installer**, or run `/mcp` to reconnect in each one afterwards: a running plugin server holds files in the install folder.
+
+<!-- release-docs: covered=chat-transcripts -->
+### Save each chat as a Markdown file when its tab closes or Clarion does, by asantarelli ([PR #318](https://github.com/ClarionLive/ClarionAssistant/pull/318))
+
+A CA chat lives in Claude Code's own transcript (`~/.claude/projects/...`), a JSON file that is not made to be read. With **Options > Clarion Assistant > Chat Transcripts > Save each chat as a Markdown file in the solution folder (.CAChats)** ticked, the conversation is written to `<solution folder>\.CAChats\<first day>_to_<last day>[_<name>]_<id>.md` when claude exits in the tab, when the tab is closed, and when Clarion closes. Open it in any editor, or in the IDE, to read an earlier chat without resuming it or asking Claude for a summary.
+
+The file has a heading with the session id, the chat's name, the tab and the period, then each of your messages with its time and Claude's replies, with one line for each tool Claude called. A message you typed while Claude was working is kept and marked *(while Claude was working)*. Tool output, Claude's reasoning and sub-agents' conversations are left out. A chat where you never typed a message is not saved.
+
+The name is what you gave the chat with `/rename`, when it is not a plain CA tab name (`CA1`, `CA2`): `2026-11-19_to_2026-11-20_Fix login dialog_3f9c21ab.md`. The first day comes first, so the folder sorts by when each chat started, and the last part of the session id stays in every name. One chat is one file: a chat saved again after it reached another day, or after you renamed it, takes the new name, and the earlier file for that chat is removed. Nothing else in the folder is touched.
+
+Screenshots are kept with the chat. A screenshot you paste into a CA tab is saved by CA in `%LOCALAPPDATA%\ClarionAssistant\paste-cache`, which CA empties of files older than a day, and only its path goes into the message. The export copies each one into `.CAChats\<id>\` and links it from the message (`![](3f9c21ab/<message>-p0.png)`), and does the same for an image sent in the message itself. The copies are named from the message, so saving the chat again after the original is gone still finds them. A screenshot that is already gone stays in the text as its path. Pasted text files are not copied, and neither are images from anywhere else. Your Markdown viewer must be able to show a picture next to the file: VS Code and GitHub do.
+
+It is **off by default**. The file holds everything typed or shown in the chat, passwords and keys included, and screenshots can show as much, so Clarion Assistant writes a `.gitignore` containing `*` into `.CAChats` and git never offers its files for commit. Saving when Clarion closes is a separate step with a 3-second limit, so it cannot hold the IDE open: a 10 MB chat takes about a quarter of a second. If Clarion crashes or is killed, chats still open at that moment are not saved; chats of tabs closed earlier already were. A chat you `/clear` away from inside a tab is not tracked after the `/clear`.
+
+<!-- release-docs: covered=home -->
+### The Home tab's button tooltips stay inside the pane, by geircodes ([PR #307](https://github.com/ClarionLive/ClarionAssistant/pull/307))
+
+In a narrow pane, the tooltip of the **Resume last session** button was cut off at the pane's left edge ("esume last session · ..."), because the tooltips of the three Work With Open Solution buttons were centred on the button with no way to see the window's edge. They are now placed by the page: above the button as before, moved sideways to stay inside the window, below the button when there is no room above, and wrapped when the pane is narrower than the text. They also disappear when the pointer leaves the pane.
+
+<!-- release-docs: covered=editor -->
+### Find All References in the CA Editor and CA Embeditor, by geircodes ([PR #326](https://github.com/ClarionLive/ClarionAssistant/pull/326), [#287](https://github.com/ClarionLive/ClarionAssistant/issues/287))
+
+Both editors went to a definition (F12, Ctrl+Click) and an implementation (Ctrl+F12), but seeing where a symbol is used meant asking Claude. There are now three ways to open Monaco's references view, the inline peek list VS Code users know:
+- **Shift+F12**;
+- **right-click > Go to References**, or **Peek > Peek References**;
+- a **Find References (Shift+F12)** link in the hover card's footer bar, on cards that carry location links when you hover a name (not a keyword such as LOOP).
+
+A single hit is opened straight away. In the list, a hit in the current document is shown in place and one in another file opens in the IDE. The list follows the editor's font size. Up/Down, Left/Right, F4 / Shift+F4 and Esc work as in Monaco. Monaco shows a reference in the preview on Enter and goes to it on a double-click; VS Code goes to it on Enter. A new gear setting, **Enter in the References list**, offers both: *Show in preview (Monaco)*, the default, or *Go to the reference (VS Code)*.
+
+The references come from the language server, and from CodeGraph when the server finds none. Known limits: in the CA Embeditor the server sees the embeditor's text in place of the module, so uses in other procedures of the same generated module are not found from there (the CA Editor does not have this limit); previews of other files show their saved text; and a list cut at 1,000 hits is not marked as cut.
+
+<!-- release-docs: covered=diagnostics -->
+### A diagnostics count and a Problems list in the editor's status bar, by geircodes ([PR #310](https://github.com/ClarionLive/ClarionAssistant/pull/310))
+
+The diagnostics pill and its list window were retired in 5.9, since the squiggles show the same problems where you are looking. The squiggles do not say how many problems a file has, though, or what one is until you hover it. The status bar of the CA Editor and the CA Embeditor now ends with the count for the text on screen (`⊗ 1  ⚠ 7`, plus `ⓘ n` for infos), the same markers the squiggles show. It reads `○ …` while the first answer is awaited and `✓ OK` when the language server found nothing, and stays empty until diagnostics have been asked for.
+
+Click the count to open the **Problems** list above it, sorted by line, at most 10 rows tall and scrolling beyond that:
+- a click or Up/Down/Home/End shows the problem's line in the editor while the list keeps the keyboard;
+- Enter or a double-click goes to the problem: its text is selected, the line flashes, the list closes and the editor has the keyboard;
+- **Navigate Back** returns to where you opened the list, in one step;
+- Esc, the ✕, the count again, or a click elsewhere closes it;
+- Shift+Click on the count steps to the next problem (F8) without opening the list.
+
+The list stops at 1,000 rows with "…and N more". It follows the light and dark themes.
+
+<!-- release-docs: covered=tabs -->
+### Every tab stays reachable when the tab strip overflows, by geircodes ([PR #308](https://github.com/ClarionLive/ClarionAssistant/pull/308))
+
+With more than three tabs open in a normal-width pane, the fourth tab was cut off at the strip's right edge with its ✕ out of sight, and later tabs could not be selected at all. When the tabs do not fit, they now shrink to a minimum width, with the full title as the tab's tooltip. When they still do not fit, the strip shows Home on the left, as many whole tabs as fit at their own width, and **‹ ›** arrows and a **⋯** button at the right:
+- the arrows scroll one tab at a time, and are faint when nothing is hidden on their side; their tooltips say how many tabs are hidden;
+- the mouse wheel over the strip scrolls one tab per notch;
+- the active tab is always brought into view;
+- **⋯** lists every tab except Home, with the active one checked. Each row has a ✕ that closes its tab while the list stays open. Up/Down and Enter pick a tab, and Esc or a click outside closes the list without reaching the chat.
+
+**Middle-click closes a tab**, as in a browser, after asking first: **Keep Tab** is the default, so Enter or Esc after an accidental click changes nothing. Tick **Close without asking next time** to close straight away from then on; deleting `Tabs.MiddleClickClose.NoConfirm=true` from `settings.txt` brings the question back. A right-click on a tab's ✕ no longer closes the tab: only a left-click does.
+
+<!-- release-docs: covered=ca-editor,diff -->
+### A Compare with saved file button in the CA Editor, by geircodes ([PR #324](https://github.com/ClarionLive/ClarionAssistant/pull/324))
+
+The CA Editor toolbar has a **Compare with saved file** button next to Split. It shows the file on disk and the editor's text, unsaved edits included, side by side in the Monaco diff viewer, in a tab titled `Saved vs. editor: <file>`. Clicking it again replaces that tab rather than adding another. When there is nothing to compare (line endings aside), a toast says *"No unsaved changes: the editor matches the saved file."* instead. The CA Embeditor has no saved file of its own, so it does not show the button.
+
+This comparison, and the **Show diff** of the toast that appears when the file changes on disk, used to show `show_diff`'s **Approve** and **Cancel** buttons. They now show **Close** and say they are a read-only comparison. A diff Claude opens with `show_diff` keeps Approve and Cancel.
+
+<!-- release-docs: covered=lsp,lsp-pin -->
+### The bundled language server is now v1.0.11, from Mark Sarson's Clarion Extension ([#327](https://github.com/ClarionLive/ClarionAssistant/issues/327))
+
+The bundled server moves from v1.0.9 to [Clarion Extension v1.0.11](https://github.com/msarson/Clarion-Extension/releases/tag/v1.0.11), at Mark Sarson's request; v1.0.10 was never picked up, so this covers two upstream releases. What changes in the server:
+- **Find All References is much more precise.** Same-named fields, members, parameters and keywords are kept apart. It now reaches colon-named objects, `Group.Field`, `?Name` controls and INCLUDE-headed MEMBER modules, is about twice as fast on structure fields, and no longer returns hits in assembler or C++ sources. This is what the new Shift+F12 list above shows.
+- **Hover.** Cards describe an attribute for the declaration it is on, hovering a `CASE` lists its branches, and overloaded calls show the matching prototype.
+- **Outline and diagnostics.** `CODE` and `DATA` words that are not section markers no longer upset the outline or diagnostics.
+- **COMPILE/OMIT.** Block ends follow the compiler's rules.
+
+<!-- release-docs: covered=lsp-fallback,hover -->
+### Go to Definition, Find All References and hover on a built-in call no longer land on a same-named field, by geircodes ([PR #320](https://github.com/ClarionLive/ClarionAssistant/pull/320))
+
+With the cursor on `ERRORCODE` in `IF ERRORCODE() = 0`, F12 and Find All References went to an unrelated field named `ErrorCode` (for example in a `QUEUE,TYPE` in an include file), and the hover showed another module's `ErrorCode` variable. The language server knows `ERRORCODE()` is the built-in and answers nothing, and Clarion Assistant then looked the bare word up in CodeGraph. For a built-in name followed by `(`, that lookup now accepts only a procedure, so a user procedure that shares a built-in's name (a `Message` or `Update` in your MAP) is still found, and a same-named field or variable is not. Hover on such a call shows the language server's card for the built-in. A built-in name without `(` (`Error`, `ErrorCode` and `Records` are legal labels) is still looked up as before.
+
+<!-- release-docs: covered=hover -->
+### Two hover card fixes, by geircodes ([PR #314](https://github.com/ClarionLive/ClarionAssistant/pull/314), [PR #315](https://github.com/ClarionLive/ClarionAssistant/pull/315))
+
+- A card answered from the open file (a local, parameter, routine, procedure or class member) ended with a mangled full path, such as `C:_src\MyApp\Main.clw` for `C:\_src\MyApp\Main.clw`. It now shows the file name only (`Main.clw`), with characters Markdown would read escaped.
+- Hovering a member of a CLASS declared in the file, in `SELF.Kill()` or on `ThisWindow.Init PROCEDURE`, showed only Clarion Assistant's own card, because the language server's card for the same member was always dropped. The server's card, which names the class and return type and links the prototype, is now shown, and the quick card only when the server has nothing or does not answer in time.
+
+<!-- release-docs: covered=embeditor -->
+### The slot balance check no longer flags correct code with an inline END or an OMIT block, by geircodes ([PR #311](https://github.com/ClarionLive/ClarionAssistant/pull/311), [PR #323](https://github.com/ClarionLive/ClarionAssistant/pull/323))
+
+Clarion Assistant's own structure check in the CA Editor and CA Embeditor reported code the compiler accepts:
+- a LOOP holding a one-line branch such as `OF 5 OROF 7 TO 11; CYCLE END` was reported as not terminated, because an END later on a statement line was not counted. Openers and closers are now read in order along the line, so `IF a THEN b END`, `IF a THEN b.`, a `.` that ends an IF opened on the same line, and an IF/ELSIF ladder of `THEN` lines balance. On 237 compiled `.clw` files this removed 34 false markers and added none;
+- END and openers inside an unconditional `OMIT('xxxxx')` block were counted, so an extra END in the omitted code made a correct END outside it read "END has no matching structure in this embed slot". The block is now skipped up to its terminator, as the compiler does. A conditional `OMIT('x', Equate)` or `COMPILE` is still read as code, as is an OMIT whose terminator is not in the slot yet.
+
+<!-- release-docs: covered=codegraph -->
+### CodeGraph: a nested GROUP no longer ends the outer structure, by geircodes ([PR #321](https://github.com/ClarionLive/ClarionAssistant/pull/321))
+
+In a DATA section, the END of a structure nested in another (a GROUP in a `QUEUE,TYPE`, a GROUP in a FILE's RECORD) closed the outer one, so the fields after it were indexed as variables of the enclosing scope. A field such as `ErrorCode` in a `QUEUE,TYPE` then showed up as a global variable. Nested structures now count, in global, module and procedure data: GROUP and QUEUE, and RECORD, JOIN, OPTION, SHEET, TAB, MENU, MENUBAR, TOOLBAR and the report bands, labelled or not; APPLICATION opens a block like WINDOW. A `.` terminator followed by a comment counts like END. A database indexed before this keeps the stray rows until a full **Reindex**.
+
+<!-- release-docs: covered=editor -->
+### A keyword used as part of a name (`While:Count`, `Cus:End`, `Queue.Id`) is no longer read as a keyword
+
+The CA Editor and CA Embeditor read a line's first word only up to a `:` or `.`, so they saw WHILE, LOOP, CASE or END in names such as `While:Count`, `End:Date`, `Loop:Idx` or `Queue.Id`. Typing `While:Count += 1` outdented the line, the line after `Loop:Idx = 1` was indented, Ctrl+I and format on Enter opened or closed levels on such lines, and the live keyword casing turned `Cus:End` into `Cus:END`. Smart indent, the formatter and the casing now leave prefixed and dotted names alone, and a labelled `Loop:Top LOOP` at module scope is laid out as a statement, not a data declaration.
+
+<!-- release-docs: covered=docgraph -->
+### `query_docs` finds the sections of Markdown documentation by their parent heading, and ranks the section a query names first ([PR #312](https://github.com/ClarionLive/ClarionAssistant/pull/312) by geircodes, [#313](https://github.com/ClarionLive/ClarionAssistant/issues/313) reported by geircodes)
+
+DocGraph stored each section of a Markdown file under its own heading only, so in an API reference laid out one function per `##` with `###` sections, every function's parameters were stored as plain "Parameters" and a search for the function name never found them. A section's heading now carries its parent headings: `FooInitialize Function > Parameters`, `[1.2.0] > Fixed`. A file's single `#` title is left out of the path. Markdown already ingested keeps the old headings until you run `ingest_docs` on it again.
+
+`query_docs` also compared only the first word of a query with the headings, so `HttpSubmitRequest Parameters` listed that function's Parameters section last of its nine sections. Within the same rank, headings holding more of the other query words now come first (up to 8 distinct words count), stop words no longer decide the rank (`the X` ranks on `X`), and a query naming the last part of a `Parent > Section` heading counts as an exact heading match. One-word queries keep their order.
+
+<!-- release-docs: covered=home -->
+### The Home tab's Previous sessions list includes long sessions, by geircodes ([PR #319](https://github.com/ClarionLive/ClarionAssistant/pull/319))
+
+The **More options** drawer left out sessions with many turns, renamed ones included: on a folder with 103 transcripts, 8 of the 50 newest sessions were missing. A session was listed only when one of Claude's replies fell in the parts of the transcript the list reads, and Claude Code now writes hundreds of KB of start-up records before the first reply. A session is now listed when it has a prompt you typed or a title you gave it with `/rename`, and the first prompt is searched for further into the file when needed. Compacted-conversation summaries are not taken for prompts. A session whose prompt never got an answer is now listed too; resuming it shows that prompt.
+
+<!-- release-docs: covered=safety,hooks -->
+### The plugin's safety hook checks PowerShell commands, and never lets Claude kill MultiTerminal or Claude Code
+
+The safety hook was registered for the Bash tool only, so a kill or destructive command run through Claude Code's PowerShell tool went through with no prompt. It now checks PowerShell commands too, with PowerShell's own rules: a recursive `Remove-Item` on a drive root or your home folder, disk formatting, shutdown, `.env` files and `Send-MailMessage` are refused, and `Stop-Process`, `taskkill` and the other ways of ending a process are judged like their Bash forms. Kills are now decided by what they would end:
+- a kill aimed at MultiTerminal or Claude Code (by name, PID or process tree) is refused without a prompt;
+- a kill whose targets all descend from this Claude session, and are not system processes or Explorer, goes ahead without a prompt;
+- a kill of a shared runtime by name (`node`, `dotnet`, `python`, `pwsh`, `git` ...), a remote kill, or one the hook cannot resolve asks.
+
+A command whose name is built at run time (`& $cmd`, `Invoke-Expression` on built text, `$(...)` as a Bash command word, a dynamic alias) asks, kill word or not. Text in a commit message or a heredoc that writes a file is data and does not trigger the rules. The hook is an accident guard: a deliberately built command can still get past a text check. The plugin is version 2.1.3; update it as described above.
+
+<!-- release-docs: covered=deploy -->
+### `deploy.ps1` builds the MCP server on a fresh checkout, by asantarelli ([PR #325](https://github.com/ClarionLive/ClarionAssistant/pull/325))
+
+For building from source: the deploy script restored NuGet packages for the add-in only. The standalone MCP server has its own package references, so on a fresh checkout its build failed, and because that build runs before the deploy, nothing was deployed while the add-in and indexer builds above it reported success. The script now restores the MCP server's packages before building it. Later runs pay about a second and a half.
+
+### Thanks
+
+- **[@geircodes](https://github.com/geircodes)** &mdash; [PR #307](https://github.com/ClarionLive/ClarionAssistant/pull/307): Home button tooltips kept inside the pane; [PR #308](https://github.com/ClarionLive/ClarionAssistant/pull/308): the tab strip overflow, the tab list and middle-click close; [PR #310](https://github.com/ClarionLive/ClarionAssistant/pull/310): the diagnostics count and Problems list, back where the squiggles are; [PR #311](https://github.com/ClarionLive/ClarionAssistant/pull/311) and [PR #323](https://github.com/ClarionLive/ClarionAssistant/pull/323): the slot balance check, each checked against hundreds of compiled files; [PR #312](https://github.com/ClarionLive/ClarionAssistant/pull/312): parent headings in Markdown chunks, and [#313](https://github.com/ClarionLive/ClarionAssistant/issues/313): the `query_docs` ranking report with the fix it needed; [PR #314](https://github.com/ClarionLive/ClarionAssistant/pull/314) and [PR #315](https://github.com/ClarionLive/ClarionAssistant/pull/315): the hover card fixes; [PR #319](https://github.com/ClarionLive/ClarionAssistant/pull/319): long sessions back in the Home list; [PR #320](https://github.com/ClarionLive/ClarionAssistant/pull/320): built-in calls kept off same-named fields; [PR #321](https://github.com/ClarionLive/ClarionAssistant/pull/321): nested structures in CodeGraph; [PR #324](https://github.com/ClarionLive/ClarionAssistant/pull/324): Compare with saved file; [PR #326](https://github.com/ClarionLive/ClarionAssistant/pull/326): Find All References, closing [#287](https://github.com/ClarionLive/ClarionAssistant/issues/287).
+- **[Adrián Santarelli](https://github.com/asantarelli)** &mdash; [PR #318](https://github.com/ClarionLive/ClarionAssistant/pull/318): saving each CA chat as Markdown, screenshots included; [PR #325](https://github.com/ClarionLive/ClarionAssistant/pull/325): the fresh-checkout deploy failure.
+- **[Mark Sarson](https://github.com/msarson)** &mdash; [#327](https://github.com/ClarionLive/ClarionAssistant/issues/327): Clarion Extension v1.0.11 and the re-pin request.
+
+## What's New in v6.3
+
+6.3 lets you resume an earlier Claude session from the Home tab, ships UltimateCOM 4.1 (each control's handler gets only its own events, and Before/After COM Registration code is no longer dropped), opens INCLUDE files with Ctrl+Click through the `.red`, and corrects the bundled `clarion`, `stringtheory` and `jfiles` skills against the compiler and library sources. The plugin is version 2.1.2: update it as described below. Full notes: **[docs/releases/v6.3.0.md](docs/releases/v6.3.0.md)**.
+
+<!-- release-docs: covered=skills -->
+### The StringTheory skill is rewritten and checked against the StringTheory source, by geircodes ([PR #282](https://github.com/ClarionLive/ClarionAssistant/pull/282))
+
+The bundled `stringtheory` skill told Claude to use `FromBlob` / `ToBlob` on a MEMO field. Those methods take a `*BLOB`, so that code does not compile; a MEMO is a plain string and is assigned like one. The `jfiles` skill repeated the advice and is corrected too. The skill also listed `Encrypt` / `Decrypt` methods that StringTheory does not have.
+
+geircodes ([@geircodes](https://github.com/geircodes)) rewrote the skill with every rule checked against `StringTheory.clw` / `.inc` 3.90, and added the silent failures an agent hits when writing StringTheory code: arguments used at their full declared size unless clipped, the three return conventions (`TRUE`/`FALSE`, `st:ok` which is zero, `st:notFound`), the `base64` and `encoding` properties that `SetValue` and `Append` leave behind, the US-ASCII default code page, `UrlEncode(Text)` binding to the flags overload and encoding the object's own value, overlapping `Count` matches, `Equals` clipping, `Random` / `MakeGuid` being predictable, and who owns the memory returned by `GetValuePtr`, `ToCstring`, `Utf16To8` and `_StealValue`. The skill's solution-specific example is replaced by a generic one. We read the rules against the StringTheory 3.70 source as well: the ones that need a newer library (a negative end in `Slice`, the `Normalize` property, `st:min`, `st:CSVDecode`) now say which version added them, and `Equals(StringTheory)` is noted as always comparing exact lengths.
+
+<!-- release-docs: covered=hover -->
+### Hovering a procedure declared in the file you are editing shows the language server's card, by geircodes ([PR #286](https://github.com/ClarionLive/ClarionAssistant/pull/286))
+
+6.2 made hover ask the language server for parameters, locals, routines and procedures found through the index. One case still showed only Clarion Assistant's quick card: a procedure the file itself prototypes or implements (`InventoryDetailToolBar PROCEDURE` in its own module, a procedure in the module's MAP, or one in a procedure's local MAP). That card names the file but no line, and it cannot see a prototype the file does not hold, so a procedure implemented in a MEMBER module and prototyped in a file INCLUDEd by the MAP showed its implementation line as the declaration. Those hovers now show the language server's card, which links the prototype and then the implementation (`protos.inc:1` → `mod.clw:5`). The quick card still appears when the server has nothing, is not running, or does not answer within 300 ms. A member of a CLASS declared in the file keeps both cards, as before, since the server may know inherited members.
+
+<!-- release-docs: covered=definition -->
+### Ctrl+Click on an INCLUDE file name opens that file, by geircodes ([PR #288](https://github.com/ClarionLive/ClarionAssistant/pull/288))
+
+In a CA Editor tab, Ctrl+Click or F12 on the file name in a line such as `INCLUDE('CWSyncHM.inc'), ONCE` opened a different file whenever the language server had no answer: the first library file that itself includes the same name (`ABFILE.INC` for `CWSyncHM.inc`). CodeGraph records every INCLUDE statement as a row named after the included file but placed in the file that contains the statement, and the fallback treated that row as a declaration. It no longer does, for Ctrl+Click or for the hover card. A file name inside INCLUDE, MODULE, MEMBER and LINK is now recognised as a file reference and found the way the compiler finds it: through the project's redirection (`.red`) file, under your solution's build configuration, with the project's own `.red` when it has one. If the `.red` does not list the file, nothing opens rather than a guess.
+
+<!-- release-docs: covered=skills -->
+### The `clarion` skill is a third smaller and corrects three statements, by geircodes ([PR #292](https://github.com/ClarionLive/ClarionAssistant/pull/292))
+
+Three things the skill told Claude were wrong. A WINDOW is closed by **one** END; the "two ENDs, one for the controls and one for the window" rule in its top ten did not compile. Container controls take their own END: SHEET, TAB, OPTION, GROUP, OLE, MENUBAR, MENU and TOOLBAR. REAL is 8 bytes (SREAL is the 4-byte type). `LEN()` counts trailing blanks (`LEN(CLIP(s))` gives the data length). The skill now also says what DISPOSE does: the reference you pass is set to NULL and a second DISPOSE of it is harmless, but any other reference to the same object now points to freed memory, so only the owner disposes a shared object. Each rule lives in one place (SKILL.md for the rule, `ai-pitfalls.md` for the compiler evidence), the .NET side of COM control building has moved entirely to the `clarioncom-control` skill, and the file shrank from 58 KB to 40 KB. We re-compiled the END rules on Clarion 12 and audited the removed text line by line: nothing was lost that is not still stated elsewhere, and the one example that was (a `LOOP ... RECORDS()` / `GET()` queue walk) is back. The skill's description also used to be cut short by the frontmatter loader at the first `#IF`, so its trigger text never reached Claude; it reads in full now.
+
+<!-- release-docs: covered=skills -->
+### The `jfiles` skill: a queue inside a group needs a derived `NewPointer`, by geircodes ([PR #296](https://github.com/ClarionLive/ClarionAssistant/pull/296))
+
+`json.Load()` fills a GROUP or QUEUE that holds a `&Queue` reference field without ever allocating that queue. Unless your JSONClass is derived with a `NewPointer` override that NEWs it, the reference stays NULL, Load reports no error, and the JSON array is silently dropped. The new rule gives a complete example (the queue type, `NAME('data | queue')`, the derived class and its `DERIVED` override, `Load`, `DisposeGroup`), states exactly which group and column names jFiles passes for a top-level, boundary, queue and nested load, and records the version boundary: the two-parameter `NewPointer(*CSTRING, *CSTRING)` is jFiles 3 (3.02 and later also fall back to the old form), while the vendor's page and jFiles 2.x show only the one-parameter form. Checked against the jFiles 3.08, 3.03 and 2.28 sources.
+
+<!-- release-docs: covered=launcher -->
+### The plugin's `clarion-tools` server starts on machines without `CLARION_ROOTS` ([#293](https://github.com/ClarionLive/ClarionAssistant/issues/293))
+
+Without `CLARION_ROOTS` set, the plugin's launcher stopped with "The following usage of the path operator in batch-parameter substitution is invalid" before it looked for a server, and Claude Code reported that the server failed to connect. `cmd` expands a `%VAR:old=new%` substitution before it evaluates the `if defined` in front of it, and an undefined variable in that form corrupts the rest of the line. The split now runs only after a separate check. Roots wrapped in quotes (`"C:\Clarion 12";"D:\C11"`), which stopped the launcher in a different way, work too. This fix reaches you through the plugin update below.
+
+<!-- release-docs: covered=hooks,publish -->
+### The plugin's hooks start faster and time out less ([#294](https://github.com/ClarionLive/ClarionAssistant/issues/294))
+
+The two PowerShell checks at session start are now one Node script. It took about 70 ms on our test machine, against about 430 ms for each old check, and says what the two checks said. The safety hook is registered once for all the tools it inspects instead of four times, with a 10 s limit instead of 5 s. When Claude Code cancels a hook at its limit, the tool call goes ahead without that check; the hook files now say so. The plugin is version 2.1.2 (with the skill rules below). To get it, run `claude plugin update clarion-assistant@clarionassistant-marketplace`, because Claude Code keeps its cached copy until the version changes. If you chose the **Shared folder** plugin location, that command reports nothing to update: run `git pull` in the shared folder instead. The publish script now refuses a plugin change that has no version bump, since such a change reaches nobody.
+
+<!-- release-docs: covered=path-policy -->
+### Paths using a short (8.3) folder name are judged by their long name ([#291](https://github.com/ClarionLive/ClarionAssistant/issues/291))
+
+When your profile folder's name is not a valid 8.3 name, Windows gives programs `%TEMP%` in short form, such as `C:\Users\JOHNSM~1\AppData\Local\Temp`. The path policy read that as another user's profile and refused every path built from it, Claude Code's scratchpad included. It now expands short names on the path being checked and on every root and protected folder it compares against. Your own profile's short name is your profile, a short-named `Mcp.AllowedRoots` entry matches its long path, and another user's short-named profile is still refused. Network paths are still judged by their text and never opened.
+
+<!-- release-docs: covered=markdown-editor,installer -->
+### Markdown Editor v1.5.0, and the installer no longer adds a second copy ([#289](https://github.com/ClarionLive/ClarionAssistant/issues/289), [#290](https://github.com/ClarionLive/ClarionAssistant/issues/290))
+
+The bundled Markdown Editor moves from v1.3.0 to [v1.5.0](https://github.com/msarson/ClarionMarkdownEditor/releases/tag/v1.5.0). Among other changes, files dropped from Explorer now open in editor tabs. Two copies of the editor stop the Clarion IDE from starting, and the installer only looked for an existing copy in `accessory\addins\MarkdownEditor`, while Clarion Addin Finder and the editor's own zip use `accessory\addins\ClarionMarkdownEditor`. It now checks every folder under `accessory\addins` and skips ours when it finds the editor elsewhere, naming that folder in the install log and on the final page. If you already have two copies, the installer leaves both in place and tells you to delete `MarkdownEditor`.
+
+<!-- release-docs: covered=skills -->
+### The `clarion` skill: one app at a time, the developer closes and saves apps, and which writes give CRLF ([#302](https://github.com/ClarionLive/ClarionAssistant/issues/302))
+
+The skill now tells Claude to keep one app open at a time. Before opening an `.app` it checks for one already open and asks you to save and close it first, because two large apps can use all of the 32-bit Clarion IDE's memory. Claude never closes an app tab itself, since `close_file` skips the IDE's save prompt: it asks you to close the app and save, and it says so when it has changed the app. If Clarion offers to recover an app after a crash, Claude tells you the dialog is up and leaves the choice to you.
+
+The line-ending rule was also out of date. The skill said `write_file` does not produce CRLF, but for Clarion source files it converts every line ending to CRLF. It now lists which writes give CRLF and which do not: `write_file` on a `.txa`, and Claude Code's own `Write` and `Edit` tools. Those must be converted before compiling. Update the plugin as described above to get it.
+
+<!-- release-docs: covered=completion -->
+### Completion no longer offers a TYPE structure's fields as variables, by geircodes ([PR #299](https://github.com/ClarionLive/ClarionAssistant/pull/299))
+
+Take a `QUEUE,TYPE` or `GROUP,TYPE` declared without `PRE()`, such as `OrderQType QUEUE,TYPE` with the fields `OrdId` and `OrdStatus`. When you typed `Ord` in a CA Editor tab, the completion list offered `OrdId` and `OrdStatus` as if they were variables in scope. A TYPE declares no data, so its fields can never be used on their own. The language server already left them out, but the editor keeps every item from Clarion Assistant's own quick list, so the server could not take them away. That list now skips the fields of a TYPE structure and of any structure nested inside one. `TYPE` inside a string or a comment, as in `NAME('X,TYPE')`, does not count as the attribute. Structures without `PRE()` that are not TYPEs still offer their fields, as before.
+
+<!-- release-docs: covered=diff -->
+### `show_diff` tells Claude which viewer has side-by-side, by geircodes ([PR #303](https://github.com/ClarionLive/ClarionAssistant/pull/303))
+
+When you asked Claude to compare two versions, you usually got the classic diff viewer, which shows a single unified column and has no side-by-side view. The side-by-side Monaco viewer only opens when Claude passes `renderer='monaco'`, and the tool's description and Claude's instructions never said so. The README and the Guide even described `show_diff` as side-by-side. All of them now name both viewers: Monaco for comparing versions, with a Side-by-side / Inline toggle; classic, still the default, when Claude needs your review notes back. The `evaluate-code` skill relies on those notes, so the default is unchanged.
+
+<!-- release-docs: covered=ultimatecom -->
+### UltimateCOM 4.1: each control's handler gets only its own events, by Aarhusdk ([#305](https://github.com/ClarionLive/ClarionAssistant/issues/305))
+
+When two UltimateCOM controls ran on the same thread, such as a window with a WebView2 control and a toast control that also opened a dialog with a third, one control's event handler could take the other control's event. The event was then handled by the wrong code, and the right handler found nothing. The generated `UCProcessCOMEvents_<object>` procedure called `GetEvent()`, which returns the thread's oldest event from any control. It now calls the new `GetEventFor(<object>_Ctrl)`, which returns only that control's events, for the control template and the procedure extension alike. Aarhusdk sent the patch with the report and tested it on 35 handlers in 10 apps.
+
+The report also found that the value given to `SetUCPostEvent` was never used: the class always posted `Event:User + 2000 + feq`. That matches the control template, but the procedure extension waits for `Event:User + 3000 + n`, so an extension's handler never ran. The class now posts the event each control was given, provided `SetUCPostEvent` is called before `RegisterEventFunc`, as the templates do. If you use the procedure extension, or call `SetUCPostEvent` with your own value in hand-written code, the code that handles those events runs from now on: check it before you rebuild against the new class. Apps using the control template see no change in which event is posted.
+
+One case is not covered: two UltimateCOM controls with the same field number in two windows on the same thread, such as a control on a window and one on a dialog that window opens with a procedure call. The class tells controls apart by field number, so while the dialog is open the window's control events can still reach the dialog's handler. Closing the dialog no longer affects the window's control.
+
+<!-- release-docs: covered=ultimatecom -->
+### UltimateCOM 4.1: Before and After COM Registration code is no longer dropped, reported by Aarhusdk ([#306](https://github.com/ClarionLive/ClarionAssistant/issues/306))
+
+Code in an UltimateCOM control's **Before COM Registration** or **After COM Registration** embed was sometimes left out of the generated source, with no error or warning. The window then opened without its setup, and a WebView2 control stayed blank. The embeds were keyed on an event name as well as the control, outside any loop over the events, so the key depended on which event the generator happened to be on. The embeditor still showed the code in place, which made it hard to spot.
+
+Both embeds are now keyed on the control's object alone, and keep the same names in the embed tree. The old embeds stay as legacy embeds: the embed tree shows them only when they hold code, as **Before COM Registration (old embed - move this code to Before COM Registration)** and the matching After entry. Code in them is generated in the same place, whichever event it was stored under, including none, so regenerating an existing app does not drop it. Each piece is preceded in the generated source by a comment naming the event it was stored under. Move the code into the new embed when convenient, and the old entry disappears.
+
+Because every stored copy now generates, a procedure where the code was pasted in again after it went missing may now run it twice. Open the old embed entries of such procedures and delete the copies you do not need before you rely on the new build. Code stored under an event name that the COM control no longer lists is still not generated. If you used the workaround of putting setup code in **Window Events, OpenWindow** at priority 9000, it keeps working.
+
+<!-- release-docs: covered=terminal,home -->
+### Start a new Claude session, resume the last one, or pick an earlier one
+
+Every chat tab used to start a fresh Claude Code session, so picking up yesterday's work meant explaining it again. The **Work With Open Solution** card on the Home tab now has three buttons:
+- **Start a new session** opens a fresh one, as before.
+- **Resume last session** reopens your most recent session for this solution.
+- **More options** opens a drawer listing earlier sessions, newest first. Each shows the tab name it ran under, how long ago it was used, and the last thing you asked in it. Click one to resume it.
+
+Resuming a session skips the greeting and the recap, and Claude is told that the session was resumed. If a session may still be open in another tab or window, Clarion Assistant asks before opening it a second time. The list holds up to 50 sessions and comes from Claude Code's own transcripts for the solution's folder.
+
+A session you renamed with `/rename` is listed with your title in bold. Resuming it keeps that title, while the tab still gets a CA name. geircodes ([PR #304](https://github.com/ClarionLive/ClarionAssistant/pull/304)) found and fixed three problems before release:
+- renamed sessions were left out of the list;
+- tabs opened and closed without a prompt used up the list's reading allowance and hid newer sessions;
+- after restarting the IDE, the Resume button stayed off until you opened the drawer.
+
+<!-- release-docs: covered=ide-detection,deploy -->
+### Clarion Assistant recognises `ClarionLAA.exe`, SoftVelocity's large-address-aware Clarion 12 ([#297](https://github.com/ClarionLive/ClarionAssistant/issues/297))
+
+Clarion.exe is a 32-bit program limited to 2 GB of memory, and one large app plus a second one can use all of it ([#297](https://github.com/ClarionLive/ClarionAssistant/issues/297)). SoftVelocity plans to ship a signed `ClarionLAA.exe` beside `Clarion.exe` in the next Clarion 12 beta refresh. It can use 4 GB, and you choose which one to run each session. Clarion Assistant now treats `ClarionLAA.exe` as the Clarion IDE everywhere it checks:
+- chat tabs and the IDE tools that other clients reach;
+- Clarion version detection;
+- the deploy script's "Clarion is still running" check.
+
+When memory runs low under `Clarion.exe` and `ClarionLAA.exe` is installed beside it, the low-memory notice suggests running that one instead. Until SoftVelocity ships it, nothing changes.
+
+### Thanks
+
+- **[@msarson](https://github.com/msarson)** &mdash; [#289](https://github.com/ClarionLive/ClarionAssistant/issues/289) and [#290](https://github.com/ClarionLive/ClarionAssistant/issues/290): the Markdown Editor release details and the diagnosis of the duplicate install.
+- **[@armisoftware](https://github.com/armisoftware)** &mdash; [#302](https://github.com/ClarionLive/ClarionAssistant/issues/302): the app-handling rules for the `clarion` skill.
+- **[@Aarhusdk](https://github.com/Aarhusdk)** &mdash; [#305](https://github.com/ClarionLive/ClarionAssistant/issues/305) and [#306](https://github.com/ClarionLive/ClarionAssistant/issues/306): the UltimateCOM `GetEventFor` patch tested on 35 handlers, and the root cause of the dropped COM Registration code, traced to the embed key.
+- **[@KevinErskine](https://github.com/KevinErskine)** &mdash; [#293](https://github.com/ClarionLive/ClarionAssistant/issues/293) and [#294](https://github.com/ClarionLive/ClarionAssistant/issues/294): the launcher failure and a measured analysis of the hook timeouts.
+
+- **[@geircodes](https://github.com/geircodes)** &mdash; [PR #282](https://github.com/ClarionLive/ClarionAssistant/pull/282): the StringTheory skill rewrite, every rule read against the library source; [PR #286](https://github.com/ClarionLive/ClarionAssistant/pull/286): the last hover card that skipped the language server, procedures declared in the file, now asks it too, with a 10,000-hover measurement behind the change; [PR #288](https://github.com/ClarionLive/ClarionAssistant/pull/288): Ctrl+Click on an INCLUDE file name, resolved through the `.red`; [PR #292](https://github.com/ClarionLive/ClarionAssistant/pull/292): the `clarion` skill dedupe and its three corrections; [PR #296](https://github.com/ClarionLive/ClarionAssistant/pull/296): the `jfiles` `NewPointer` rule; [PR #299](https://github.com/ClarionLive/ClarionAssistant/pull/299): TYPE structure fields kept out of completion, with a test proven to fail without the fix; [PR #303](https://github.com/ClarionLive/ClarionAssistant/pull/303): the `show_diff` descriptions that name both viewers; [PR #304](https://github.com/ClarionLive/ClarionAssistant/pull/304): three fixes to the new session chooser, measured on a real solution folder; [#291](https://github.com/ClarionLive/ClarionAssistant/issues/291): the short-name path refusal, diagnosed down to the rule.
 
 ## What's New in v6.2
 
@@ -921,7 +1186,7 @@ Clarion Assistant exposes **108 MCP tools** that Claude uses to interact with th
 | `is_modified` | Check if the active file has unsaved changes |
 | `undo` | Undo the last edit |
 | `redo` | Redo the last undone edit |
-| `show_diff` | Show a side-by-side diff in the Monaco viewer |
+| `show_diff` | Show a diff: unified with review notes (default), or Monaco side-by-side / inline with `renderer='monaco'` |
 | `get_diff_result` | Get approval/notes from the diff viewer |
 
 ### Application Tree & Embeditor (22 tools)

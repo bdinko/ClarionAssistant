@@ -1010,6 +1010,32 @@ namespace ClarionAssistant
             });
         }
 
+        // Find All References (Shift+F12, right-click, hover footer link). The page shows the locations in
+        // Monaco's references view; a hit in this file is a line of this buffer (identity +1 mapping).
+        void IMonacoEditorHost.OnReferences(MonacoEditorControl editor, string rawJson)
+        {
+            int reqId, line, col; string buffer;
+            if (!ParseLspRequest(editor, rawJson, out reqId, out line, out col, out buffer)) return;
+            System.Threading.Tasks.Task.Run(() =>
+            {
+                Dictionary<string, object> reply = null;
+                try
+                {
+                    EnsureLsp();
+                    if (SharedLspBridge.IsRunning)
+                    {
+                        if (!string.IsNullOrEmpty(buffer)) SharedLspBridge.EnsureBufferSynced(_filePath, buffer);
+                        bool fromIndex;   // the CodeGraph fallback's lines are the saved file's: the same file here
+                        var refs = SharedLspBridge.GetReferences(_filePath, Math.Max(0, line - 1), Math.Max(0, col - 1),
+                            buffer, out fromIndex);
+                        reply = ReferenceLocations.Build(refs, SameSourceFile, l0 => l0 + 1);
+                    }
+                }
+                catch (Exception ex) { MonacoSpikeLog.Write("overlay references error: " + ex.Message); }
+                editor.PostResponse(reqId, reply ?? new Dictionary<string, object> { { "locations", new object[0] } });
+            });
+        }
+
         // LSP signature help — parameter hints when typing '(' or ',' at a call site. Same
         // position/buffer contract as OnHover; the page hides the widget on a null reply.
         void IMonacoEditorHost.OnSignatureHelp(MonacoEditorControl editor, string rawJson)
@@ -1503,8 +1529,14 @@ namespace ClarionAssistant
             {
                 object wbw = _wbWindow;
                 if (wbw == null) { try { wbw = GetType().GetProperty("WorkbenchWindow")?.GetValue(this, null); } catch { } }
-                if (wbw == null) { MonacoSpikeLog.Write("focusEditor: WorkbenchWindow not available"); return; }
-                wbw.GetType().GetMethod("SelectWindow", Type.EmptyTypes)?.Invoke(wbw, null);
+                if (wbw == null) { MonacoSpikeLog.Write("focusEditor: WorkbenchWindow not available"); }
+                else wbw.GetType().GetMethod("SelectWindow", Type.EmptyTypes)?.Invoke(wbw, null);
+                // SelectWindow raises the tab but does not give the WebView2 Windows keyboard focus. FocusEditor
+                // is the full hand-off (Focus + MoveFocus into Chromium, verified and retried), so the page's
+                // own editor.focus() reaches the keyboard: a Problems-list jump (PR #310 live test 2026-11-27)
+                // left the line shown but typing went nowhere.
+                MonacoSpikeLog.Write("focusEditor: host focus hand-off");
+                editor?.FocusEditor();
             }
             catch (Exception ex) { MonacoSpikeLog.Write("OnFocusEditor error: " + ex.Message); }
         }
@@ -2576,21 +2608,43 @@ namespace ClarionAssistant
         /// <summary>{action:"diffWithDisk"} from the external-change toast's "Show diff" button — routed
         /// via OnUnknownAction (like toggleBreakpoint) rather than a new IMonacoEditorHost method, so
         /// ModernEmbeditorViewContent (CA Embeditor) — which implements the same shared interface — is
-        /// completely untouched by this CA-Editor-only feature.</summary>
+        /// completely untouched by this CA-Editor-only feature.
+        /// Also sent with onDemand:true by the toolbar's "Compare with saved file" button: same disk-vs-live
+        /// diff, titled as a saved-vs-editor compare, one tab per editor (a second click replaces it with a
+        /// fresh one), and a toast instead of an empty diff when the editor matches the file.</summary>
         private void ShowDiskDiff(string rawJson)
         {
             try
             {
-                if (string.IsNullOrEmpty(_filePath) || !File.Exists(_filePath)) return;
                 var data = new JavaScriptSerializer { MaxJsonLength = int.MaxValue }.DeserializeObject(rawJson) as Dictionary<string, object>;
+                bool onDemand = data != null && data.ContainsKey("onDemand") && data["onDemand"] is bool && (bool)data["onDemand"];
+                if (string.IsNullOrEmpty(_filePath) || !File.Exists(_filePath))
+                {
+                    if (onDemand)
+                        _editor?.PostJson("{\"type\":\"toast\",\"ok\":false,\"message\":\"The saved file is not on disk, so there is nothing to compare with.\"}");
+                    return;
+                }
                 string liveText = (data != null && data.ContainsKey("text")) ? (data["text"] as string ?? "") : (_overlayLiveText ?? "");
                 string diskText = EncodingHelper.ReadAllText(_filePath, out _);
+                if (onDemand)
+                {
+                    CloseDiffView(_onDemandDiff);   // replace this editor's previous compare, never stack them
+                    _onDemandDiff = null;
+                    // Line endings only: Monaco's getValue() and the file on disk may differ in EOL alone.
+                    if (string.Equals(diskText.Replace("\r\n", "\n"), liveText.Replace("\r\n", "\n"), StringComparison.Ordinal))
+                    {
+                        _editor?.PostJson("{\"type\":\"toast\",\"ok\":true,\"message\":\"No unsaved changes: the editor matches the saved file.\"}");
+                        return;
+                    }
+                }
                 var diff = new MonacoDiffViewContent(
-                    "External change: " + Path.GetFileName(_filePath), diskText, liveText, "clarion", false, Services.CaEditorSettings.MonacoThemeDark);
-                // This is a read-only comparison, not a code-review workflow — there's nothing to "apply"
-                // (unlike show_diff's usual Approve/Cancel meaning). Live testing confirmed both buttons were
-                // otherwise dead clicks with no wired handler; closing the tab either way is the only
-                // sensible behavior here.
+                    (onDemand ? "Saved vs. editor: " : "External change: ") + Path.GetFileName(_filePath),
+                    diskText, liveText, "clarion", false, Services.CaEditorSettings.MonacoThemeDark);
+                // A read-only comparison, not a code-review workflow: there is nothing to approve, so the page
+                // shows only Close (CompareOnly hides Approve). Close raises Cancelled and closes the tab; Applied
+                // is still wired so an older page that shows Approve closes the tab too instead of a dead click.
+                diff.CompareOnly = true;
+                if (onDemand) _onDemandDiff = diff;
                 diff.Applied += modifiedText => CloseDiffView(diff);
                 diff.Cancelled += () => CloseDiffView(diff);
                 ICSharpCode.SharpDevelop.Gui.WorkbenchSingleton.Workbench.ShowView(diff);
@@ -2599,8 +2653,11 @@ namespace ClarionAssistant
             catch (Exception ex) { MonacoSpikeLog.Write("ShowDiskDiff error: " + ex.Message); }
         }
 
+        private MonacoDiffViewContent _onDemandDiff;   // the toolbar compare's tab, replaced on the next click
+
         private static void CloseDiffView(MonacoDiffViewContent diff)
         {
+            if (diff == null || diff.IsDisposed) return;   // already closed (Close, the tab's X): nothing to do
             try { var ww = diff.WorkbenchWindow; if (ww != null) ww.CloseWindow(true); }
             catch (Exception ex) { MonacoSpikeLog.Write("CloseDiffView error: " + ex.Message); }
         }

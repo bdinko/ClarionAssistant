@@ -46,6 +46,9 @@ function Resolve-MSBuild {
 
 $ProjectDir  = $PSScriptRoot
 $ProjectFile = Join-Path $ProjectDir "ClarionAssistant.csproj"
+# The Clarion IDE's process names: Clarion.exe, and ClarionLAA.exe (SoftVelocity's LargeAddressAware build). Keep in
+# step with Services\ClarionIdeProcess.cs IdeImageNames (1976d2e9).
+$IdeImageNames = @("Clarion", "ClarionLAA")
 $MSBuild     = Resolve-MSBuild
 
 # Indexer build output. VENDORED into this repo as indexer/ (GitHub #30) — self-contained,
@@ -599,7 +602,8 @@ function Get-DeployBlockers {
                 $blockers += [PSCustomObject]@{ Name = $p.ProcessName; Id = $p.Id; Why = $path }
                 break
             }
-            if ($p.ProcessName -eq "Clarion" -and $path -like "$rr\*") {
+            # Clarion.exe or ClarionLAA.exe, SoftVelocity's LargeAddressAware build beside it (1976d2e9).
+            if ($IdeImageNames -contains $p.ProcessName -and $path -like "$rr\*") {
                 $blockers += [PSCustomObject]@{ Name = $p.ProcessName; Id = $p.Id; Why = "$path (loads the addin)" }
                 break
             }
@@ -609,7 +613,7 @@ function Get-DeployBlockers {
 }
 
 if ($Kill) {
-    $proc = Get-Process -Name "Clarion" -ErrorAction SilentlyContinue
+    $proc = Get-Process -Name $IdeImageNames -ErrorAction SilentlyContinue
     if ($proc) {
         Write-Host ""
         Write-Host "Stopping Clarion IDE..." -ForegroundColor Yellow
@@ -698,9 +702,11 @@ if (-not $NoBuild) {
     if (Test-Path $McpServerFile) {
         Write-Host ""
         Write-Host "Building standalone MCP server..." -ForegroundColor Cyan
-        # /t:Restore FIRST: this project is not $ProjectFile, so the restore above never covered it.
-        # Without it the PdfPig PackageReference stays unresolved and the shared DocGraphService.cs
-        # fails with CS0103 on UglyToad -- which exit 1's below and aborts the whole deploy.
+        # RESTORE FIRST. The restore above covers $ProjectFile only, and this project carries its
+        # own PackageReference (PdfPig, for the shared DocGraphService.cs it compiles in). With no
+        # obj\project.assets.json of its own the compile fails with CS0103 "UglyToad does not exist"
+        # - which is every FRESH CHECKOUT's first deploy, the same blind spot as 0cd0b20c. Cheap to
+        # repeat: restore is a no-op once the assets file is there.
         & $MSBuild $McpServerFile /t:Restore /p:Configuration=Debug /p:Platform=x86 /v:minimal
         if ($LASTEXITCODE -ne 0) { Write-Host "MCP server restore failed." -ForegroundColor Red; exit 1 }
         & $MSBuild $McpServerFile /p:Configuration=Debug /p:Platform=x86 /v:minimal
@@ -1026,9 +1032,9 @@ foreach ($ver in $TargetVersions) {
         # copy's return: this is the check that actually proved an install undamaged on 2026-09-10.
         $DeployedDll = Join-Path $DeployDir "ClarionAssistant.dll"
         $BuiltDll    = Join-Path $BuildOutput "ClarionAssistant.dll"
-        if ((Test-Path $DeployedDll) -and (Test-Path $BuiltDll)) {
+        if ((Test-Path -LiteralPath $DeployedDll) -and (Test-Path -LiteralPath $BuiltDll)) {
             try {
-                if ((Get-FileHash $DeployedDll -Algorithm SHA256).Hash -ne (Get-FileHash $BuiltDll -Algorithm SHA256).Hash) {
+                if ((Get-FileHash -LiteralPath $DeployedDll -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath $BuiltDll -Algorithm SHA256).Hash) {
                     Write-Host "  FAIL  ClarionAssistant.dll does NOT match the build it came from." -ForegroundColor Red
                     Write-Host "        deployed: $DeployedDll" -ForegroundColor Red
                     Write-Host "        built:    $BuiltDll" -ForegroundColor Red
